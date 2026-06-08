@@ -822,12 +822,17 @@ find_chunk_crlf(<<Original/binary>>, Skip, SizeLen) ->
 find_path_version(Bin, Method) ->
     case binary:split(Bin, <<" HTTP/1.">>) of
         [Path, <<Ver:1/binary, "\r\n", Rest/binary>>] when Ver =:= <<"1">>; Ver =:= <<"0">> ->
-            Version =
-                case Ver of
-                    <<"1">> -> http1_1;
-                    <<"0">> -> http1_0
-                end,
-            {ok, Method, Path, Version, Rest};
+            case valid_request_target(Path) of
+                true ->
+                    Version =
+                        case Ver of
+                            <<"1">> -> http1_1;
+                            <<"0">> -> http1_0
+                        end,
+                    {ok, Method, Path, Version, Rest};
+                false ->
+                    {error, bad_request_line}
+            end;
         [_Path, <<Ver:1/binary, "\r">>] when Ver =:= <<"1">>; Ver =:= <<"0">> ->
             {more, 1};
         [_Path, <<Ver:1/binary>>] when Ver =:= <<"1">>; Ver =:= <<"0">> ->
@@ -921,10 +926,20 @@ get_all_content_lengths(Headers) ->
 
 -spec has_invalid_char(binary()) -> boolean().
 has_invalid_char(<<>>) -> false;
-has_invalid_char(<<$\r, _/binary>>) -> true;
-has_invalid_char(<<$\n, _/binary>>) -> true;
-has_invalid_char(<<0, _/binary>>) -> true;
+has_invalid_char(<<$\t, Rest/binary>>) -> has_invalid_char(Rest);
+has_invalid_char(<<C, _/binary>>) when C =< 16#1F -> true;
+has_invalid_char(<<16#7F, _/binary>>) -> true;
 has_invalid_char(<<_, Rest/binary>>) -> has_invalid_char(Rest).
+
+-spec valid_request_target(binary()) -> boolean().
+valid_request_target(<<>>) -> false;
+valid_request_target(Target) -> not target_has_invalid_char(Target).
+
+-spec target_has_invalid_char(binary()) -> boolean().
+target_has_invalid_char(<<>>) -> false;
+target_has_invalid_char(<<C, _/binary>>) when C =< 16#20 -> true;
+target_has_invalid_char(<<16#7F, _/binary>>) -> true;
+target_has_invalid_char(<<_, Rest/binary>>) -> target_has_invalid_char(Rest).
 
 -spec is_chunked_transfer_encoding(binary()) -> boolean().
 is_chunked_transfer_encoding(Bin) ->
