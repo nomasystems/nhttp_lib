@@ -1,6 +1,6 @@
 {application, nhttp_lib, [
     {description, "HTTP protocol primitives for Erlang/OTP 27+ (HTTP/1.1, HTTP/2, HTTP/3, QPACK)"},
-    {vsn, "1.0.0"},
+    {vsn, "1.0.1"},
     {registered, []},
     {applications, [
         kernel,
