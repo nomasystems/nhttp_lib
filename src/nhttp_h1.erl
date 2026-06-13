@@ -35,6 +35,14 @@ When a limit is exceeded, parsing returns `{error, header_too_large}`,
 `{error, too_many_headers}`, or `{error, {body_too_large, Size, Max}}`
 respectively.
 
+With `max_header_size` set, an incomplete request head is also rejected
+as `header_too_large` once the buffered input exceeds `max_header_size`
+plus an 8 KiB request-line allowance: a head that never terminates (for
+example a header line with no CRLF) cannot grow the caller's buffer
+without bound. The same budget bounds chunked trailer sections, and
+chunk-size lines longer than 1 KiB are rejected as
+`invalid_chunk_size`.
+
 ```erlang
 Opts = #{max_header_size => 8192, max_headers_count => 100, max_body_size => 1048576},
 case nhttp_h1:parse_request(Binary, Opts) of
@@ -195,6 +203,12 @@ pattern applies to chunked requests.
 -opaque chunked_st() :: #chunked_st{}.
 
 %%%-----------------------------------------------------------------------------
+%% LOCAL MACROS
+%%%-----------------------------------------------------------------------------
+-define(REQUEST_LINE_ALLOWANCE, 8192).
+-define(MAX_CHUNK_SIZE_LINE, 1024).
+
+%%%-----------------------------------------------------------------------------
 %% COMPILED PATTERNS
 %%%-----------------------------------------------------------------------------
 -define(PT_CRLF, {?MODULE, crlf_pattern}).
@@ -303,13 +317,16 @@ parse_request(<<Bin/binary>>, Opts) ->
     OriginalSize = byte_size(Bin),
     MaxHeaderSize = maps:get(max_header_size, Opts, infinity),
     MaxHeadersCount = maps:get(max_headers_count, Opts, infinity),
-    maybe
-        {ok, Method, Path, Version, Rest} ?= parse_request_line(Bin),
-        {ok, Headers, BodyRest} ?= parse_headers_acc(Rest, [], 0, MaxHeaderSize, MaxHeadersCount),
-        HeadersConsumed = OriginalSize - byte_size(BodyRest),
-        Req = build_request(Method, Path, Version, Headers, Opts),
-        finish_request(Req, BodyRest, Headers, HeadersConsumed, Opts)
-    end.
+    Result =
+        maybe
+            {ok, Method, Path, Version, Rest} ?= parse_request_line(Bin),
+            {ok, Headers, BodyRest} ?=
+                parse_headers_acc(Rest, [], 0, MaxHeaderSize, MaxHeadersCount),
+            HeadersConsumed = OriginalSize - byte_size(BodyRest),
+            Req = build_request(Method, Path, Version, Headers, Opts),
+            finish_request(Req, BodyRest, Headers, HeadersConsumed, Opts)
+        end,
+    cap_incomplete_head(Result, OriginalSize, MaxHeaderSize).
 
 -doc """
 Feed body bytes for a streaming request whose headers were parsed via
@@ -390,32 +407,34 @@ parse_request_headers(<<Bin/binary>>, Opts) ->
     MaxHeaderSize = maps:get(max_header_size, Opts, infinity),
     MaxHeadersCount = maps:get(max_headers_count, Opts, infinity),
     MaxBodySize = maps:get(max_body_size, Opts, infinity),
-    maybe
-        {ok, Method, Path, Version, Rest} ?= parse_request_line(Bin),
-        {ok, Headers, BodyRest} ?=
-            parse_headers_acc(Rest, [], 0, MaxHeaderSize, MaxHeadersCount),
-        HeadersConsumed = OriginalSize - byte_size(BodyRest),
-        Req0 = build_request(Method, Path, Version, Headers, Opts),
-        Req = Req0#{body => streaming},
-        case detect_body_mode(Headers) of
-            undefined ->
-                {ok, Req, none, HeadersConsumed};
-            {content_length, Len} ->
-                case check_body_size(Len, MaxBodySize) of
-                    ok -> {ok, Req, {length, Len}, HeadersConsumed};
-                    {error, _} = Err -> Err
-                end;
-            chunked ->
-                St = #chunked_st{
-                    max_header_size = MaxHeaderSize,
-                    max_headers_count = MaxHeadersCount,
-                    max_body_size = MaxBodySize
-                },
-                {ok, Req, {chunked, St}, HeadersConsumed};
-            {error, _} = Err ->
-                Err
-        end
-    end.
+    Result =
+        maybe
+            {ok, Method, Path, Version, Rest} ?= parse_request_line(Bin),
+            {ok, Headers, BodyRest} ?=
+                parse_headers_acc(Rest, [], 0, MaxHeaderSize, MaxHeadersCount),
+            HeadersConsumed = OriginalSize - byte_size(BodyRest),
+            Req0 = build_request(Method, Path, Version, Headers, Opts),
+            Req = Req0#{body => streaming},
+            case detect_body_mode(Headers) of
+                undefined ->
+                    {ok, Req, none, HeadersConsumed};
+                {content_length, Len} ->
+                    case check_body_size(Len, MaxBodySize) of
+                        ok -> {ok, Req, {length, Len}, HeadersConsumed};
+                        {error, _} = Err -> Err
+                    end;
+                chunked ->
+                    St = #chunked_st{
+                        max_header_size = MaxHeaderSize,
+                        max_headers_count = MaxHeadersCount,
+                        max_body_size = MaxBodySize
+                    },
+                    {ok, Req, {chunked, St}, HeadersConsumed};
+                {error, _} = Err ->
+                    Err
+            end
+        end,
+    cap_incomplete_head(Result, OriginalSize, MaxHeaderSize).
 
 -doc "Parse an HTTP/1.1 response from binary. Returns {ok, Response, BytesConsumed} on success. Use split_at/2 to get the remaining buffer.".
 -spec parse_response(binary()) -> parse_result(resp()).
@@ -668,6 +687,24 @@ build_request(Method, Path, Version, Headers, Opts) ->
                 body => <<>>
             }
     end.
+
+-doc """
+Reject an incomplete request head whose buffered input already exceeds the
+header budget. Without this, a head that never terminates (e.g. a header
+line with no CRLF) bypasses the per-line limit checks and grows the
+caller's buffer without bound, while each new arrival rescans the whole
+tail (O(n^2)).
+""".
+-spec cap_incomplete_head(Result, non_neg_integer(), header_limit()) ->
+    Result | {error, header_too_large}
+when
+    Result :: term().
+cap_incomplete_head({more, _}, BufferedSize, MaxHeaderSize) when
+    is_integer(MaxHeaderSize), BufferedSize > MaxHeaderSize + ?REQUEST_LINE_ALLOWANCE
+->
+    {error, header_too_large};
+cap_incomplete_head(Result, _BufferedSize, _MaxHeaderSize) ->
+    Result.
 
 -spec check_body_size(non_neg_integer(), header_limit()) ->
     ok | {error, {body_too_large, non_neg_integer(), non_neg_integer()}}.
@@ -1117,6 +1154,10 @@ parse_chunked_stream(Bin, Consumed, Acc, #chunked_st{phase = trailers} = St) ->
                     NewConsumed = Consumed + Used,
                     FinalAcc = lists:reverse([{fin, Trailers} | Acc]),
                     {ok, FinalAcc, none, NewConsumed};
+                {more, _MinBytes} when
+                    is_integer(MaxSize), HSize + byte_size(Rest) > MaxSize
+                ->
+                    {error, header_too_large};
                 {more, MinBytes} ->
                     finish_chunked_step(Acc, St, Consumed, MinBytes);
                 {error, _} = Err ->
@@ -1956,8 +1997,10 @@ scan_chunk_size_line(Bin, Skip, SizeLen) ->
                 {ok, Size} -> {ok, Size, Skip + SizeLen + 2};
                 error -> {error, invalid_chunk_size}
             end;
-        <<_:Pos/binary, _, _/binary>> ->
+        <<_:Pos/binary, _, _/binary>> when SizeLen < ?MAX_CHUNK_SIZE_LINE ->
             scan_chunk_size_line(Bin, Skip, SizeLen + 1);
+        <<_:Pos/binary, _, _/binary>> ->
+            {error, invalid_chunk_size};
         _ ->
             {more, 1}
     end.

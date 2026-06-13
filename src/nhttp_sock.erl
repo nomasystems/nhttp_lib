@@ -401,6 +401,7 @@ build_tcp_opts(Opts) ->
         {backlog, Backlog},
         {nodelay, Nodelay},
         {send_timeout, SendTimeout},
+        {send_timeout_close, true},
         {buffer, Buffer},
         {packet, raw}
     ].
