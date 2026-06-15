@@ -1997,7 +1997,7 @@ scan_chunk_size_line(Bin, Skip, SizeLen) ->
                 {ok, Size} -> {ok, Size, Skip + SizeLen + 2};
                 error -> {error, invalid_chunk_size}
             end;
-        <<_:Pos/binary, _, _/binary>> when SizeLen < ?MAX_CHUNK_SIZE_LINE ->
+        <<_:Pos/binary, _, _/binary>> when SizeLen =< ?MAX_CHUNK_SIZE_LINE ->
             scan_chunk_size_line(Bin, Skip, SizeLen + 1);
         <<_:Pos/binary, _, _/binary>> ->
             {error, invalid_chunk_size};
