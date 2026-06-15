@@ -29,6 +29,7 @@
     tcp_connect_buffer_override/1,
     tcp_connect_timeout/1,
     tcp_handshake_noop/1,
+    tcp_listen_send_timeout_close/1,
     ssl_listen_accept_handshake/1,
     ssl_send_recv/1,
     ssl_alpn_negotiation/1,
@@ -75,7 +76,8 @@ groups() ->
             tcp_connect_buffer_default,
             tcp_connect_buffer_override,
             tcp_connect_timeout,
-            tcp_handshake_noop
+            tcp_handshake_noop,
+            tcp_listen_send_timeout_close
         ]},
         {ssl, [sequence], [
             ssl_listen_accept_handshake,
@@ -593,6 +595,13 @@ tcp_connect(_Config) ->
     end,
 
     nhttp_sock:close(ClientSock),
+    nhttp_sock:close(ListenSock),
+    ok.
+
+tcp_listen_send_timeout_close(_Config) ->
+    {ok, ListenSock} = nhttp_sock:listen(#{port => 0, transport => tcp}),
+    {ok, Opts} = inet:getopts(element(2, ListenSock), [send_timeout_close]),
+    ?assertEqual(true, proplists:get_value(send_timeout_close, Opts)),
     nhttp_sock:close(ListenSock),
     ok.
 

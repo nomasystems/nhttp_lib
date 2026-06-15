@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-06-12
+
+### Changed
+
+- Listen sockets set `{send_timeout_close, true}` so a send that hits
+  `send_timeout` closes the socket instead of leaving it half-dead
+
+### Fixed
+
+- Reject an incomplete HTTP/1.1 request head as `header_too_large` once
+  the buffered input exceeds `max_header_size` plus an 8 KiB
+  request-line allowance, bounding both memory and the repeated rescan
+  of the unparsed tail
+- Apply the same `max_header_size` budget to incomplete chunked trailer
+  sections
+- Reject chunk-size lines longer than 1 KiB as `invalid_chunk_size`
+
 ## [1.0.1] - 2026-06-09
 
 ### Fixed

@@ -173,7 +173,14 @@ groups() ->
             duplicate_content_length_same_values_request,
             duplicate_content_length_same_values_response,
             te_and_content_length_request_rejected,
-            te_and_content_length_response_rejected
+            te_and_content_length_response_rejected,
+            limit_incomplete_head_capped_parse_request,
+            limit_incomplete_head_capped_parse_request_headers,
+            limit_incomplete_request_line_capped,
+            limit_incomplete_head_below_cap_returns_more,
+            limit_incomplete_head_unbounded_without_limit,
+            limit_incomplete_trailers_capped,
+            limit_chunk_size_line_capped
         ]}
     ].
 
@@ -1107,6 +1114,45 @@ te_and_content_length_response_rejected(_Config) ->
         "0\r\n\r\n"
     >>,
     ?assertEqual({error, conflicting_framing}, nhttp_h1:parse_response(Data)).
+
+limit_incomplete_head_capped_parse_request(_Config) ->
+    Tail = binary:copy(<<"x">>, 16384),
+    Data = <<"GET / HTTP/1.1\r\nX-Endless: ", Tail/binary>>,
+    Opts = #{max_header_size => 1024},
+    ?assertEqual({error, header_too_large}, nhttp_h1:parse_request(Data, Opts)).
+
+limit_incomplete_head_capped_parse_request_headers(_Config) ->
+    Tail = binary:copy(<<"x">>, 16384),
+    Data = <<"GET / HTTP/1.1\r\nX-Endless: ", Tail/binary>>,
+    Opts = #{max_header_size => 1024},
+    ?assertEqual({error, header_too_large}, nhttp_h1:parse_request_headers(Data, Opts)).
+
+limit_incomplete_request_line_capped(_Config) ->
+    Data = <<"GET /", (binary:copy(<<"a">>, 16384))/binary>>,
+    Opts = #{max_header_size => 1024},
+    ?assertEqual({error, header_too_large}, nhttp_h1:parse_request_headers(Data, Opts)).
+
+limit_incomplete_head_below_cap_returns_more(_Config) ->
+    Data = <<"GET / HTTP/1.1\r\nX-Pending: ", (binary:copy(<<"x">>, 100))/binary>>,
+    Opts = #{max_header_size => 1024},
+    ?assertMatch({more, _}, nhttp_h1:parse_request_headers(Data, Opts)).
+
+limit_incomplete_head_unbounded_without_limit(_Config) ->
+    Data = <<"GET / HTTP/1.1\r\nX-Endless: ", (binary:copy(<<"x">>, 16384))/binary>>,
+    ?assertMatch({more, _}, nhttp_h1:parse_request_headers(Data, #{})).
+
+limit_incomplete_trailers_capped(_Config) ->
+    Head = <<"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n">>,
+    Opts = #{max_header_size => 256},
+    {ok, _Req, {chunked, St}, _Consumed} = nhttp_h1:parse_request_headers(Head, Opts),
+    Body = <<"5\r\nhello\r\n0\r\nX-Endless: ", (binary:copy(<<"x">>, 1024))/binary>>,
+    ?assertEqual({error, header_too_large}, nhttp_h1:parse_request_body(Body, {chunked, St})).
+
+limit_chunk_size_line_capped(_Config) ->
+    Head = <<"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n">>,
+    {ok, _Req, {chunked, St}, _Consumed} = nhttp_h1:parse_request_headers(Head, #{}),
+    Body = <<"5;ext=", (binary:copy(<<"a">>, 4096))/binary>>,
+    ?assertEqual({error, invalid_chunk_size}, nhttp_h1:parse_request_body(Body, {chunked, St})).
 
 %%%-----------------------------------------------------------------------------
 %%% STREAMING REQUEST TESTS
