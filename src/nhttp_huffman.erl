@@ -63,7 +63,6 @@ decode(Data) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
-
 -spec finalize_padding({ok, binary(), bitstring()} | {error, invalid_huffman}) ->
     {ok, binary()} | {error, invalid_huffman}.
 finalize_padding({ok, Decoded, <<>>}) ->
