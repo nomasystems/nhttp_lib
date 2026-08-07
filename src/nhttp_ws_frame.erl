@@ -23,6 +23,8 @@ masked (RFC 6455 §5.1).
     encode_masked/1,
     opcode_to_complete_message/2,
     opcode_to_message/3,
+    scan_utf8/1,
+    scan_utf8/2,
     validate_control_frame/3
 ]).
 
@@ -206,6 +208,49 @@ decode_unmasked(_) ->
 %%%-----------------------------------------------------------------------------
 %% SHARED HELPERS (USED BY STATEFUL MESSAGE-LEVEL DECODER)
 %%%-----------------------------------------------------------------------------
+-doc """
+Scan a run of text for UTF-8 validity (RFC 3629) and return the trailing
+bytes that do not yet form a character.
+
+A fragmented text message can split a character across two frames, so a
+fragment is not valid or invalid on its own: it ends in a carry, which the
+next fragment starts with. The run is refused as soon as no continuation
+can complete it, which puts the refusal on the fragment that breaks rather
+than on the whole reassembled message.
+
+A carry left at the end of a message is a truncated character, so the
+caller must require an empty one on the final fragment.
+""".
+-spec scan_utf8(binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
+scan_utf8(<<_/utf8, Rest/binary>>) ->
+    scan_utf8(Rest);
+scan_utf8(<<>>) ->
+    {ok, <<>>};
+scan_utf8(Rest) ->
+    case is_utf8_prefix(Rest) of
+        true -> {ok, Rest};
+        false -> {error, invalid_utf8}
+    end.
+
+-doc """
+Scan a run of text that continues an unfinished character.
+
+`Carry` comes from the previous fragment and is at most three bytes. Only
+the bytes needed to finish that character are copied; the rest of the
+payload is scanned where it lies.
+""".
+-spec scan_utf8(Carry :: binary(), binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
+scan_utf8(Carry, Payload) when byte_size(Payload) =< 3 ->
+    scan_utf8(<<Carry/binary, Payload/binary>>);
+scan_utf8(Carry, <<Head:3/binary, Rest/binary>>) ->
+    maybe
+        {ok, <<>>} ?= scan_utf8(<<Carry/binary, Head/binary>>),
+        scan_utf8(Rest)
+    else
+        {ok, NewCarry} -> scan_utf8(NewCarry, Rest);
+        {error, _} = Err -> Err
+    end.
+
 -doc """
 Map a complete (FIN=1) frame's opcode and payload to a `ws_message/0`.
 Text payloads are validated as UTF-8 (RFC 6455 §5.6 / §8.1).
@@ -442,6 +487,27 @@ is_valid_close_code(Code) when Code >= 1000, Code =< 1003 -> true;
 is_valid_close_code(Code) when Code >= 1007, Code =< 1014 -> true;
 is_valid_close_code(Code) when Code >= 3000, Code =< 4999 -> true;
 is_valid_close_code(_) -> false.
+
+-doc """
+Whether the bytes are a proper prefix of a UTF-8 character, so a
+continuation can still complete them. The constraints on the second byte
+are the ones that make an overlong encoding (`E0 80`), a surrogate half
+(`ED A0`) and a scalar above U+10FFFF (`F4 90`) refusals here rather than
+one byte later.
+""".
+-spec is_utf8_prefix(binary()) -> boolean().
+is_utf8_prefix(<<B>>) when B >= 16#C2, B =< 16#F4 -> true;
+is_utf8_prefix(<<16#E0, B>>) when B >= 16#A0, B =< 16#BF -> true;
+is_utf8_prefix(<<16#ED, B>>) when B >= 16#80, B =< 16#9F -> true;
+is_utf8_prefix(<<A, B>>) when A >= 16#E1, A =< 16#EF, A =/= 16#ED, B >= 16#80, B =< 16#BF ->
+    true;
+is_utf8_prefix(<<16#F0, B>>) when B >= 16#90, B =< 16#BF -> true;
+is_utf8_prefix(<<16#F4, B>>) when B >= 16#80, B =< 16#8F -> true;
+is_utf8_prefix(<<A, B>>) when A >= 16#F1, A =< 16#F3, B >= 16#80, B =< 16#BF -> true;
+is_utf8_prefix(<<A, B, C>>) when A >= 16#F0, A =< 16#F4, C >= 16#80, C =< 16#BF ->
+    is_utf8_prefix(<<A, B>>);
+is_utf8_prefix(_) ->
+    false.
 
 -spec is_valid_utf8(binary()) -> boolean().
 is_valid_utf8(<<_/utf8, Rest/binary>>) -> is_valid_utf8(Rest);
