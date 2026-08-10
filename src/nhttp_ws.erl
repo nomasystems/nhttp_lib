@@ -409,19 +409,17 @@ Continuation frames are accumulated until FIN=1, then the complete
 message is delivered. Control frames (ping, pong, close) may appear
 between fragments and are delivered immediately.
 
-Three of the four returns tell the caller what to do with the buffer,
-and they are not interchangeable:
+A successful return has three forms, and each one says what to keep:
 
-- `{ok, Message, Rest, Decoder}` and `{continue, Rest, Decoder}` both
-  consumed a frame. The caller keeps `Rest` and decodes again. The
-  second one buffered a non-final fragment in the decoder and has no
-  message to deliver yet.
-- `{more, MinBytes, Decoder}` consumed nothing. The caller keeps the
-  buffer it passed in and waits for at least `MinBytes` more bytes.
+- `{ok, Message, Rest, Decoder}`: a frame was consumed and the message
+  is complete. Keep `Rest`.
+- `{continue, Rest, Decoder}`: a frame was consumed and buffered as a
+  non-final fragment. No message yet. Keep `Rest`.
+- `{more, MinBytes, Decoder}`: nothing was consumed. Keep the input
+  buffer and wait for `MinBytes` more bytes.
 
-A caller that keeps its whole buffer after a consumed fragment decodes
-that fragment twice, and the second pass fails with
-`expected_continuation`.
+If you keep the whole buffer after a consumed frame, the next call
+decodes that frame again and fails with `expected_continuation`.
 """.
 -spec decode_with_state(binary(), ws_decoder()) -> stateful_decode_result().
 decode_with_state(Data, #ws_decoder{role = Role} = Dec) ->
