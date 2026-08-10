@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-08-10
+
+### Added
+
+- `nhttp_ws_frame:scan_utf8/1` and `nhttp_ws_frame:scan_utf8/2` scan a run
+  of text for UTF-8 validity and return the trailing bytes that do not yet
+  form a character
+
+### Changed
+
+- `nhttp_ws:decode_with_state/2` returns `{continue, Rest, Decoder}` when it
+  consumes a non-final fragment. The call returned `{more, 1, Decoder}`
+  before, which hid the fact that the frame was consumed
+
+### Fixed
+
+- Return the unconsumed rest of the buffer after a WebSocket fragment. A
+  caller that kept the whole buffer decoded the same fragment again and
+  failed with `expected_continuation`
+- Validate a fragmented text message as UTF-8 (RFC 6455 §5.6) per fragment,
+  with the character that spans two frames carried across. A message that
+  ends with a truncated character is refused as `invalid_utf8`
+
 ## [1.0.2] - 2026-06-12
 
 ### Changed
