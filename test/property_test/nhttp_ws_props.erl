@@ -179,7 +179,7 @@ prop_ws_new_message_mid_fragmentation_rejected() ->
             Intruder = encode_masked_raw(1, IntruderOpcode, IntruderPayload),
             Dec0 = nhttp_ws:decoder_new(server),
             case nhttp_ws:decode_with_state(Start, Dec0) of
-                {more, _, Dec1} ->
+                {continue, _, Dec1} ->
                     case nhttp_ws:decode_with_state(Intruder, Dec1) of
                         {error, expected_continuation} -> true;
                         _ -> false
@@ -204,6 +204,38 @@ prop_ws_max_message_size_cumulative() ->
             decode_frames_until_error(Frames, Dec) =:= {error, message_too_large}
         end
     ).
+
+-spec prop_ws_incremental_utf8_matches_whole() -> triq:property().
+prop_ws_incremental_utf8_matches_whole() ->
+    ?FORALL(
+        {Payload, NumChunks},
+        {oneof([valid_utf8_gen(), invalid_utf8_gen(), binary()]), int(1, 8)},
+        begin
+            Chunks = split_into_n(Payload, NumChunks),
+            scan_chunks(Chunks, <<>>) =:= whole_utf8_verdict(Payload)
+        end
+    ).
+
+-spec scan_chunks([binary()], binary()) -> valid | invalid.
+scan_chunks([], <<>>) ->
+    valid;
+scan_chunks([], _Carry) ->
+    invalid;
+scan_chunks([Chunk | Rest], <<>>) ->
+    scan_chunks_next(nhttp_ws_frame:scan_utf8(Chunk), Rest);
+scan_chunks([Chunk | Rest], Carry) ->
+    scan_chunks_next(nhttp_ws_frame:scan_utf8(Carry, Chunk), Rest).
+
+-spec scan_chunks_next({ok, binary()} | {error, invalid_utf8}, [binary()]) -> valid | invalid.
+scan_chunks_next({ok, Carry}, Rest) -> scan_chunks(Rest, Carry);
+scan_chunks_next({error, invalid_utf8}, _Rest) -> invalid.
+
+-spec whole_utf8_verdict(binary()) -> valid | invalid.
+whole_utf8_verdict(Payload) ->
+    case nhttp_ws_frame:opcode_to_complete_message(1, Payload) of
+        {ok, _} -> valid;
+        {error, invalid_utf8} -> invalid
+    end.
 
 -spec control_frame_gen() -> triq_dom:domain().
 control_frame_gen() ->
@@ -293,7 +325,7 @@ decode_frames([], _Dec, Acc) ->
 decode_frames([Frame | Rest], Dec, Acc) ->
     case nhttp_ws:decode_with_state(Frame, Dec) of
         {ok, Msg, _LeftOver, Dec1} -> decode_frames(Rest, Dec1, [Msg | Acc]);
-        {more, _, Dec1} -> decode_frames(Rest, Dec1, Acc);
+        {continue, _, Dec1} -> decode_frames(Rest, Dec1, Acc);
         {error, _} -> error
     end.
 
@@ -304,7 +336,7 @@ decode_frames_until_error([], _Dec) ->
 decode_frames_until_error([Frame | Rest], Dec) ->
     case nhttp_ws:decode_with_state(Frame, Dec) of
         {ok, _Msg, _Rest, Dec1} -> decode_frames_until_error(Rest, Dec1);
-        {more, _, Dec1} -> decode_frames_until_error(Rest, Dec1);
+        {continue, _, Dec1} -> decode_frames_until_error(Rest, Dec1);
         {error, _} = Err -> Err
     end.
 

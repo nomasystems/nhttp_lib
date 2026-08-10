@@ -84,6 +84,12 @@ decoding, and stateful fragmentation for both server and client roles.
     frag_text/1,
     frag_binary/1,
     frag_with_control/1,
+    frag_coalesced_fragments/1,
+    frag_coalesced_with_control/1,
+    frag_text_invalid_utf8_fails_at_fragment/1,
+    frag_text_split_code_point/1,
+    frag_text_truncated_at_fin/1,
+    frag_binary_not_utf8_checked/1,
     frag_error_no_start/1,
     frag_server_decoder/1,
     frag_message_too_large_start/1,
@@ -193,6 +199,12 @@ groups() ->
             frag_text,
             frag_binary,
             frag_with_control,
+            frag_coalesced_fragments,
+            frag_coalesced_with_control,
+            frag_text_invalid_utf8_fails_at_fragment,
+            frag_text_split_code_point,
+            frag_text_truncated_at_fin,
+            frag_binary_not_utf8_checked,
             frag_error_no_start,
             frag_server_decoder,
             frag_message_too_large_start,
@@ -630,25 +642,62 @@ decode_unmasked_partial_ext64(_Config) ->
 frag_text(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client),
     First = <<16#01, 3, "Hel">>,
-    {more, 1, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
     Cont = <<16#80, 2, "lo">>,
     {ok, {text, <<"Hello">>}, <<>>, _Dec2} = nhttp_ws:decode_with_state(Cont, Dec1).
 
 frag_binary(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client),
     First = <<16#02, 2, "AB">>,
-    {more, 1, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
     Cont = <<16#80, 2, "CD">>,
     {ok, {binary, <<"ABCD">>}, <<>>, _Dec2} = nhttp_ws:decode_with_state(Cont, Dec1).
 
 frag_with_control(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client),
     First = <<16#01, 3, "Hel">>,
-    {more, 1, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
     Ping = <<16#89, 0>>,
     {ok, ping, <<>>, Dec2} = nhttp_ws:decode_with_state(Ping, Dec1),
     Cont = <<16#80, 2, "lo">>,
     {ok, {text, <<"Hello">>}, <<>>, _Dec3} = nhttp_ws:decode_with_state(Cont, Dec2).
+
+frag_coalesced_fragments(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    Buffer = <<16#01, 3, "Hel", 16#80, 2, "lo">>,
+    {continue, Rest, Dec1} = nhttp_ws:decode_with_state(Buffer, Dec0),
+    ?assertEqual(<<16#80, 2, "lo">>, Rest),
+    {ok, {text, <<"Hello">>}, <<>>, _Dec2} = nhttp_ws:decode_with_state(Rest, Dec1).
+
+frag_coalesced_with_control(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    Buffer = <<16#01, 3, "Hel", 16#89, 0, 16#80, 2, "lo">>,
+    {continue, Rest1, Dec1} = nhttp_ws:decode_with_state(Buffer, Dec0),
+    {ok, ping, Rest2, Dec2} = nhttp_ws:decode_with_state(Rest1, Dec1),
+    {ok, {text, <<"Hello">>}, <<>>, _Dec3} = nhttp_ws:decode_with_state(Rest2, Dec2).
+
+frag_text_invalid_utf8_fails_at_fragment(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(<<16#01, 3, "Hel">>, Dec0),
+    Broken = <<16#00, 2, 16#C0, 16#AF>>,
+    ?assertEqual({error, invalid_utf8}, nhttp_ws:decode_with_state(Broken, Dec1)).
+
+frag_text_split_code_point(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(<<16#01, 1, 16#C3>>, Dec0),
+    Last = <<16#80, 1, 16#A9>>,
+    {ok, {text, <<16#C3, 16#A9>>}, <<>>, _Dec2} = nhttp_ws:decode_with_state(Last, Dec1).
+
+frag_text_truncated_at_fin(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(<<16#01, 1, 16#C3>>, Dec0),
+    ?assertEqual({error, invalid_utf8}, nhttp_ws:decode_with_state(<<16#80, 0>>, Dec1)).
+
+frag_binary_not_utf8_checked(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(<<16#02, 2, 16#C0, 16#AF>>, Dec0),
+    Last = <<16#80, 1, 16#FF>>,
+    {ok, {binary, <<16#C0, 16#AF, 16#FF>>}, <<>>, _Dec2} = nhttp_ws:decode_with_state(Last, Dec1).
 
 frag_error_no_start(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client),
@@ -672,7 +721,7 @@ frag_message_too_large_start(_Config) ->
 frag_message_too_large_continuation(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => 5}),
     First = <<16#01, 3, "Hel">>,
-    {more, 1, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(First, Dec0),
     Cont = <<16#80, 5, "lothe">>,
     ?assertEqual({error, message_too_large}, nhttp_ws:decode_with_state(Cont, Dec1)).
 
