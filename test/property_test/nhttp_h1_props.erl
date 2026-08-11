@@ -130,9 +130,19 @@ h1_resp_gen() ->
             status => Status,
             reason => Reason,
             headers => Headers,
-            body => Body
+            body => body_for_status(Status, Body)
         }
     ).
+
+%% RFC 9112 Section 6.3: a 1xx, 204, or 304 response has no content, so a
+%% generated one that carries a body is not a valid message to round-trip.
+-spec body_for_status(nhttp_lib:status(), binary()) -> binary().
+body_for_status(Status, _Body) when
+    Status >= 100, Status =< 199; Status =:= 204; Status =:= 304
+->
+    <<>>;
+body_for_status(_Status, Body) ->
+    Body.
 
 -spec method_gen() -> triq_dom:domain().
 method_gen() ->

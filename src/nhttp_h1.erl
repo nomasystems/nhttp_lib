@@ -110,6 +110,7 @@ pattern applies to chunked requests.
     encode_last_chunk/0,
     encode_request/1,
     encode_response/1,
+    encode_response/2,
     encode_response_head/3
 ]).
 
@@ -128,6 +129,7 @@ pattern applies to chunked requests.
     body_mode/0,
     body_stream/0,
     chunked_st/0,
+    enc_opts/0,
     opts/0,
     parse_error/0,
     parse_result/1,
@@ -157,6 +159,21 @@ pattern applies to chunked requests.
     | {length, non_neg_integer()}
     | until_close
     | none.
+
+-doc """
+Encoder options for `encode_response/2`.
+
+`content_length` selects how the encoder frames a response:
+
+- `auto` (the default) adds `Content-Length` when the header list carries
+  neither `content-length` nor `transfer-encoding`, and the status permits
+  the field.
+- `omit` suppresses the automatic field at any status. A server that
+  answers a `CONNECT` request with a 2xx status uses it, because RFC 9110
+  Section 8.6 forbids the field there and the response map carries no
+  request method.
+""".
+-type enc_opts() :: #{content_length => auto | omit}.
 
 -type opts() :: #{
     max_header_size => pos_integer(),
@@ -597,7 +614,8 @@ encode_request(#{method := Method, path := Path} = Req) ->
     Version = maps:get(version, Req, http1_1),
     Headers = maps:get(headers, Req, []),
     Body = maps:get(body, Req, <<>>),
-    FinalHeaders = maybe_add_content_length(Headers, Body),
+    Len = iolist_size(Body),
+    FinalHeaders = maybe_add_content_length(Headers, Len, Len > 0),
     [
         nhttp_lib:encode_method(Method),
         <<" ">>,
@@ -610,14 +628,42 @@ encode_request(#{method := Method, path := Path} = Req) ->
         Body
     ].
 
--doc "Encode an HTTP/1.1 response to iolist.".
+-doc """
+Encode an HTTP/1.1 response to iolist.
+
+Equivalent to `encode_response(Resp, #{})`. The encoder adds
+`Content-Length` when the header list carries neither `content-length` nor
+`transfer-encoding`, including a `Content-Length: 0` on an empty body.
+
+The encoder adds no `Content-Length` at a 1xx, 204, or 304 status. RFC 9110
+Section 8.6 forbids the field at 1xx and 204. It permits the field at 304
+only at the length that a 200 response would have carried, which this
+encoder cannot compute, so a caller that knows the value supplies it in the
+header list.
+
+A 2xx response to a `CONNECT` request also carries no `Content-Length`. The
+response map holds no request method, so that case needs
+`encode_response/2` with `#{content_length => omit}`.
+""".
 -spec encode_response(resp()) -> iolist().
-encode_response(#{status := Status} = Resp) ->
+encode_response(Resp) ->
+    encode_response(Resp, #{}).
+
+-doc """
+Encode an HTTP/1.1 response to iolist under the given encoder options.
+
+See `encode_response/1` for the framing rules and `t:enc_opts/0` for the
+options.
+""".
+-spec encode_response(resp(), enc_opts()) -> iolist().
+encode_response(#{status := Status} = Resp, EncOpts) ->
     Version = maps:get(version, Resp, http1_1),
     Reason = maps:get(reason, Resp, <<>>),
     Headers = maps:get(headers, Resp, []),
     Body = maps:get(body, Resp, <<>>),
-    FinalHeaders = maybe_add_content_length(Headers, Body),
+    FinalHeaders = maybe_add_content_length(
+        Headers, iolist_size(Body), allows_content_length(Status, EncOpts)
+    ),
     [
         encode_version(Version),
         <<" ">>,
@@ -1024,22 +1070,35 @@ is_token_chars(<<C, Rest/binary>>) ->
 is_valid_chunk_ext_tail(<<>>) -> true;
 is_valid_chunk_ext_tail(Bin) -> skip_bws_to_semi(Bin).
 
--spec maybe_add_content_length(nhttp_lib:headers(), iodata()) -> nhttp_lib:headers().
-maybe_add_content_length(Headers, Body) ->
-    case iolist_size(Body) of
-        0 ->
+-spec maybe_add_content_length(nhttp_lib:headers(), non_neg_integer(), boolean()) ->
+    nhttp_lib:headers().
+maybe_add_content_length(Headers, _Len, false) ->
+    Headers;
+maybe_add_content_length(Headers, Len, true) ->
+    case
+        nhttp_headers:has(<<"content-length">>, Headers) orelse
+            nhttp_headers:has(<<"transfer-encoding">>, Headers)
+    of
+        true ->
             Headers;
-        Len ->
-            case
-                nhttp_headers:has(<<"content-length">>, Headers) orelse
-                    nhttp_headers:has(<<"transfer-encoding">>, Headers)
-            of
-                true ->
-                    Headers;
-                false ->
-                    [{<<"content-length">>, integer_to_binary(Len)} | Headers]
-            end
+        false ->
+            [{<<"content-length">>, integer_to_binary(Len)} | Headers]
     end.
+
+-spec allows_content_length(nhttp_lib:status(), enc_opts()) -> boolean().
+allows_content_length(Status, EncOpts) ->
+    case maps:get(content_length, EncOpts, auto) of
+        auto -> not forbids_content_length(Status);
+        omit -> false
+    end.
+
+%% RFC 9110 Section 8.6: 1xx and 204 forbid the field, and 304 permits it
+%% only at the length a 200 response would have carried, which is unknown here.
+-spec forbids_content_length(nhttp_lib:status()) -> boolean().
+forbids_content_length(Status) when Status >= 100, Status =< 199 -> true;
+forbids_content_length(204) -> true;
+forbids_content_length(304) -> true;
+forbids_content_length(_Status) -> false.
 
 -spec parse_chunk_body_after_size(binary(), non_neg_integer(), non_neg_integer(), binary()) ->
     {ok, binary(), pos_integer()}

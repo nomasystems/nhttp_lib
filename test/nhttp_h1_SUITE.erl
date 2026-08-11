@@ -533,7 +533,8 @@ encode_response_no_body(_Config) ->
     },
     IOList = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
-    ?assertMatch(<<"HTTP/1.1 204 No Content\r\n", _/binary>>, Bin).
+    ?assertMatch(<<"HTTP/1.1 204 No Content\r\n", _/binary>>, Bin),
+    ?assertEqual(nomatch, re:run(Bin, <<"content-length">>, [caseless])).
 
 encode_response_head(_Config) ->
     IOList = nhttp_h1:encode_response_head(
