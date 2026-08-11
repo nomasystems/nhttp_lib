@@ -56,9 +56,16 @@ end.
 ## Encoding
 
 ```erlang
-IOList = nhttp_h1:encode_request(Request).
-IOList = nhttp_h1:encode_response(Response).
+{ok, IOList} = nhttp_h1:encode_request(Request).
+{ok, IOList} = nhttp_h1:encode_response(Response).
 ```
+
+The encoders validate what they serialise and return
+`{error, t:encode_error/0}` for a field name that is not a token, a field
+value or reason phrase that carries CR, LF, NUL, or another control byte,
+and a request target that carries a byte at or below `0x20`. RFC 9112
+Section 11.1 names that filter as the mitigation for response splitting and
+request smuggling. A refused message is never repaired and never truncated.
 
 `encode_request/1` and `encode_response/1` consume the canonical
 `t:nhttp_lib:request/0` / `t:nhttp_lib:response/0` map shape. The `body`
@@ -130,6 +137,7 @@ pattern applies to chunked requests.
     body_stream/0,
     chunked_st/0,
     enc_opts/0,
+    encode_error/0,
     opts/0,
     parse_error/0,
     parse_result/1,
@@ -174,6 +182,18 @@ Encoder options for `encode_response/2`.
   request method.
 """.
 -type enc_opts() :: #{content_length => auto | omit}.
+
+-doc """
+Reason an encoder refuses to serialise a message.
+
+Each arm carries the offending value so that the caller can log it. The
+encoder never repairs the value and never strips a byte from it.
+""".
+-type encode_error() ::
+    {invalid_field_name, binary()}
+    | {invalid_field_value, binary()}
+    | {invalid_reason_phrase, binary()}
+    | {invalid_request_target, binary()}.
 
 -type opts() :: #{
     max_header_size => pos_integer(),
@@ -608,25 +628,44 @@ encode_chunk(Data) when is_list(Data) ->
 encode_last_chunk() ->
     <<"0\r\n\r\n">>.
 
--doc "Encode an HTTP/1.1 request to iolist.".
--spec encode_request(req()) -> iolist().
+-doc """
+Encode an HTTP/1.1 request to iolist.
+
+The encoder refuses a message that cannot be framed unambiguously on the
+wire. It returns `{error, {invalid_request_target, Target}}` for a target
+that is empty or that carries a byte at or below `0x20` or the byte `0x7F`,
+`{error, {invalid_field_name, Name}}` for a field name that is not a token
+(RFC 9110 Section 5.6.2), and `{error, {invalid_field_value, Value}}` for a
+field value that carries CR, LF, NUL, another control byte, or `0x7F`
+(RFC 9110 Section 5.5).
+
+RFC 9112 Section 2.2 forbids a sender to generate a bare CR in any protocol
+element other than the content, and Section 11.1 names this filtering as the
+mitigation for request smuggling and response splitting. No value is
+repaired and no byte is stripped. The message is refused whole.
+""".
+-spec encode_request(req()) -> {ok, iolist()} | {error, encode_error()}.
 encode_request(#{method := Method, path := Path} = Req) ->
-    Version = maps:get(version, Req, http1_1),
     Headers = maps:get(headers, Req, []),
-    Body = maps:get(body, Req, <<>>),
-    Len = iolist_size(Body),
-    FinalHeaders = maybe_add_content_length(Headers, Len, Len > 0),
-    [
-        nhttp_lib:encode_method(Method),
-        <<" ">>,
-        Path,
-        <<" ">>,
-        encode_version(Version),
-        <<"\r\n">>,
-        encode_headers(FinalHeaders),
-        <<"\r\n">>,
-        Body
-    ].
+    maybe
+        ok ?= validate_request_target(Path),
+        ok ?= validate_headers_out(Headers),
+        Version = maps:get(version, Req, http1_1),
+        Body = maps:get(body, Req, <<>>),
+        Len = iolist_size(Body),
+        FinalHeaders = maybe_add_content_length(Headers, Len, Len > 0),
+        {ok, [
+            nhttp_lib:encode_method(Method),
+            <<" ">>,
+            Path,
+            <<" ">>,
+            encode_version(Version),
+            <<"\r\n">>,
+            encode_headers(FinalHeaders),
+            <<"\r\n">>,
+            Body
+        ]}
+    end.
 
 -doc """
 Encode an HTTP/1.1 response to iolist.
@@ -644,53 +683,79 @@ header list.
 A 2xx response to a `CONNECT` request also carries no `Content-Length`. The
 response map holds no request method, so that case needs
 `encode_response/2` with `#{content_length => omit}`.
+
+The encoder refuses a message that cannot be framed unambiguously on the
+wire. It returns `{error, {invalid_reason_phrase, Reason}}` for a reason
+phrase outside `1*( HTAB / SP / VCHAR / obs-text )` (RFC 9112 Section 4.1),
+`{error, {invalid_field_name, Name}}` for a field name that is not a token
+(RFC 9110 Section 5.6.2), and `{error, {invalid_field_value, Value}}` for a
+field value that carries CR, LF, NUL, another control byte, or `0x7F`
+(RFC 9110 Section 5.5). An empty reason phrase stays legal, because the
+status-line grammar makes the element optional.
+
+RFC 9112 Section 2.2 forbids a sender to generate a bare CR in any protocol
+element other than the content, and Section 11.1 names this filtering as the
+mitigation for response splitting. No value is repaired and no byte is
+stripped. The message is refused whole.
 """.
--spec encode_response(resp()) -> iolist().
+-spec encode_response(resp()) -> {ok, iolist()} | {error, encode_error()}.
 encode_response(Resp) ->
     encode_response(Resp, #{}).
 
 -doc """
 Encode an HTTP/1.1 response to iolist under the given encoder options.
 
-See `encode_response/1` for the framing rules and `t:enc_opts/0` for the
-options.
+See `encode_response/1` for the framing rules, the rejected byte classes,
+and `t:enc_opts/0` for the options.
 """.
--spec encode_response(resp(), enc_opts()) -> iolist().
+-spec encode_response(resp(), enc_opts()) -> {ok, iolist()} | {error, encode_error()}.
 encode_response(#{status := Status} = Resp, EncOpts) ->
-    Version = maps:get(version, Resp, http1_1),
     Reason = maps:get(reason, Resp, <<>>),
     Headers = maps:get(headers, Resp, []),
-    Body = maps:get(body, Resp, <<>>),
-    FinalHeaders = maybe_add_content_length(
-        Headers, iolist_size(Body), allows_content_length(Status, EncOpts)
-    ),
-    [
-        encode_version(Version),
-        <<" ">>,
-        integer_to_binary(Status),
-        <<" ">>,
-        Reason,
-        <<"\r\n">>,
-        encode_headers(FinalHeaders),
-        <<"\r\n">>,
-        Body
-    ].
+    maybe
+        ok ?= validate_reason_phrase(Reason),
+        ok ?= validate_headers_out(Headers),
+        Version = maps:get(version, Resp, http1_1),
+        Body = maps:get(body, Resp, <<>>),
+        FinalHeaders = maybe_add_content_length(
+            Headers, iolist_size(Body), allows_content_length(Status, EncOpts)
+        ),
+        {ok, [
+            encode_version(Version),
+            <<" ">>,
+            integer_to_binary(Status),
+            <<" ">>,
+            Reason,
+            <<"\r\n">>,
+            encode_headers(FinalHeaders),
+            <<"\r\n">>,
+            Body
+        ]}
+    end.
 
--doc "Encode HTTP/1.x response headers for streaming. Used when sending chunked responses - sends status line + headers only.".
+-doc """
+Encode HTTP/1.x response headers for streaming.
+
+Used when sending chunked responses - sends status line + headers only. The
+reason phrase comes from the status code, so only the header list is subject
+to validation. See `encode_response/1` for the rejected byte classes.
+""".
 -spec encode_response_head(version(), nhttp_lib:status(), nhttp_lib:headers()) ->
-    iolist().
+    {ok, iolist()} | {error, encode_error()}.
 encode_response_head(Version, Status, Headers) ->
-    Reason = reason_phrase(Status),
-    [
-        encode_version(Version),
-        <<" ">>,
-        integer_to_binary(Status),
-        <<" ">>,
-        Reason,
-        <<"\r\n">>,
-        encode_headers(Headers),
-        <<"\r\n">>
-    ].
+    maybe
+        ok ?= validate_headers_out(Headers),
+        {ok, [
+            encode_version(Version),
+            <<" ">>,
+            integer_to_binary(Status),
+            <<" ">>,
+            reason_phrase(Status),
+            <<"\r\n">>,
+            encode_headers(Headers),
+            <<"\r\n">>
+        ]}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% UTILITIES
@@ -1006,6 +1071,46 @@ finish_response(Resp, BodyRest, Headers, HeadersConsumed, Opts) ->
 -spec get_all_content_lengths(nhttp_lib:headers()) -> [binary()].
 get_all_content_lengths(Headers) ->
     [V || {<<"content-length">>, V} <- Headers].
+
+-spec validate_headers_out(nhttp_lib:headers()) -> ok | {error, encode_error()}.
+validate_headers_out([]) ->
+    ok;
+validate_headers_out([{Name, Value} | Rest]) ->
+    maybe
+        ok ?= validate_field_name(Name),
+        ok ?= validate_field_value(Value),
+        validate_headers_out(Rest)
+    end.
+
+-spec validate_field_name(binary()) -> ok | {error, encode_error()}.
+validate_field_name(Name) ->
+    case is_token(Name) of
+        true -> ok;
+        false -> {error, {invalid_field_name, Name}}
+    end.
+
+-spec validate_field_value(binary()) -> ok | {error, encode_error()}.
+validate_field_value(Value) ->
+    case has_invalid_char(Value) of
+        false -> ok;
+        true -> {error, {invalid_field_value, Value}}
+    end.
+
+-spec validate_reason_phrase(binary()) -> ok | {error, encode_error()}.
+validate_reason_phrase(Reason) ->
+    %% RFC 9112 Section 4.1: 1*( HTAB / SP / VCHAR / obs-text ), and the
+    %% status-line grammar makes the whole element optional.
+    case has_invalid_char(Reason) of
+        false -> ok;
+        true -> {error, {invalid_reason_phrase, Reason}}
+    end.
+
+-spec validate_request_target(binary()) -> ok | {error, encode_error()}.
+validate_request_target(Target) ->
+    case valid_request_target(Target) of
+        true -> ok;
+        false -> {error, {invalid_request_target, Target}}
+    end.
 
 -spec has_invalid_char(binary()) -> boolean().
 has_invalid_char(<<>>) -> false;
