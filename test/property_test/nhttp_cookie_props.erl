@@ -45,6 +45,35 @@ prop_set_cookie_roundtrip() ->
         end
     ).
 
+-spec prop_encode_set_cookie_no_injection() -> triq:property().
+prop_encode_set_cookie_no_injection() ->
+    ?FORALL(
+        {Name, Value},
+        {risky_name_gen(), risky_value_gen()},
+        case nhttp_cookie:encode_set_cookie(#{name => Name, value => Value}) of
+            {error, _} ->
+                true;
+            {ok, Encoded} ->
+                binary:match(Encoded, [<<"\r">>, <<"\n">>, <<";">>]) =:= nomatch andalso
+                    nhttp_cookie:decode_set_cookie(Encoded) =:=
+                        {ok, #{name => Name, value => Value}}
+        end
+    ).
+
+-spec prop_encode_cookie_no_injection() -> triq:property().
+prop_encode_cookie_no_injection() ->
+    ?FORALL(
+        Cookies,
+        non_empty(list(risky_cookie_gen())),
+        case nhttp_cookie:encode_cookie(Cookies) of
+            {error, _} ->
+                true;
+            {ok, Encoded} ->
+                binary:match(Encoded, [<<"\r">>, <<"\n">>]) =:= nomatch andalso
+                    nhttp_cookie:decode_cookie(Encoded) =:= {ok, Cookies}
+        end
+    ).
+
 -spec prop_decode_cookie_never_crashes() -> triq:property().
 prop_decode_cookie_never_crashes() ->
     ?FORALL(
@@ -178,6 +207,37 @@ value_char_gen() ->
         elements([$_, $-, $., $/, $:, $+, $=])
     ]).
 
+-spec risky_cookie_gen() -> triq_dom:domain().
+risky_cookie_gen() ->
+    ?LET(
+        {Name, Value},
+        {risky_name_gen(), risky_value_gen()},
+        #{name => Name, value => Value}
+    ).
+
+-spec risky_name_gen() -> triq_dom:domain().
+risky_name_gen() ->
+    ?LET(
+        Chars,
+        list(oneof([name_char_gen(), hostile_char_gen()])),
+        list_to_binary(Chars)
+    ).
+
+-spec risky_value_gen() -> triq_dom:domain().
+risky_value_gen() ->
+    ?LET(
+        Chars,
+        list(oneof([value_char_gen(), hostile_char_gen()])),
+        list_to_binary(Chars)
+    ).
+
+-spec hostile_char_gen() -> triq_dom:domain().
+hostile_char_gen() ->
+    oneof([
+        elements([$\r, $\n, $;, $\s, $", $\\, $,, 0, 16#7F]),
+        int(16#80, 16#FF)
+    ]).
+
 -spec path_gen() -> triq_dom:domain().
 path_gen() ->
     ?LET(
@@ -204,17 +264,26 @@ domain_gen() ->
 
 -spec domain_label_gen() -> triq_dom:domain().
 domain_label_gen() ->
-    ?LET(
-        Chars,
-        non_empty(list(domain_char_gen())),
-        list_to_binary(Chars)
-    ).
+    oneof([
+        ?LET(C, let_dig_gen(), list_to_binary([C])),
+        ?LET(
+            {First, Middle, Last},
+            {let_dig_gen(), list(domain_char_gen()), let_dig_gen()},
+            list_to_binary([First | Middle] ++ [Last])
+        )
+    ]).
 
 -spec domain_char_gen() -> triq_dom:domain().
 domain_char_gen() ->
     oneof([
+        let_dig_gen(),
+        elements([$-])
+    ]).
+
+-spec let_dig_gen() -> triq_dom:domain().
+let_dig_gen() ->
+    oneof([
         int($a, $z),
         int($A, $Z),
-        int($0, $9),
-        elements([$-])
+        int($0, $9)
     ]).

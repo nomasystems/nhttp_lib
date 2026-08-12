@@ -154,6 +154,8 @@ groups() ->
         {cookie_props, [parallel], [
             cookie_roundtrip,
             cookie_set_cookie_roundtrip,
+            cookie_encode_set_cookie_no_injection,
+            cookie_encode_cookie_no_injection,
             cookie_decode_never_crashes,
             cookie_decode_set_cookie_never_crashes
         ]},
@@ -509,6 +511,12 @@ cookie_roundtrip(Config) ->
 
 cookie_set_cookie_roundtrip(Config) ->
     run_property(nhttp_cookie_props, prop_set_cookie_roundtrip, Config).
+
+cookie_encode_set_cookie_no_injection(Config) ->
+    run_property(nhttp_cookie_props, prop_encode_set_cookie_no_injection, Config).
+
+cookie_encode_cookie_no_injection(Config) ->
+    run_property(nhttp_cookie_props, prop_encode_cookie_no_injection, Config).
 
 cookie_decode_never_crashes(Config) ->
     run_property(nhttp_cookie_props, prop_decode_cookie_never_crashes, Config).
