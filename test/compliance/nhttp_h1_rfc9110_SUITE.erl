@@ -39,7 +39,10 @@ groups() ->
             caller_content_length_survives_on_204,
             no_content_length_with_transfer_encoding,
             content_length_omit_opt_out,
-            reject_malformed_content_length
+            reject_malformed_content_length,
+            reject_signed_content_length,
+            reject_non_digit_content_length,
+            accept_digit_content_length
         ]},
         {section_9_methods, [parallel], [
             no_body_headers_2xx_connect,
@@ -220,6 +223,84 @@ reject_malformed_content_length(_Config) ->
         {ok, #{body := <<>>}, _} ->
             ok
     end.
+
+%% RFC 9110 Section 8.6: "Content-Length = 1*DIGIT". A sign is not a DIGIT,
+%% so "+5" and "-5" are not valid field values. RFC 9112 Section 6.3 item 5:
+%% "If a message is received without Transfer-Encoding and with an invalid
+%% Content-Length header field, then the message framing is invalid and the
+%% recipient MUST treat it as an unrecoverable error".
+reject_signed_content_length(_Config) ->
+    ?assertEqual({error, invalid_content_length}, parse_req_with_cl(<<"+5">>, <<"hello">>)),
+    ?assertEqual({error, invalid_content_length}, parse_req_with_cl(<<"-5">>, <<"hello">>)),
+    ?assertEqual({error, invalid_content_length}, parse_resp_with_cl(<<"+5">>, <<"hello">>)),
+    ?assertEqual({error, invalid_content_length}, parse_resp_with_cl(<<"-5">>, <<"hello">>)),
+
+    %% The streaming response path has no error channel, so an invalid value
+    %% must not be honoured as a length. It falls back to close-delimited.
+    ?assertEqual(
+        until_close,
+        nhttp_h1:body_stream_from_response(get, 200, [{<<"content-length">>, <<"+5">>}])
+    ).
+
+%% RFC 9110 Section 8.6: every octet of the field value is a DIGIT, and at
+%% least one is present.
+reject_non_digit_content_length(_Config) ->
+    Rejected = [
+        <<>>,
+        <<"+0">>,
+        <<"1 0">>,
+        <<"1\t0">>,
+        <<"0x5">>,
+        <<"5.0">>,
+        <<"5,5">>,
+        %% U+FF15 FULLWIDTH DIGIT FIVE, a digit to a human and not to the ABNF.
+        <<239, 188, 149>>
+    ],
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(
+                {error, invalid_content_length},
+                parse_req_with_cl(Value, <<"hello">>),
+                binary_to_list(Value)
+            ),
+            ?assertEqual(
+                {error, invalid_content_length},
+                parse_resp_with_cl(Value, <<"hello">>),
+                binary_to_list(Value)
+            )
+        end,
+        Rejected
+    ).
+
+%% RFC 9110 Section 8.6: "Any Content-Length field value greater than or equal
+%% to zero is valid." Leading zeros are DIGITs, and the value has no upper
+%% bound. RFC 9110 Section 5.5 strips leading and trailing OWS before the field
+%% value is read, so surrounding whitespace is not part of the value.
+accept_digit_content_length(_Config) ->
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, parse_req_with_cl(<<"5">>, <<"hello">>)),
+    ?assertMatch({ok, #{body := <<>>}, _}, parse_req_with_cl(<<"0">>, <<"hello">>)),
+    ?assertMatch({ok, #{body := <<"hellowo">>}, _}, parse_req_with_cl(<<"007">>, <<"helloworld">>)),
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, parse_req_with_cl(<<" \t5\t ">>, <<"hello">>)),
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, parse_resp_with_cl(<<"5">>, <<"hello">>)),
+
+    Beyond64 = integer_to_binary(1 bsl 64),
+    ?assertEqual({more, 1 bsl 64}, parse_req_with_cl(Beyond64, <<>>)),
+    ?assertEqual(
+        {length, 1 bsl 64},
+        nhttp_h1:body_stream_from_response(get, 200, [{<<"content-length">>, Beyond64}])
+    ).
+
+-spec parse_req_with_cl(binary(), binary()) -> term().
+parse_req_with_cl(Value, Body) ->
+    nhttp_h1:parse_request(
+        <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ", Value/binary, "\r\n\r\n", Body/binary>>
+    ).
+
+-spec parse_resp_with_cl(binary(), binary()) -> term().
+parse_resp_with_cl(Value, Body) ->
+    nhttp_h1:parse_response(
+        <<"HTTP/1.1 200 OK\r\nContent-Length: ", Value/binary, "\r\n\r\n", Body/binary>>
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 9 - Methods

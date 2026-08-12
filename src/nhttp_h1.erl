@@ -1360,13 +1360,9 @@ parse_chunks_resp(<<Original/binary>>, Skip, Acc, Partial, HeadersConsumed, MaxB
 
 -spec parse_content_length(binary()) -> {ok, non_neg_integer()} | {error, badarg}.
 parse_content_length(Bin) ->
-    try
-        case binary_to_integer(Bin) of
-            N when N >= 0 -> {ok, N};
-            _ -> {error, badarg}
-        end
-    catch
-        error:badarg -> {error, badarg}
+    case nhttp_msg:parse_content_length(Bin) of
+        undefined -> {error, badarg};
+        Len -> {ok, Len}
     end.
 
 -spec parse_header_value_direct(
