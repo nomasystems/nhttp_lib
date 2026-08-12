@@ -93,7 +93,8 @@ groups() ->
             h1_reject_header_name_injection,
             h1_reject_header_value_bare_controls,
             h1_no_smuggling,
-            h1_encode_response_single_terminator
+            h1_encode_response_single_terminator,
+            h1_request_method_is_token
         ]},
         {h2_props, [parallel], [
             h2_headers_roundtrip,
@@ -340,6 +341,9 @@ h1_reject_header_value_bare_controls(Config) ->
 
 h1_no_smuggling(Config) ->
     run_property(nhttp_h1_props, prop_no_smuggling, Config).
+
+h1_request_method_is_token(Config) ->
+    run_property(nhttp_h1_props, prop_request_method_is_token, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% HTTP/2 PROPERTY TESTS
