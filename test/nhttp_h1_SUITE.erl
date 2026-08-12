@@ -858,7 +858,7 @@ encode_method_coverage(_Config) ->
     ?assertEqual(<<"CUSTOM">>, nhttp_lib:encode_method(<<"CUSTOM">>)).
 
 parse_unknown_method_with_crlf_before_space(_Config) ->
-    {error, bad_request_line} = nhttp_h1:parse_request(<<"UNKNOWNMETHOD\r\n/ HTTP/1.1\r\n\r\n">>).
+    {error, invalid_method} = nhttp_h1:parse_request(<<"UNKNOWNMETHOD\r\n/ HTTP/1.1\r\n\r\n">>).
 
 parse_unknown_method_long(_Config) ->
     {error, bad_request_line} = nhttp_h1:parse_request(<<"VERYLONGMETHODNAME / HTTP/1.1\r\n\r\n">>).

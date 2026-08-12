@@ -22,6 +22,7 @@ Run with: rebar3 ct --suite=test/compliance/nhttp_h1_rfc9112_SUITE
 all() ->
     [
         {group, section_2_message},
+        {group, section_3_request_line},
         {group, section_4_status_line},
         {group, section_5_field_syntax},
         {group, section_6_message_body},
@@ -35,6 +36,16 @@ groups() ->
             parse_as_ascii_superset,
             reject_or_replace_bare_cr,
             reject_whitespace_before_headers
+        ]},
+        {section_3_request_line, [parallel], [
+            reject_method_with_crlf,
+            reject_method_with_non_token_octets,
+            reject_method_with_whitespace,
+            reject_lowercase_method,
+            reject_overlong_method,
+            accept_token_method_outside_alpha,
+            known_methods_return_atom,
+            truncated_request_line_returns_more
         ]},
         {section_4_status_line, [parallel], [
             status_line_space_before_reason
@@ -101,6 +112,124 @@ reject_or_replace_bare_cr(_Config) ->
 reject_whitespace_before_headers(_Config) ->
     Req = <<"GET / HTTP/1.1\r\n Host: x\r\n\r\n">>,
     ?assertMatch({error, _}, nhttp_h1:parse_request(Req)).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 3 - Request Line
+%%%
+%%% RFC 9112 Section 3.1: method = token.
+%%% RFC 9110 Section 5.6.2: token = 1*tchar.
+%%%-----------------------------------------------------------------------------
+
+reject_method_with_crlf(_Config) ->
+    Req = <<"XX\r\nY /p HTTP/1.1\r\nHost: a\r\n\r\n">>,
+    ?assertEqual({error, invalid_method}, nhttp_h1:parse_request(Req)),
+    ?assertEqual({error, invalid_method}, nhttp_h1:parse_request_headers(Req, #{})).
+
+reject_method_with_non_token_octets(_Config) ->
+    lists:foreach(
+        fun(Octet) ->
+            Req = request_with_method(<<"GE", Octet:8, "T">>),
+            ?assertEqual(
+                {error, invalid_method},
+                nhttp_h1:parse_request(Req),
+                {octet, Octet}
+            )
+        end,
+        non_tchar_octets()
+    ).
+
+reject_method_with_whitespace(_Config) ->
+    ?assertMatch(
+        {error, _}, nhttp_h1:parse_request(<<"GE T /p HTTP/1.1\r\nHost: a\r\n\r\n">>)
+    ),
+    ?assertEqual(
+        {error, invalid_method}, nhttp_h1:parse_request(request_with_method(<<"GE\tT">>))
+    ).
+
+reject_lowercase_method(_Config) ->
+    ?assertEqual(
+        {error, invalid_method}, nhttp_h1:parse_request(request_with_method(<<"get">>))
+    ),
+    ?assertEqual(
+        {error, invalid_method}, nhttp_h1:parse_request(request_with_method(<<"gEt">>))
+    ).
+
+reject_overlong_method(_Config) ->
+    ?assertMatch(
+        {ok, #{method := <<"ABCDEFGHIJKLMNOP">>}, _},
+        nhttp_h1:parse_request(request_with_method(<<"ABCDEFGHIJKLMNOP">>))
+    ),
+    ?assertMatch(
+        {error, _}, nhttp_h1:parse_request(request_with_method(<<"ABCDEFGHIJKLMNOPQ">>))
+    ).
+
+accept_token_method_outside_alpha(_Config) ->
+    lists:foreach(
+        fun(Method) ->
+            ?assertMatch(
+                {ok, #{method := Method}, _},
+                nhttp_h1:parse_request(request_with_method(Method)),
+                {method, Method}
+            )
+        end,
+        [
+            <<"PROPFIND">>,
+            <<"M-SEARCH">>,
+            <<"!#$%&*">>,
+            <<"7ZIP">>,
+            <<"X'A">>,
+            <<"A+B.C">>,
+            <<"^_`|~">>
+        ]
+    ).
+
+known_methods_return_atom(_Config) ->
+    Known = [
+        {<<"GET">>, get},
+        {<<"POST">>, post},
+        {<<"PUT">>, put},
+        {<<"HEAD">>, head},
+        {<<"DELETE">>, delete},
+        {<<"PATCH">>, patch},
+        {<<"OPTIONS">>, options},
+        {<<"CONNECT">>, connect},
+        {<<"TRACE">>, trace}
+    ],
+    lists:foreach(
+        fun({Bin, Atom}) ->
+            ?assertMatch(
+                {ok, #{method := Atom}, _},
+                nhttp_h1:parse_request(request_with_method(Bin)),
+                {method, Bin}
+            )
+        end,
+        Known
+    ).
+
+truncated_request_line_returns_more(_Config) ->
+    Fulls = [
+        request_with_method(<<"GET">>),
+        request_with_method(<<"PROPFIND">>),
+        request_with_method(<<"M-SEARCH">>),
+        request_with_method(<<"!#$%&*">>),
+        request_with_method(<<"7ZIP">>)
+    ],
+    lists:foreach(
+        fun(Full) ->
+            lists:foreach(
+                fun(N) ->
+                    Prefix = binary:part(Full, 0, N),
+                    ?assertMatch(
+                        {more, More} when More >= 1,
+                        nhttp_h1:parse_request(Prefix),
+                        {prefix, Prefix}
+                    )
+                end,
+                lists:seq(0, byte_size(Full) - 1)
+            )
+        end,
+        Fulls
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 4 - Status Line
@@ -393,6 +522,15 @@ single_header_terminator(_Config) ->
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
+
+-spec request_with_method(binary()) -> binary().
+request_with_method(Method) ->
+    <<Method/binary, " /p HTTP/1.1\r\nHost: a\r\n\r\n">>.
+
+-spec non_tchar_octets() -> [byte()].
+non_tchar_octets() ->
+    [0, 16#09, 16#0A, 16#0B, 16#0C, 16#0D, 16#7F, 16#80, 16#FF] ++
+        [$", $(, $), $,, $/, $:, $;, $<, $=, $>, $?, $@, $[, $\\, $], ${, $}].
 
 -spec injection_values() -> [binary()].
 injection_values() ->

@@ -363,6 +363,42 @@ prop_reject_header_value_bare_controls() ->
         end
     ).
 
+-spec prop_request_method_is_token() -> triq:property().
+prop_request_method_is_token() ->
+    ?FORALL(
+        {MethodBin, Path},
+        {method_fuzz_gen(), elements([<<"/">>, <<"/p">>, <<"/a/b?q=1">>])},
+        begin
+            Req = <<MethodBin/binary, " ", Path/binary, " HTTP/1.1\r\nHost: x\r\n\r\n">>,
+            case nhttp_h1:parse_request(Req) of
+                {ok, #{method := Method}, _} -> method_is_rfc9110_token(Method);
+                _ -> true
+            end
+        end
+    ).
+
+-spec method_fuzz_gen() -> triq_dom:domain().
+method_fuzz_gen() ->
+    ?LET(
+        Chars,
+        non_empty(list(oneof([tchar_byte_gen(), non_tchar_byte_gen(), int(0, 255)]))),
+        list_to_binary(lists:sublist(Chars, 16))
+    ).
+
+-spec method_is_rfc9110_token(nhttp_lib:method()) -> boolean().
+method_is_rfc9110_token(Method) when is_atom(Method) ->
+    lists:member(Method, [get, head, post, put, delete, connect, options, trace, patch]);
+method_is_rfc9110_token(<<>>) ->
+    false;
+method_is_rfc9110_token(Method) when is_binary(Method) ->
+    lists:all(fun is_tchar_byte/1, binary_to_list(Method)).
+
+-spec is_tchar_byte(byte()) -> boolean().
+is_tchar_byte(C) when C >= $a, C =< $z -> true;
+is_tchar_byte(C) when C >= $A, C =< $Z -> true;
+is_tchar_byte(C) when C >= $0, C =< $9 -> true;
+is_tchar_byte(C) -> lists:member(C, [$!, $#, $$, $%, $&, $', $*, $+, $-, $., $^, $_, $`, $|, $~]).
+
 -spec valid_token_gen() -> triq_dom:domain().
 valid_token_gen() ->
     ?LET(Chars, non_empty(list(tchar_byte_gen())), list_to_binary(Chars)).

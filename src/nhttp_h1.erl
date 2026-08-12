@@ -2046,9 +2046,30 @@ parse_request_line(<<"CONNECT ", Rest/binary>>) ->
 parse_request_line(<<"TRACE ", Rest/binary>>) ->
     find_path_version(Rest, trace);
 parse_request_line(<<C, _/binary>> = Bin) when C >= $A, C =< $Z ->
+    parse_request_line_token(Bin);
+parse_request_line(<<C, _/binary>>) when C >= $a, C =< $z ->
+    {error, invalid_method};
+parse_request_line(<<"\r\n", _/binary>>) ->
+    {error, bad_request_line};
+parse_request_line(<<C, _/binary>> = Bin) ->
+    case is_tchar(C) of
+        true -> parse_request_line_token(Bin);
+        false -> parse_request_line_cold(Bin)
+    end;
+parse_request_line(<<>>) ->
+    {more, 16}.
+
+-spec parse_request_line_token(binary()) ->
+    {ok, nhttp_lib:method(), binary(), version(), binary()}
+    | {more, pos_integer()}
+    | {error, parse_error()}.
+parse_request_line_token(Bin) ->
     case binary:split(Bin, <<" ">>) of
         [Method, Rest] when byte_size(Method) =< 16 ->
-            find_path_version(Rest, Method);
+            case is_token(Method) of
+                true -> find_path_version(Rest, Method);
+                false -> {error, invalid_method}
+            end;
         [_] when byte_size(Bin) < 18 ->
             case binary:match(Bin, <<"\r\n">>) of
                 nomatch -> {more, 18 - byte_size(Bin)};
@@ -2056,14 +2077,13 @@ parse_request_line(<<C, _/binary>> = Bin) when C >= $A, C =< $Z ->
             end;
         _ ->
             {error, bad_request_line}
-    end;
-parse_request_line(<<C, _/binary>>) when C >= $a, C =< $z ->
-    {error, invalid_method};
-parse_request_line(<<"\r\n", _/binary>>) ->
-    {error, bad_request_line};
-parse_request_line(Bin) when byte_size(Bin) < 16 ->
+    end.
+
+-spec parse_request_line_cold(binary()) ->
+    {more, pos_integer()} | {error, parse_error()}.
+parse_request_line_cold(Bin) when byte_size(Bin) < 16 ->
     {more, 16 - byte_size(Bin)};
-parse_request_line(_) ->
+parse_request_line_cold(_) ->
     {error, bad_request_line}.
 
 -spec parse_status_line(binary()) ->
