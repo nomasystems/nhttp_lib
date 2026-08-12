@@ -20,7 +20,7 @@ Key invariants:
 """.
 
 -compile(
-    {inline, [to_lower/1]}
+    {inline, [to_lower/1, is_tchar/1]}
 ).
 
 %%%-----------------------------------------------------------------------------
@@ -33,6 +33,8 @@ Key invariants:
     get/2,
     get/3,
     has/2,
+    is_tchar/1,
+    is_token/1,
     set/3,
     to_lower/1
 ]).
@@ -80,6 +82,43 @@ get(Name, Headers, Default) ->
 has(Name, Headers) ->
     Lower = to_lower(Name),
     do_has(Lower, Headers).
+
+-doc """
+True iff `C` is a `tchar`, the character set that RFC 9110 §5.6.2 allows
+in a `token`.
+
+RFC 6265 §4.1.1 defines `cookie-name` in terms of the RFC 2616 §2.2
+`token`, which admits the same octets, so cookie names are checked with
+this predicate too.
+""".
+-spec is_tchar(byte()) -> boolean().
+is_tchar(C) when C >= $a, C =< $z -> true;
+is_tchar(C) when C >= $A, C =< $Z -> true;
+is_tchar(C) when C >= $0, C =< $9 -> true;
+is_tchar($!) -> true;
+is_tchar($#) -> true;
+is_tchar($$) -> true;
+is_tchar($%) -> true;
+is_tchar($&) -> true;
+is_tchar($') -> true;
+is_tchar($*) -> true;
+is_tchar($+) -> true;
+is_tchar($-) -> true;
+is_tchar($.) -> true;
+is_tchar($^) -> true;
+is_tchar($_) -> true;
+is_tchar($`) -> true;
+is_tchar($|) -> true;
+is_tchar($~) -> true;
+is_tchar(_) -> false.
+
+-doc """
+True iff `Bin` is a `token` per RFC 9110 §5.6.2: `token = 1*tchar`. An
+empty binary is not a token.
+""".
+-spec is_token(binary()) -> boolean().
+is_token(<<>>) -> false;
+is_token(Bin) -> is_token_chars(Bin).
 
 -doc """
 Replace every occurrence of `Name` with a single `{Name, Value}` entry.
@@ -180,6 +219,15 @@ do_get(_, [], Default) -> Default.
 do_has(Name, [{Name, _} | _]) -> true;
 do_has(Name, [_ | Rest]) -> do_has(Name, Rest);
 do_has(_, []) -> false.
+
+-spec is_token_chars(binary()) -> boolean().
+is_token_chars(<<>>) ->
+    true;
+is_token_chars(<<C, Rest/binary>>) ->
+    case is_tchar(C) of
+        true -> is_token_chars(Rest);
+        false -> false
+    end.
 
 -compile({inline, [to_lower_byte/1]}).
 -spec to_lower_byte(byte()) -> byte().
