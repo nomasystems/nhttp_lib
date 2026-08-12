@@ -377,6 +377,90 @@ prop_request_method_is_token() ->
         end
     ).
 
+%% RFC 9110 Section 8.6: Content-Length = 1*DIGIT. RFC 9110 Section 5.5 strips
+%% leading and trailing OWS before the field value is read.
+-spec prop_content_length_is_digits() -> triq:property().
+prop_content_length_is_digits() ->
+    ?FORALL(
+        Value,
+        content_length_fuzz_gen(),
+        begin
+            Req =
+                <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ", Value/binary, "\r\n\r\n">>,
+            Valid = is_content_length_abnf(trim_ows(Value)),
+            case nhttp_h1:parse_request(Req) of
+                {ok, _, _} -> Valid;
+                {more, _} -> Valid;
+                {error, invalid_content_length} -> not Valid;
+                {error, _} -> false
+            end
+        end
+    ).
+
+-spec content_length_fuzz_gen() -> triq_dom:domain().
+content_length_fuzz_gen() ->
+    oneof([
+        signed_content_length_gen(),
+        affixed_content_length_gen(),
+        free_content_length_gen()
+    ]).
+
+%% A bare fuzz generator almost never lands on "+5", the one shape that a
+%% binary_to_integer/1 based parser accepts and the ABNF does not.
+-spec signed_content_length_gen() -> triq_dom:domain().
+signed_content_length_gen() ->
+    ?LET(
+        {Sign, Digits},
+        {elements([<<"+">>, <<"-">>]), elements([<<"0">>, <<"5">>, <<"42">>, <<"007">>])},
+        <<Sign/binary, Digits/binary>>
+    ).
+
+-spec affixed_content_length_gen() -> triq_dom:domain().
+affixed_content_length_gen() ->
+    ?LET(
+        {Prefix, Digits, Suffix},
+        {
+            elements([<<>>, <<"+">>, <<"-">>, <<" ">>, <<"\t">>, <<"0x">>, <<"00">>]),
+            elements([<<>>, <<"0">>, <<"5">>, <<"42">>]),
+            elements([<<>>, <<" ">>, <<"\t">>, <<".0">>, <<",5">>, <<239, 188, 149>>])
+        },
+        <<Prefix/binary, Digits/binary, Suffix/binary>>
+    ).
+
+-spec free_content_length_gen() -> triq_dom:domain().
+free_content_length_gen() ->
+    ?LET(
+        Chars,
+        list(content_length_byte_gen()),
+        list_to_binary(lists:sublist(Chars, 6))
+    ).
+
+-spec content_length_byte_gen() -> triq_dom:domain().
+content_length_byte_gen() ->
+    oneof([
+        int($0, $9),
+        elements([$+, $-, $\s, $\t, $., $,, $x, $a, $O, 16#EF])
+    ]).
+
+-spec is_content_length_abnf(binary()) -> boolean().
+is_content_length_abnf(<<>>) ->
+    false;
+is_content_length_abnf(Bin) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, binary_to_list(Bin)).
+
+-spec trim_ows(binary()) -> binary().
+trim_ows(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t ->
+    trim_ows(Rest);
+trim_ows(<<>>) ->
+    <<>>;
+trim_ows(Bin) ->
+    case binary:last(Bin) of
+        C when C =:= $\s; C =:= $\t ->
+            trim_ows(binary:part(Bin, 0, byte_size(Bin) - 1));
+        _ ->
+            Bin
+    end.
+
 -spec method_fuzz_gen() -> triq_dom:domain().
 method_fuzz_gen() ->
     ?LET(

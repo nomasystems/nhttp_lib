@@ -2,7 +2,9 @@
 
 -moduledoc """
 Shared message-level helpers for the HTTP/2 (RFC 9113) and HTTP/3
-(RFC 9114) state machines.
+(RFC 9114) state machines. `nhttp_h1` (RFC 9112) shares the digit and
+length parsing, so all three wire formats read a `content-length` value
+through one implementation of the RFC 9110 Section 8.6 ABNF.
 
 These functions deal with the parts of a request/response that are
 identical on both wire formats once the framing layer has produced a
