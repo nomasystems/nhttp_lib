@@ -96,6 +96,9 @@ decoding, and stateful fragmentation for both server and client roles.
     frag_message_too_large_continuation/1,
     frag_single_frame_too_large/1,
     frag_max_message_size_infinity/1,
+    frag_frame_cap_refuses_before_buffering/1,
+    frag_frame_cap_infinity_buffers/1,
+    frag_default_max_message_size_is_finite/1,
     session_accessors/1,
     session_send_envelope/1,
     session_send_async_envelope/1,
@@ -210,7 +213,10 @@ groups() ->
             frag_message_too_large_start,
             frag_message_too_large_continuation,
             frag_single_frame_too_large,
-            frag_max_message_size_infinity
+            frag_max_message_size_infinity,
+            frag_frame_cap_refuses_before_buffering,
+            frag_frame_cap_infinity_buffers,
+            frag_default_max_message_size_is_finite
         ]},
         {session, [parallel], [
             session_accessors,
@@ -735,6 +741,29 @@ frag_max_message_size_infinity(_Config) ->
     Big = binary:copy(<<"x">>, 1024),
     Frame = <<16#81, 16#7E, 1024:16, Big/binary>>,
     {ok, {text, Big}, <<>>, _Dec1} = nhttp_ws:decode_with_state(Frame, Dec0).
+
+frag_frame_cap_refuses_before_buffering(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => 1024}),
+    Header = <<16#82, 127, 0:1, (1 bsl 40):63>>,
+    ?assertEqual(
+        {error, {frame_too_large, 1 bsl 40}},
+        nhttp_ws:decode_with_state(Header, Dec0)
+    ).
+
+frag_frame_cap_infinity_buffers(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => infinity}),
+    Header = <<16#82, 127, 0:1, (1 bsl 40):63>>,
+    ?assertMatch({more, _, _}, nhttp_ws:decode_with_state(Header, Dec0)).
+
+frag_default_max_message_size_is_finite(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    Header = <<16#82, 127, 0:1, (1 bsl 60):63>>,
+    ?assertEqual(
+        {error, {frame_too_large, 1 bsl 60}},
+        nhttp_ws:decode_with_state(Header, Dec0)
+    ),
+    Small = <<16#82, 2, "hi">>,
+    ?assertMatch({ok, {binary, <<"hi">>}, <<>>, _}, nhttp_ws:decode_with_state(Small, Dec0)).
 
 %%%-----------------------------------------------------------------------------
 %%% SESSION TESTS
