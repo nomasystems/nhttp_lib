@@ -532,10 +532,26 @@ decode_headers_internal(
                                         ),
                                         active_stream_count = NewActiveCount
                                     },
-                                    Events = build_headers_event(
-                                        Role, IsTrailers, StreamId, Headers, EndStream, NewConn
-                                    ),
-                                    {ok, NewConn, Events, []};
+                                    case
+                                        build_headers_event(
+                                            Role,
+                                            IsTrailers,
+                                            StreamId,
+                                            Headers,
+                                            EndStream,
+                                            NewConn
+                                        )
+                                    of
+                                        {ok, Events} ->
+                                            {ok, NewConn, Events, []};
+                                        {error, _} ->
+                                            {error,
+                                                {stream_error, StreamId, protocol_error, <<
+                                                    "Malformed response: :status is not three "
+                                                    "digits in 100-599 (RFC 9113 Section 8.1.1, "
+                                                    "Section 8.3.2)"
+                                                >>}}
+                                    end;
                                 {error, protocol_error} ->
                                     {error,
                                         {stream_error, StreamId, protocol_error,
@@ -1153,21 +1169,24 @@ validate_recv_flow(_ConnWindow, _StreamWindow, _StreamId) ->
 -spec build_headers_event(
     role(), boolean(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin(), conn()
 ) ->
-    [event()].
+    {ok, [event()]} | {error, nhttp_msg:status_error()}.
 build_headers_event(_, true, StreamId, Headers, _Fin, _Conn) ->
-    [{trailers, StreamId, Headers}];
+    {ok, [{trailers, StreamId, Headers}]};
 build_headers_event(server, false, StreamId, Headers, Fin, Conn) ->
     Request = build_request(Conn, Headers),
-    [{request, StreamId, Request, Fin}];
+    {ok, [{request, StreamId, Request, Fin}]};
 build_headers_event(client, false, StreamId, Headers, Fin, _Conn) ->
-    Response = build_response(Headers),
-    [{response, StreamId, Response, Fin}].
+    maybe
+        {ok, Response} ?= build_response(Headers),
+        {ok, [{response, StreamId, Response, Fin}]}
+    end.
 
 -spec build_request(conn(), nhttp_lib:headers()) -> nhttp_lib:request().
 build_request(#h2_conn{peer = Peer}, Headers) ->
     nhttp_msg:build_request(http2, Peer, Headers).
 
--spec build_response(nhttp_lib:headers()) -> nhttp_lib:response().
+-spec build_response(nhttp_lib:headers()) ->
+    {ok, nhttp_lib:response()} | {error, nhttp_msg:status_error()}.
 build_response(Headers) ->
     nhttp_msg:build_response(http2, Headers).
 

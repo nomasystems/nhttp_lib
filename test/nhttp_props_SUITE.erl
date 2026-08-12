@@ -162,7 +162,10 @@ groups() ->
         ]},
         {msg_props, [parallel], [
             msg_validate_request_pseudo_shape_no_crash,
-            msg_validate_request_pseudo_shape_valid_roundtrip
+            msg_validate_request_pseudo_shape_valid_roundtrip,
+            msg_extract_response_pseudo_never_raises,
+            msg_extract_response_pseudo_accepts_exactly_valid_status,
+            msg_extract_response_pseudo_missing_status
         ]},
         {compress_props, [parallel], [
             compress_roundtrip_gzip,
@@ -537,6 +540,17 @@ msg_validate_request_pseudo_shape_no_crash(Config) ->
 
 msg_validate_request_pseudo_shape_valid_roundtrip(Config) ->
     run_property(nhttp_msg_props, prop_validate_request_pseudo_shape_valid_roundtrip, Config).
+
+msg_extract_response_pseudo_never_raises(Config) ->
+    run_property(nhttp_msg_props, prop_extract_response_pseudo_never_raises, Config).
+
+msg_extract_response_pseudo_accepts_exactly_valid_status(Config) ->
+    run_property(
+        nhttp_msg_props, prop_extract_response_pseudo_accepts_exactly_valid_status, Config
+    ).
+
+msg_extract_response_pseudo_missing_status(Config) ->
+    run_property(nhttp_msg_props, prop_extract_response_pseudo_missing_status, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% NHTTP_COMPRESS PROPERTY TESTS
