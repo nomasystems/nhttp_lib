@@ -151,6 +151,7 @@ groups() ->
             ws_continuation_without_start_rejected,
             ws_new_message_mid_fragmentation_rejected,
             ws_max_message_size_cumulative,
+            ws_frame_cap_bounds_more,
             ws_incremental_utf8_matches_whole
         ]},
         {cookie_props, [parallel], [
@@ -511,6 +512,9 @@ ws_new_message_mid_fragmentation_rejected(Config) ->
 
 ws_max_message_size_cumulative(Config) ->
     run_property(nhttp_ws_props, prop_ws_max_message_size_cumulative, Config).
+
+ws_frame_cap_bounds_more(Config) ->
+    run_property(nhttp_ws_props, prop_ws_frame_cap_bounds_more, Config).
 
 ws_incremental_utf8_matches_whole(Config) ->
     run_property(nhttp_ws_props, prop_ws_incremental_utf8_matches_whole, Config).

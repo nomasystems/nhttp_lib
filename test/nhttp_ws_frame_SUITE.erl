@@ -15,6 +15,7 @@ all() ->
     [
         {group, encode},
         {group, decode_raw},
+        {group, frame_cap},
         {group, helpers}
     ].
 
@@ -31,7 +32,24 @@ groups() ->
             decode_raw_client,
             decode_raw_server,
             decode_raw_more,
-            decode_raw_invalid_mask
+            decode_raw_invalid_mask,
+            decode_raw_reserved_bits_masked,
+            decode_raw_reserved_bits_unmasked
+        ]},
+        {frame_cap, [parallel], [
+            cap_refuses_declared_64bit,
+            cap_infinity_keeps_more,
+            cap_absent_keeps_more,
+            cap_refuses_declared_16bit,
+            cap_accepts_length_at_cap,
+            cap_refuses_length_one_above,
+            cap_refuses_complete_frame,
+            cap_truncated_header_16_untouched,
+            cap_truncated_header_64_untouched,
+            cap_floor_allows_control_frame,
+            cap_refuses_unmasked_64bit,
+            cap_decode_refuses,
+            cap_decode_unmasked_refuses
         ]},
         {helpers, [parallel], [
             validate_control_frame_ok,
@@ -92,6 +110,111 @@ decode_raw_more(_Config) ->
 decode_raw_invalid_mask(_Config) ->
     Unmasked = iolist_to_binary(nhttp_ws_frame:encode({text, <<"x">>})),
     ?assertEqual({error, unmasked_client_frame}, nhttp_ws_frame:decode_raw(Unmasked, server)).
+
+decode_raw_reserved_bits_masked(_Config) ->
+    Frame = <<1:1, 4:3, 1:4, 1:1, 0:7, 0:32>>,
+    ?assertEqual({error, reserved_bits_set}, nhttp_ws_frame:decode_raw(Frame, server)).
+
+decode_raw_reserved_bits_unmasked(_Config) ->
+    Frame = <<1:1, 4:3, 1:4, 0:1, 0:7>>,
+    ?assertEqual({error, reserved_bits_set}, nhttp_ws_frame:decode_raw(Frame, client)).
+
+%%%-----------------------------------------------------------------------------
+%%% FRAME LENGTH CAP TESTS (RFC 6455 Section 10.4)
+%%%
+%%% Section 10.4 requires an implementation to protect itself against "a
+%%% single big frame (e.g., of size 2**60)". A declared length above the
+%%% caller's cap is refused when the length is read, before the caller
+%%% buffers the payload. Section 5.5 bounds a control frame at 125 bytes,
+%%% so the effective cap never drops below 125.
+%%%-----------------------------------------------------------------------------
+
+cap_refuses_declared_64bit(_Config) ->
+    ?assertEqual(
+        {error, {frame_too_large, 1 bsl 60}},
+        nhttp_ws_frame:decode_raw(exabyte_header(), server, #{max_frame_size => 1024})
+    ).
+
+cap_infinity_keeps_more(_Config) ->
+    ?assertEqual(
+        {more, 1 bsl 60},
+        nhttp_ws_frame:decode_raw(exabyte_header(), server, #{max_frame_size => infinity})
+    ).
+
+cap_absent_keeps_more(_Config) ->
+    ?assertEqual({more, 1 bsl 60}, nhttp_ws_frame:decode_raw(exabyte_header(), server, #{})),
+    ?assertEqual({more, 1 bsl 60}, nhttp_ws_frame:decode_raw(exabyte_header(), server)).
+
+cap_refuses_declared_16bit(_Config) ->
+    Header = <<16#82, 16#FE, 1000:16>>,
+    ?assertEqual(
+        {error, {frame_too_large, 1000}},
+        nhttp_ws_frame:decode_raw(Header, server, #{max_frame_size => 200})
+    ).
+
+cap_accepts_length_at_cap(_Config) ->
+    Header = <<16#82, 16#FE, 1000:16>>,
+    ?assertEqual(
+        {more, 1004},
+        nhttp_ws_frame:decode_raw(Header, server, #{max_frame_size => 1000})
+    ).
+
+cap_refuses_length_one_above(_Config) ->
+    Header = <<16#82, 16#FE, 1001:16>>,
+    ?assertEqual(
+        {error, {frame_too_large, 1001}},
+        nhttp_ws_frame:decode_raw(Header, server, #{max_frame_size => 1000})
+    ).
+
+cap_refuses_complete_frame(_Config) ->
+    Frame = iolist_to_binary(nhttp_ws_frame:encode_masked({binary, binary:copy(<<0>>, 200)})),
+    ?assertEqual(
+        {error, {frame_too_large, 200}},
+        nhttp_ws_frame:decode_raw(Frame, server, #{max_frame_size => 125})
+    ).
+
+cap_truncated_header_16_untouched(_Config) ->
+    ?assertEqual(
+        {more, 2},
+        nhttp_ws_frame:decode_raw(<<16#82, 16#FE>>, server, #{max_frame_size => 125})
+    ).
+
+cap_truncated_header_64_untouched(_Config) ->
+    ?assertEqual(
+        {more, 6},
+        nhttp_ws_frame:decode_raw(<<16#82, 16#FF, 0, 0>>, server, #{max_frame_size => 125})
+    ).
+
+cap_floor_allows_control_frame(_Config) ->
+    Payload = binary:copy(<<7>>, 125),
+    Frame = iolist_to_binary(nhttp_ws_frame:encode_masked({ping, Payload})),
+    ?assertEqual(
+        {ok, 1, 9, Payload, <<>>},
+        nhttp_ws_frame:decode_raw(Frame, server, #{max_frame_size => 10})
+    ).
+
+cap_refuses_unmasked_64bit(_Config) ->
+    Header = <<1:1, 0:3, 2:4, 0:1, 127:7, 0:1, (1 bsl 60):63>>,
+    ?assertEqual(
+        {error, {frame_too_large, 1 bsl 60}},
+        nhttp_ws_frame:decode_raw(Header, client, #{max_frame_size => 1024})
+    ).
+
+cap_decode_refuses(_Config) ->
+    ?assertEqual(
+        {error, {frame_too_large, 1 bsl 60}},
+        nhttp_ws_frame:decode(exabyte_header(), #{max_frame_size => 1024})
+    ).
+
+cap_decode_unmasked_refuses(_Config) ->
+    Header = <<1:1, 0:3, 2:4, 0:1, 127:7, 0:1, (1 bsl 60):63>>,
+    ?assertEqual(
+        {error, {frame_too_large, 1 bsl 60}},
+        nhttp_ws_frame:decode_unmasked(Header, #{max_frame_size => 1024})
+    ).
+
+exabyte_header() ->
+    <<1:1, 0:3, 2:4, 1:1, 127:7, 0:1, (1 bsl 60):63, 0, 0, 0, 0>>.
 
 %%%-----------------------------------------------------------------------------
 %%% HELPER TESTS

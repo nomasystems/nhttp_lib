@@ -173,6 +173,7 @@ for backwards compatibility.
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
 -define(WS_MAGIC, <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>).
+-define(WS_DEFAULT_MAX_MESSAGE_SIZE, 16777216).
 -define(OP_CONTINUATION, 0).
 -define(OP_TEXT, 1).
 -define(OP_BINARY, 2).
@@ -199,7 +200,9 @@ for backwards compatibility.
     frag_opcode :: 0..15 | undefined,
     frag_acc = [] :: [binary()],
     frag_acc_size = 0 :: non_neg_integer(),
-    max_message_size = infinity :: pos_integer() | infinity,
+    max_message_size = ?WS_DEFAULT_MAX_MESSAGE_SIZE :: pos_integer() | infinity,
+    frame_limits = #{max_frame_size => ?WS_DEFAULT_MAX_MESSAGE_SIZE} ::
+        nhttp_ws_frame:frame_limits(),
     utf8_carry = <<>> :: binary()
 }).
 
@@ -422,8 +425,8 @@ If you keep the whole buffer after a consumed frame, the next call
 decodes that frame again and fails with `expected_continuation`.
 """.
 -spec decode_with_state(binary(), ws_decoder()) -> stateful_decode_result().
-decode_with_state(Data, #ws_decoder{role = Role} = Dec) ->
-    case nhttp_ws_frame:decode_raw(Data, Role) of
+decode_with_state(Data, #ws_decoder{role = Role, frame_limits = Limits} = Dec) ->
+    case nhttp_ws_frame:decode_raw(Data, Role, Limits) of
         {ok, Fin, Opcode, Payload, Rest} ->
             case nhttp_ws_frame:validate_control_frame(Fin, Opcode, Payload) of
                 ok -> process_fragment(Fin, Opcode, Payload, Rest, Dec);
@@ -435,24 +438,39 @@ decode_with_state(Data, #ws_decoder{role = Role} = Dec) ->
             Err
     end.
 
--doc "Create a new stateful decoder for the given role.".
+-doc """
+Create a new stateful decoder for the given role, with the default
+`max_message_size` of 16 MiB. Equivalent to `decoder_new(Role, #{})`.
+""".
 -spec decoder_new(client | server) -> ws_decoder().
 decoder_new(Role) ->
     decoder_new(Role, #{}).
 
 -doc """
 Create a new stateful decoder honouring `max_message_size` from the runtime
-opts. The cap applies to the cumulative payload of fragmented messages and
-to single non-control frames; exceeding it returns `{error, message_too_large}`.
+opts. The option defaults to 16 MiB and bounds two different things.
+
+The cumulative payload of a fragmented message, and the payload of a single
+non-control frame, are measured after the bytes arrive. Exceeding the option
+returns `{error, message_too_large}`.
+
+The payload length that a frame header declares is refused before any payload
+is buffered (RFC 6455 §10.4). Exceeding the option returns
+`{error, {frame_too_large, DeclaredLength}}`, and the caller closes with
+status 1009 (§7.4.1). This bound never drops below 125 bytes, the largest
+control frame that §5.5 permits.
+
+Pass `max_message_size => infinity` to remove both bounds.
 """.
 -spec decoder_new(client | server, ws_runtime_opts()) -> ws_decoder().
 decoder_new(Role, Opts) ->
-    Max = maps:get(max_message_size, Opts, infinity),
+    Max = maps:get(max_message_size, Opts, ?WS_DEFAULT_MAX_MESSAGE_SIZE),
     #ws_decoder{
         role = Role,
         frag_opcode = undefined,
         frag_acc = [],
-        max_message_size = Max
+        max_message_size = Max,
+        frame_limits = #{max_frame_size => Max}
     }.
 
 %%%-----------------------------------------------------------------------------
