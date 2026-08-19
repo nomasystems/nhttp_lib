@@ -75,7 +75,10 @@ groups() ->
             parse_chunked,
             handle_large_chunk_size,
             ignore_chunk_extensions,
-            handle_trailer_fields
+            handle_trailer_fields,
+            reject_chunk_data_without_crlf_request,
+            reject_chunk_data_without_crlf_response,
+            short_chunk_data_returns_more
         ]},
         {section_11_response_splitting, [parallel], [
             reject_field_value_injection,
@@ -509,6 +512,43 @@ handle_trailer_fields(_Config) ->
              "\r\n">>,
     {ok, #{body := Body}, _} = nhttp_h1:parse_response(Resp),
     ?assertEqual(<<"hello">>, iolist_to_binary(Body)).
+
+%% RFC 9112 Section 7.1: chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF.
+%% The CRLF behind chunk-data is mandatory. Data long enough to satisfy the
+%% chunk-size, with any other pair of octets behind it, is a refusal and not a
+%% crash.
+reject_chunk_data_without_crlf_request(_Config) ->
+    Req = <<"POST / HTTP/1.1\r\n",
+            "Host: x\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "1\r\nABC">>,
+    ?assertEqual({error, incomplete_chunk}, nhttp_h1:parse_request(Req)).
+
+reject_chunk_data_without_crlf_response(_Config) ->
+    Resp = <<"HTTP/1.1 200 OK\r\n",
+             "Transfer-Encoding: chunked\r\n",
+             "\r\n",
+             "1\r\nABC">>,
+    ?assertEqual({error, incomplete_chunk}, nhttp_h1:parse_response(Resp)).
+
+%% RFC 9112 Section 7.1: the octet count and the terminator are two rules. A
+%% body that holds fewer octets than the chunk-size names is incomplete, not
+%% malformed, so the parser asks for more.
+short_chunk_data_returns_more(_Config) ->
+    Req = <<"POST / HTTP/1.1\r\n",
+            "Host: x\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "5\r\nAB">>,
+    ?assertEqual({more, 5}, nhttp_h1:parse_request(Req)),
+    Valid = <<"POST / HTTP/1.1\r\n",
+              "Host: x\r\n",
+              "Transfer-Encoding: chunked\r\n",
+              "\r\n",
+              "1\r\nA\r\n0\r\n\r\n">>,
+    ?assertMatch({ok, #{body := <<"A">>}, 67}, nhttp_h1:parse_request(Valid)),
+    ?assertEqual(byte_size(Valid), 67).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 11.1 - Response Splitting
