@@ -175,7 +175,9 @@ groups() ->
             compress_decompress_max_output_gzip,
             compress_decompress_within_max_output_gzip,
             compress_decompress_truncated_no_crash,
-            compress_decompress_random_binary_no_crash
+            compress_decompress_random_binary_no_crash,
+            compress_decompress_respects_max,
+            compress_decompress_rejects_trailing_bytes
         ]}
     ].
 
@@ -581,6 +583,12 @@ compress_decompress_truncated_no_crash(Config) ->
 
 compress_decompress_random_binary_no_crash(Config) ->
     run_property(nhttp_compress_props, prop_decompress_random_binary_no_crash, Config).
+
+compress_decompress_respects_max(Config) ->
+    run_property(nhttp_compress_props, prop_decompress_respects_max, Config).
+
+compress_decompress_rejects_trailing_bytes(Config) ->
+    run_property(nhttp_compress_props, prop_decompress_rejects_trailing_bytes, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% HELPERS
