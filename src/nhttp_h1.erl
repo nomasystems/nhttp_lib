@@ -1210,12 +1210,16 @@ parse_chunk_body_after_size(<<Original/binary>>, Skip, SizeLen, SizeLine) ->
             BodyStart = Skip + HeaderLen,
             TotalNeeded = Size + 2,
             Available = byte_size(Original) - BodyStart,
-            case Available >= TotalNeeded of
-                true ->
-                    <<_:BodyStart/binary, ChunkData:Size/binary, "\r\n", _/binary>> = Original,
-                    {ok, ChunkData, HeaderLen + Size + 2};
+            %% RFC 9112 Section 7.1: a short body waits, a wrong terminator refuses.
+            maybe
+                true ?= Available >= TotalNeeded,
+                <<_:BodyStart/binary, ChunkData:Size/binary, "\r\n", _/binary>> ?= Original,
+                {ok, ChunkData, HeaderLen + Size + 2}
+            else
                 false ->
-                    {more, TotalNeeded - Available}
+                    {more, TotalNeeded - Available};
+                <<_/binary>> ->
+                    {error, incomplete_chunk}
             end;
         error ->
             {error, invalid_chunk_size}
