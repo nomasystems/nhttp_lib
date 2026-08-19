@@ -427,6 +427,47 @@ affixed_content_length_gen() ->
         <<Prefix/binary, Digits/binary, Suffix/binary>>
     ).
 
+%% RFC 9110 Section 5.3: a recipient combines multiple field lines with the
+%% same name into one comma-separated list, in order of receipt. The framing
+%% decision must therefore not depend on how the sender split the field.
+-spec prop_transfer_encoding_field_lines_join() -> triq:property().
+prop_transfer_encoding_field_lines_join() ->
+    ?FORALL(
+        Lines,
+        non_empty(list(transfer_coding_line_gen())),
+        te_framing(Lines) =:= te_framing([join_field_lines(Lines)])
+    ).
+
+-spec transfer_coding_line_gen() -> triq_dom:domain().
+transfer_coding_line_gen() ->
+    elements([
+        <<"chunked">>,
+        <<"Chunked">>,
+        <<" chunked\t">>,
+        <<"gzip">>,
+        <<"deflate">>,
+        <<"identity">>,
+        <<"gzip, chunked">>,
+        <<"chunked, gzip">>,
+        <<"chunked, chunked">>,
+        <<>>,
+        <<",">>
+    ]).
+
+-spec join_field_lines([binary()]) -> binary().
+join_field_lines(Lines) ->
+    iolist_to_binary(lists:join(<<", ">>, Lines)).
+
+-spec te_framing([binary()]) -> term().
+te_framing(Lines) ->
+    Field = [[<<"Transfer-Encoding: ">>, Line, <<"\r\n">>] || Line <- Lines],
+    Bin = iolist_to_binary([<<"POST / HTTP/1.1\r\nHost: x\r\n">>, Field, <<"\r\n0\r\n\r\n">>]),
+    case nhttp_h1:parse_request_headers(Bin, #{}) of
+        {ok, _Req, {chunked, _St}, _Consumed} -> chunked;
+        {ok, _Req, Stream, _Consumed} -> Stream;
+        Other -> Other
+    end.
+
 -spec free_content_length_gen() -> triq_dom:domain().
 free_content_length_gen() ->
     ?LET(
