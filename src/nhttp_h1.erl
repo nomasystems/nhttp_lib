@@ -278,7 +278,11 @@ Framing rules in order:
 
 - `HEAD` request → `none` (HEAD responses never have a body).
 - 1xx, 204, 304 status → `none`.
-- `Transfer-Encoding: chunked` → `{chunked, _}`.
+- `Transfer-Encoding` with `chunked` as the single final coding →
+  `{chunked, _}`. Every `Transfer-Encoding` field line contributes to the
+  coding list, in order of receipt (RFC 9110 §5.3).
+- `Transfer-Encoding` with any other coding list → `until_close`
+  (RFC 9112 §6.3 #4).
 - `Content-Length: N` → `{length, N}`.
 - otherwise → `until_close` (RFC 9112 §6.3 #7).
 
@@ -300,22 +304,9 @@ body_stream_from_response(_Method, _Status, Headers) ->
 
 -spec detect_response_body_stream(nhttp_lib:headers()) -> body_stream().
 detect_response_body_stream(Headers) ->
-    case nhttp_headers:get(<<"transfer-encoding">>, Headers) of
-        TE when is_binary(TE) ->
-            case is_chunked_transfer_encoding(TE) of
-                true -> {chunked, #chunked_st{}};
-                false -> until_close
-            end;
-        undefined ->
-            case nhttp_headers:get(<<"content-length">>, Headers) of
-                undefined ->
-                    until_close;
-                LenBin ->
-                    case parse_content_length(LenBin) of
-                        {ok, Len} -> {length, Len};
-                        {error, _} -> until_close
-                    end
-            end
+    case transfer_codings(Headers) of
+        absent -> content_length_body_stream(Headers);
+        Codings -> chunked_body_stream(Codings)
     end.
 
 -doc """
@@ -432,6 +423,11 @@ The body framing mode is encoded in `BodyStream`:
   into `parse_request_body/2`.
 The returned request map carries `body => streaming` instead of buffered
 bytes. Use `parse_request_body/2` to drive the body stream.
+
+Every `Transfer-Encoding` field line contributes to one coding list, in
+order of receipt (RFC 9110 §5.3). The parser returns
+`{error, unsupported_transfer_encoding}` unless that list holds `chunked`
+exactly once, as the final coding (RFC 9112 §6.1 and §6.3 #4).
 """.
 -spec parse_request_headers(binary(), opts()) ->
     {ok, req(), body_stream(), non_neg_integer()}
@@ -833,6 +829,54 @@ check_header_limits(_Size, _MaxSize, Count, MaxCount) when is_integer(MaxCount),
 check_header_limits(_Size, _MaxSize, _Count, _MaxCount) ->
     ok.
 
+-spec chunked_body_mode([binary()]) -> chunked | {error, unsupported_transfer_encoding}.
+chunked_body_mode(Codings) ->
+    case is_chunked_framing(Codings) of
+        true -> chunked;
+        false -> {error, unsupported_transfer_encoding}
+    end.
+
+%% RFC 9112 Section 6.3 item 4: a response whose final transfer coding is not
+%% chunked is delimited by the connection close, so this path has no error.
+-spec chunked_body_stream([binary()]) -> body_stream().
+chunked_body_stream(Codings) ->
+    case is_chunked_framing(Codings) of
+        true -> {chunked, #chunked_st{}};
+        false -> until_close
+    end.
+
+-spec content_length_body_mode([binary()]) ->
+    body_mode() | {error, duplicate_content_length | invalid_content_length}.
+content_length_body_mode([]) ->
+    undefined;
+content_length_body_mode([LenBin]) ->
+    content_length_mode(LenBin);
+content_length_body_mode([First | Rest]) ->
+    case lists:all(fun(V) -> V =:= First end, Rest) of
+        true -> content_length_mode(First);
+        false -> {error, duplicate_content_length}
+    end.
+
+-spec content_length_body_stream(nhttp_lib:headers()) -> body_stream().
+content_length_body_stream(Headers) ->
+    case nhttp_headers:get(<<"content-length">>, Headers) of
+        undefined ->
+            until_close;
+        LenBin ->
+            case parse_content_length(LenBin) of
+                {ok, Len} -> {length, Len};
+                {error, _} -> until_close
+            end
+    end.
+
+-spec content_length_mode(binary()) -> body_mode() | {error, invalid_content_length}.
+content_length_mode(LenBin) ->
+    case parse_content_length(LenBin) of
+        {ok, 0} -> undefined;
+        {ok, Len} -> {content_length, Len};
+        {error, _} -> {error, invalid_content_length}
+    end.
+
 -spec consume_chunk_trailing_crlf(binary(), non_neg_integer(), [body_chunk()], chunked_st()) ->
     {ok, [body_chunk()], body_stream(), non_neg_integer()}
     | {more, pos_integer(), body_stream()}
@@ -872,38 +916,13 @@ derive_authority(_Path, Headers) ->
         | invalid_content_length
         | unsupported_transfer_encoding}.
 detect_body_mode(Headers) ->
-    case nhttp_headers:get(<<"transfer-encoding">>, Headers) of
-        TE when is_binary(TE) ->
+    case transfer_codings(Headers) of
+        absent ->
+            content_length_body_mode(get_all_content_lengths(Headers));
+        Codings ->
             case nhttp_headers:has(<<"content-length">>, Headers) of
-                true ->
-                    {error, conflicting_framing};
-                false ->
-                    case is_chunked_transfer_encoding(TE) of
-                        true -> chunked;
-                        false -> {error, unsupported_transfer_encoding}
-                    end
-            end;
-        undefined ->
-            case get_all_content_lengths(Headers) of
-                [] ->
-                    undefined;
-                [LenBin] ->
-                    case parse_content_length(LenBin) of
-                        {ok, 0} -> undefined;
-                        {ok, Len} -> {content_length, Len};
-                        {error, _} -> {error, invalid_content_length}
-                    end;
-                [First | Rest] ->
-                    case lists:all(fun(V) -> V =:= First end, Rest) of
-                        true ->
-                            case parse_content_length(First) of
-                                {ok, 0} -> undefined;
-                                {ok, Len} -> {content_length, Len};
-                                {error, _} -> {error, invalid_content_length}
-                            end;
-                        false ->
-                            {error, duplicate_content_length}
-                    end
+                true -> {error, conflicting_framing};
+                false -> chunked_body_mode(Codings)
             end
     end.
 
@@ -1129,13 +1148,18 @@ target_has_invalid_char(<<C, _/binary>>) when C =< 16#20 -> true;
 target_has_invalid_char(<<16#7F, _/binary>>) -> true;
 target_has_invalid_char(<<_, Rest/binary>>) -> target_has_invalid_char(Rest).
 
--spec is_chunked_transfer_encoding(binary()) -> boolean().
-is_chunked_transfer_encoding(Bin) ->
-    Codings = binary:split(Bin, <<",">>, [global, trim_all]),
-    case lists:reverse(Codings) of
-        [Last | _] -> nhttp_headers:to_lower(trim_ows(Last)) =:= <<"chunked">>;
-        [] -> false
-    end.
+%% RFC 9112 Section 6.1: chunked is the final transfer coding, and a sender
+%% applies it at most once. Two recipients that disagree on the number of
+%% chunked layers disagree on every byte after the first chunk.
+-spec is_chunked_framing([binary()]) -> boolean().
+is_chunked_framing(Codings) ->
+    is_chunked_framing(Codings, 0).
+
+-spec is_chunked_framing([binary()], non_neg_integer()) -> boolean().
+is_chunked_framing([], _Seen) -> false;
+is_chunked_framing([<<"chunked">>], Seen) -> Seen =:= 0;
+is_chunked_framing([<<"chunked">> | Rest], Seen) -> is_chunked_framing(Rest, Seen + 1);
+is_chunked_framing([_Coding | Rest], Seen) -> is_chunked_framing(Rest, Seen).
 
 -spec is_tchar(byte()) -> boolean().
 is_tchar(C) when C >= $a, C =< $z -> true;
@@ -2215,6 +2239,32 @@ skip_trailer_fields(Original, Pos, Consumed) ->
         false ->
             {more, 2 - Available}
     end.
+
+%% RFC 9110 Section 5.6.1.2: a recipient ignores empty list elements.
+-spec split_transfer_codings([binary()], [binary()]) -> [binary()].
+split_transfer_codings([], Acc) ->
+    Acc;
+split_transfer_codings([Raw | Rest], Acc) ->
+    case trim_ows(Raw) of
+        <<>> -> split_transfer_codings(Rest, Acc);
+        Coding -> split_transfer_codings(Rest, [nhttp_headers:to_lower(Coding) | Acc])
+    end.
+
+%% RFC 9110 Section 5.3: multiple field lines with the same name combine into
+%% one comma-separated list, in order of receipt. `absent` and `[]` differ:
+%% an empty list is a declared framing that names no transfer coding.
+-spec transfer_codings(nhttp_lib:headers()) -> absent | [binary()].
+transfer_codings(Headers) ->
+    case [Value || {<<"transfer-encoding">>, Value} <- Headers] of
+        [] -> absent;
+        Values -> lists:reverse(transfer_codings(Values, []))
+    end.
+
+-spec transfer_codings([binary()], [binary()]) -> [binary()].
+transfer_codings([], Acc) ->
+    Acc;
+transfer_codings([Value | Rest], Acc) ->
+    transfer_codings(Rest, split_transfer_codings(binary:split(Value, <<",">>, [global]), Acc)).
 
 -spec trim_ows(binary()) -> binary().
 trim_ows(<<" ", Rest/binary>>) -> trim_ows(Rest);

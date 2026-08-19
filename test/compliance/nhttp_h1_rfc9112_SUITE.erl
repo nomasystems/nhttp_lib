@@ -26,6 +26,7 @@ all() ->
         {group, section_4_status_line},
         {group, section_5_field_syntax},
         {group, section_6_message_body},
+        {group, section_6_1_transfer_encoding},
         {group, section_7_transfer_codings},
         {group, section_11_response_splitting}
     ].
@@ -59,6 +60,16 @@ groups() ->
             parse_chunked_transfer,
             reject_invalid_content_length,
             transfer_encoding_overrides_content_length
+        ]},
+        {section_6_1_transfer_encoding, [parallel], [
+            join_transfer_encoding_field_lines,
+            reject_chunked_before_other_coding,
+            accept_other_coding_before_chunked,
+            reject_repeated_chunked,
+            transfer_coding_case_and_ows,
+            reject_empty_transfer_encoding,
+            reject_content_length_with_transfer_encoding,
+            response_transfer_encoding_field_lines
         ]},
         {section_7_transfer_codings, [parallel], [
             parse_chunked,
@@ -314,6 +325,142 @@ transfer_encoding_overrides_content_length(_Config) ->
             "5\r\nhello\r\n",
             "0\r\n\r\n">>,
     ?assertEqual({error, conflicting_framing}, nhttp_h1:parse_request(Req)).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 6.1 - Transfer-Encoding
+%%%-----------------------------------------------------------------------------
+
+%% RFC 9110 Section 5.3: a recipient combines multiple field lines with the
+%% same name into one comma-separated list, in order of receipt. Framing that
+%% reads only the first field line desynchronizes against a recipient that
+%% performs the join.
+join_transfer_encoding_field_lines(_Config) ->
+    ?assertEqual(te_framing([<<"gzip, chunked">>]), te_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual(te_framing([<<"chunked, gzip">>]), te_framing([<<"chunked">>, <<"gzip">>])),
+    ?assertEqual(
+        te_framing([<<"deflate, gzip, chunked">>]),
+        te_framing([<<"deflate">>, <<"gzip, chunked">>])
+    ).
+
+%% RFC 9112 Section 6.3 item 4: a request whose final transfer coding is not
+%% chunked has no reliable body length, and the server answers 400.
+reject_chunked_before_other_coding(_Config) ->
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"chunked">>, <<"gzip">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"chunked, gzip">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"gzip">>])).
+
+%% RFC 9112 Section 6.1: chunked is the final transfer coding of a request.
+accept_other_coding_before_chunked(_Config) ->
+    ?assertEqual(chunked, te_framing([<<"gzip, chunked">>])),
+    ?assertEqual(chunked, te_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual(chunked, te_framing([<<"deflate">>, <<"gzip">>, <<"chunked">>])).
+
+%% RFC 9112 Section 6.1: "A sender MUST NOT apply the chunked transfer coding
+%% more than once to a message body". Two recipients that disagree on the
+%% number of chunked layers disagree on every byte after the first chunk.
+reject_repeated_chunked(_Config) ->
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"chunked, chunked">>])),
+    ?assertEqual(
+        {error, unsupported_transfer_encoding}, te_framing([<<"chunked">>, <<"chunked">>])
+    ),
+    ?assertEqual(
+        {error, unsupported_transfer_encoding}, te_framing([<<"chunked">>, <<"gzip, chunked">>])
+    ).
+
+%% RFC 9110 Section 10.1.4: transfer-coding is a token, and tokens are
+%% case-insensitive. RFC 9110 Section 5.6.1.2: a recipient ignores empty list
+%% elements and the OWS around each element.
+transfer_coding_case_and_ows(_Config) ->
+    ?assertEqual(chunked, te_framing([<<"Chunked">>])),
+    ?assertEqual(chunked, te_framing([<<"CHUNKED">>])),
+    ?assertEqual(chunked, te_framing([<<"  chunked  ">>])),
+    ?assertEqual(chunked, te_framing([<<"gzip ,\tchunked">>])),
+    ?assertEqual(chunked, te_framing([<<"chunked,">>])),
+    ?assertEqual(chunked, te_framing([<<"gzip, , chunked">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"Chunked, chunked">>])).
+
+%% RFC 9110 Section 5.6.1.2: an empty list has no elements, so the message
+%% declares no transfer coding and cannot be framed by one.
+reject_empty_transfer_encoding(_Config) ->
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<>>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<",">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<" ,\t,">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<>>, <<>>])).
+
+%% RFC 9112 Section 6.3 item 3: a message carrying both fields is handled as
+%% an error. The field line count does not change that.
+reject_content_length_with_transfer_encoding(_Config) ->
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"chunked">>])),
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"chunked">>, <<"chunked">>])),
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"gzip">>])).
+
+%% RFC 9112 Section 6.3 item 4: a response whose final transfer coding is not
+%% chunked is delimited by the connection close, not by an error.
+response_transfer_encoding_field_lines(_Config) ->
+    ?assertEqual(chunked, response_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual(chunked, response_framing([<<"gzip, chunked">>])),
+    ?assertEqual(until_close, response_framing([<<"chunked">>, <<"gzip">>])),
+    ?assertEqual(until_close, response_framing([<<"chunked">>, <<"chunked">>])),
+    ?assertEqual(until_close, response_framing([<<>>])),
+    ?assertEqual(
+        {error, unsupported_transfer_encoding}, one_shot_response_framing([<<"chunked">>, <<"gzip">>])
+    ),
+    ?assertEqual(chunked, one_shot_response_framing([<<"gzip">>, <<"chunked">>])).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 6.1 helpers
+%%%-----------------------------------------------------------------------------
+
+%% The one-shot parser and the streaming parser must reach the same framing
+%% decision, so every case runs through both.
+te_framing(Lines) ->
+    Streaming = streaming_framing(te_request(Lines)),
+    ?assertEqual(Streaming, one_shot_framing(te_request(Lines))),
+    Streaming.
+
+cl_te_framing(Lines) ->
+    Head = <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n">>,
+    Streaming = streaming_framing(te_message(Head, Lines)),
+    ?assertEqual(Streaming, one_shot_framing(te_message(Head, Lines))),
+    Streaming.
+
+te_request(Lines) ->
+    te_message(<<"POST / HTTP/1.1\r\nHost: x\r\n">>, Lines).
+
+te_message(Head, Lines) ->
+    Field = [[<<"Transfer-Encoding: ">>, Line, <<"\r\n">>] || Line <- Lines],
+    iolist_to_binary([Head, Field, <<"\r\n5\r\nhello\r\n0\r\n\r\n">>]).
+
+streaming_framing(Bin) ->
+    case nhttp_h1:parse_request_headers(Bin, #{}) of
+        {ok, _Req, {chunked, _St}, _Consumed} -> chunked;
+        {ok, _Req, Stream, _Consumed} -> Stream;
+        Other -> Other
+    end.
+
+one_shot_framing(Bin) ->
+    case nhttp_h1:parse_request(Bin) of
+        {ok, #{body := <<"hello">>}, _Consumed} -> chunked;
+        {ok, #{body := Body}, _Consumed} -> {body, Body};
+        Other -> Other
+    end.
+
+response_framing(Lines) ->
+    Head = <<"HTTP/1.1 200 OK\r\n">>,
+    {ok, 200, Headers, _Rest} = nhttp_h1:parse_response_headers(te_message(Head, Lines)),
+    case nhttp_h1:body_stream_from_response(get, 200, Headers) of
+        {chunked, _St} -> chunked;
+        Stream -> Stream
+    end.
+
+one_shot_response_framing(Lines) ->
+    Head = <<"HTTP/1.1 200 OK\r\n">>,
+    case nhttp_h1:parse_response(te_message(Head, Lines)) of
+        {ok, #{body := <<"hello">>}, _Consumed} -> chunked;
+        {ok, #{body := Body}, _Consumed} -> {body, Body};
+        Other -> Other
+    end.
 
 %%%-----------------------------------------------------------------------------
 %%% Section 7 - Transfer Codings
