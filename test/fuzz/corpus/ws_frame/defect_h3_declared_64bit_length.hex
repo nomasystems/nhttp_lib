@@ -1,0 +1,2 @@
+# Defect H3: a 64 bit declared payload length (CVE-2025-46728, CVE-2025-53629).
+81ff7fffffffffffffff

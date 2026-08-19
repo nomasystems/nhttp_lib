@@ -1,0 +1,2 @@
+# A 64 bit length with the top bit set, which RFC 6455 5.2 forbids.
+81ffffffffffffffff00

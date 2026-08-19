@@ -1,0 +1,2 @@
+# A SETTINGS frame whose payload holds an identifier and no value (RFC 9114 7.2.4).
+040101
