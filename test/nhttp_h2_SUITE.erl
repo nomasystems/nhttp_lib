@@ -72,6 +72,16 @@ Tests RFC 9113 compliance for:
 ]).
 
 -export([
+    stream_stats_starts_at_zero/1,
+    reset_loop_counts_turnover/1,
+    reset_allowance_ends_connection/1,
+    normal_exchanges_do_not_trip_allowance/1,
+    reset_allowance_infinity_matches_default/1,
+    reset_for_unknown_stream_not_counted/1,
+    local_reset_not_counted/1
+]).
+
+-export([
     stream_removed_after_full_lifecycle_h2/1,
     stream_removed_after_rst_stream_h2/1
 ]).
@@ -163,7 +173,8 @@ all() ->
         {group, integration},
         {group, stream_cleanup},
         {group, coverage},
-        {group, header_validation}
+        {group, header_validation},
+        {group, rapid_reset}
     ].
 
 groups() ->
@@ -280,6 +291,15 @@ groups() ->
             extended_connect_not_enabled_test,
             protocol_without_connect_test,
             extended_connect_missing_authority_test
+        ]},
+        {rapid_reset, [parallel], [
+            stream_stats_starts_at_zero,
+            reset_loop_counts_turnover,
+            reset_allowance_ends_connection,
+            normal_exchanges_do_not_trip_allowance,
+            reset_allowance_infinity_matches_default,
+            reset_for_unknown_stream_not_counted,
+            local_reset_not_counted
         ]}
     ].
 
@@ -1488,3 +1508,113 @@ window_update_on_half_closed_remote_test(_Config) ->
     {ok, WinUpdate} = nhttp_h2_frame:window_update(1, 1000),
     {ok, [{window_update, 1, 1000}], _Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(WinUpdate)),
     ok.
+
+%%%-----------------------------------------------------------------------------
+%%% RAPID RESET TESTS (RFC 9113 SECTION 10.5)
+%%%-----------------------------------------------------------------------------
+
+-doc "A fresh connection reports every stream counter as zero.".
+stream_stats_starts_at_zero(_Config) ->
+    ?assertEqual(
+        #{active => 0, peer_opened => 0, peer_reset => 0},
+        nhttp_h2:stream_stats(nhttp_h2:new(server))
+    ),
+    ?assertEqual(
+        #{active => 0, peer_opened => 0, peer_reset => 0},
+        nhttp_h2:stream_stats(nhttp_h2:new(client))
+    ),
+    ok.
+
+-doc "A HEADERS plus RST_STREAM loop holds active at zero and raises both peer counters.".
+reset_loop_counts_turnover(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, Conn1} = reset_h2_rounds(Conn0, 1, 200),
+    ?assertEqual(
+        #{active => 0, peer_opened => 200, peer_reset => 200},
+        nhttp_h2:stream_stats(Conn1)
+    ),
+    ok.
+
+-doc "A finite max_reset_streams ends the connection with ENHANCE_YOUR_CALM.".
+reset_allowance_ends_connection(_Config) ->
+    Conn0 = server_with_preface(nhttp_h2:new(server, #{max_reset_streams => 10})),
+    Result = reset_h2_rounds(Conn0, 1, 200),
+    ?assertMatch({refused, 21, {connection_error, enhance_your_calm, _}}, Result),
+    ok.
+
+-doc "Streams that complete normally never trip the reset allowance.".
+normal_exchanges_do_not_trip_allowance(_Config) ->
+    Conn0 = server_with_preface(nhttp_h2:new(server, #{max_reset_streams => 10})),
+    Conn1 = complete_n_h2_streams(Conn0, 1, 200),
+    ?assertEqual(
+        #{active => 0, peer_opened => 200, peer_reset => 0},
+        nhttp_h2:stream_stats(Conn1)
+    ),
+    ok.
+
+-doc "An explicit infinity allowance reproduces the default behaviour.".
+reset_allowance_infinity_matches_default(_Config) ->
+    Conn0 = server_with_preface(nhttp_h2:new(server, #{max_reset_streams => infinity})),
+    {ok, Conn1} = reset_h2_rounds(Conn0, 1, 200),
+    Default0 = server_with_preface(),
+    {ok, Default1} = reset_h2_rounds(Default0, 1, 200),
+    ?assertEqual(nhttp_h2:stream_stats(Default1), nhttp_h2:stream_stats(Conn1)),
+    ?assertEqual(
+        #{active => 0, peer_opened => 200, peer_reset => 200},
+        nhttp_h2:stream_stats(Conn1)
+    ),
+    ok.
+
+-doc "A RST_STREAM for a stream that is already gone changes no counter.".
+reset_for_unknown_stream_not_counted(_Config) ->
+    Conn0 = server_with_preface(),
+    Conn1 = complete_n_h2_streams(Conn0, 1, 1),
+    Before = nhttp_h2:stream_stats(Conn1),
+    ?assertEqual(#{active => 0, peer_opened => 1, peer_reset => 0}, Before),
+    {ok, RstFrame} = nhttp_h2_frame:rst_stream(1, cancel),
+    {Events, Conn2} = recv_events(Conn1, iolist_to_binary(RstFrame)),
+    ?assertEqual([], Events),
+    ?assertEqual(Before, nhttp_h2:stream_stats(Conn2)),
+    ok.
+
+-doc "A RST_STREAM that this side sends changes no counter.".
+local_reset_not_counted(_Config) ->
+    Conn0 = server_with_preface(nhttp_h2:new(server, #{max_reset_streams => 1})),
+    Conn1 = send_local_resets(Conn0, 1, 50),
+    ?assertEqual(
+        #{active => 0, peer_opened => 50, peer_reset => 0},
+        nhttp_h2:stream_stats(Conn1)
+    ),
+    ok.
+
+-spec server_with_preface(nhttp_h2:conn()) -> nhttp_h2:conn().
+server_with_preface(Conn0) ->
+    {ok, Preface} = nhttp_h2_frame:preface(),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1.
+
+-spec reset_h2_rounds(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
+    {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+reset_h2_rounds(Conn, _BaseId, 0) ->
+    {ok, Conn};
+reset_h2_rounds(Conn, BaseId, N) ->
+    HeaderBlock = encode_headers(minimal_request_headers()),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(BaseId, fin, fin, HeaderBlock),
+    {ok, RstFrame} = nhttp_h2_frame:rst_stream(BaseId, cancel),
+    Data = iolist_to_binary([HeadersFrame, RstFrame]),
+    case nhttp_h2:recv(Conn, Data) of
+        {ok, _, Conn1} -> reset_h2_rounds(Conn1, BaseId + 2, N - 1);
+        {ok, _, Conn1, _} -> reset_h2_rounds(Conn1, BaseId + 2, N - 1);
+        {error, Reason} -> {refused, (BaseId + 1) div 2, Reason}
+    end.
+
+-spec send_local_resets(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
+    nhttp_h2:conn().
+send_local_resets(Conn, _BaseId, 0) ->
+    Conn;
+send_local_resets(Conn, BaseId, N) ->
+    HeaderBlock = encode_headers(minimal_request_headers()),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(BaseId, fin, fin, HeaderBlock),
+    {_, Conn1} = recv_events(Conn, iolist_to_binary(HeadersFrame)),
+    {ok, Conn2, _RstFrame} = nhttp_h2:send_rst_stream(Conn1, BaseId, cancel),
+    send_local_resets(Conn2, BaseId + 2, N - 1).

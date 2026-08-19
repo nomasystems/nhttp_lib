@@ -12,6 +12,7 @@ providing:
 - Flow control (connection and stream level)
 - Header block assembly (CONTINUATION handling)
 - Error handling (connection vs stream errors)
+- Stream turnover accounting (RFC 9113 Section 10.5)
 
 ## Usage
 
@@ -88,7 +89,8 @@ Flow-control and END_STREAM ride on the DATA frame.
 %% STREAM MANAGEMENT
 %%%-----------------------------------------------------------------------------
 -export([
-    open_stream/1
+    open_stream/1,
+    stream_stats/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -128,7 +130,8 @@ Flow-control and END_STREAM ride on the DATA frame.
     initial_window_size => 1..16#7fffffff,
     max_frame_size => 16#4000..16#ffffff,
     max_header_list_size => pos_integer() | infinity,
-    enable_connect_protocol => boolean()
+    enable_connect_protocol => boolean(),
+    max_reset_streams => pos_integer() | infinity
 }.
 
 -type stream_state() ::
@@ -207,6 +210,8 @@ Flow-control and END_STREAM ride on the DATA frame.
     next_stream_id :: nhttp_lib:stream_id(),
     last_peer_stream_id = 0 :: nhttp_lib:stream_id(),
     active_stream_count = 0 :: non_neg_integer(),
+    peer_streams_opened = 0 :: non_neg_integer(),
+    peer_streams_reset = 0 :: non_neg_integer(),
     send_window = ?H2_DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
     recv_window = ?H2_DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
     hpack_enc :: nhttp_hpack:state(),
@@ -401,6 +406,41 @@ open_stream(
             Error
     end.
 
+-doc """
+Return the stream counters for this connection.
+
+`active` is the number of streams in the "open" state or in either
+"half-closed" state, the set that `SETTINGS_MAX_CONCURRENT_STREAMS` bounds
+(RFC 9113 Section 5.1.2). `peer_opened` is the total number of streams that
+the peer opened. `peer_reset` is the number of streams that the peer
+terminated with RST_STREAM.
+
+`SETTINGS_MAX_CONCURRENT_STREAMS` bounds the streams that are open at one
+instant. It does not bound stream turnover. A peer that alternates HEADERS
+and RST_STREAM holds `active` at a low value and drives `peer_opened` and
+`peer_reset` without limit. RFC 9113 Section 10.5 tells an implementation to
+track such use and to set a limit on it.
+
+This library holds no clock, so it counts events only. The caller reads these
+counters to apply a rate per unit of time. To let the connection refuse the
+peer on its own, set `max_reset_streams` in the local settings. The
+connection then fails with a connection error of type ENHANCE_YOUR_CALM when
+`peer_reset` is more than `max_reset_streams + (peer_opened div 2)`. The
+default is `infinity`, which counts without a limit.
+""".
+-spec stream_stats(conn()) ->
+    #{
+        active := non_neg_integer(),
+        peer_opened := non_neg_integer(),
+        peer_reset := non_neg_integer()
+    }.
+stream_stats(#h2_conn{
+    active_stream_count = Active,
+    peer_streams_opened = Opened,
+    peer_streams_reset = Reset
+}) ->
+    #{active => Active, peer_opened => Opened, peer_reset => Reset}.
+
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
@@ -410,6 +450,14 @@ check_header_block_size(#h2_conn{local_settings = Settings}, Size) ->
         infinity -> ok;
         Max when Size =< Max -> ok;
         _ -> {error, exceeded}
+    end.
+
+-spec check_reset_allowance(conn(), non_neg_integer()) -> ok | {error, exceeded}.
+check_reset_allowance(#h2_conn{local_settings = Settings, peer_streams_opened = Opened}, Resets) ->
+    case maps:get(max_reset_streams, Settings, infinity) of
+        infinity -> ok;
+        Allowance when Resets > Allowance + (Opened div 2) -> {error, exceeded};
+        _ -> ok
     end.
 
 -spec check_stream_concurrency(conn()) -> ok | {error, at_limit}.
@@ -522,6 +570,10 @@ decode_headers_internal(
                                     NewActiveCount = update_active_count_on_transition(
                                         OldState, NewState, ActiveCount
                                     ),
+                                    OpenedCount = Conn#h2_conn.peer_streams_opened,
+                                    NewOpenedCount = update_peer_opened_count(
+                                        Role, StreamId, OldState, NewState, OpenedCount
+                                    ),
                                     NewConn = Conn#h2_conn{
                                         hpack_dec = NewHpackDec,
                                         streams = store_or_remove_stream(
@@ -530,7 +582,8 @@ decode_headers_internal(
                                         last_peer_stream_id = max(
                                             Conn#h2_conn.last_peer_stream_id, StreamId
                                         ),
-                                        active_stream_count = NewActiveCount
+                                        active_stream_count = NewActiveCount,
+                                        peer_streams_opened = NewOpenedCount
                                     },
                                     case
                                         build_headers_event(
@@ -696,6 +749,10 @@ is_active_state(open) -> true;
 is_active_state(half_closed_local) -> true;
 is_active_state(half_closed_remote) -> true;
 is_active_state(_) -> false.
+
+-spec is_peer_initiated(role(), nhttp_lib:stream_id()) -> boolean().
+is_peer_initiated(server, StreamId) -> StreamId band 1 =:= 1;
+is_peer_initiated(client, StreamId) -> StreamId band 1 =:= 0.
 
 -spec process_continuation(conn(), nhttp_lib:stream_id(), fin(), binary()) ->
     {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
@@ -949,15 +1006,23 @@ process_push_promise(#h2_conn{role = server}, _PromisedId) ->
             <<"Server received PUSH_PROMISE (RFC 9113 Section 6.6)">>}}.
 
 -spec process_rst_stream(conn(), nhttp_lib:stream_id(), error_code()) ->
-    {ok, conn(), [event()], iodata()}.
+    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
 process_rst_stream(#h2_conn{streams = Streams} = Conn, StreamId, ErrorCode) ->
-    NewConn = close_stream(Conn, StreamId),
-    Event =
-        case maps:get(StreamId, Streams, undefined) of
-            undefined -> [];
-            _ -> [{stream_reset, StreamId, ErrorCode}]
-        end,
-    {ok, NewConn, Event, []}.
+    case maps:is_key(StreamId, Streams) of
+        false ->
+            {ok, Conn, [], []};
+        true ->
+            Resets = Conn#h2_conn.peer_streams_reset + 1,
+            case check_reset_allowance(Conn, Resets) of
+                ok ->
+                    NewConn = close_stream(
+                        Conn#h2_conn{peer_streams_reset = Resets}, StreamId
+                    ),
+                    {ok, NewConn, [{stream_reset, StreamId, ErrorCode}], []};
+                {error, exceeded} ->
+                    rapid_reset_error()
+            end
+    end.
 
 -spec process_settings(conn(), settings()) ->
     {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
@@ -1007,6 +1072,14 @@ process_settings(#h2_conn{peer_settings = OldSettings, streams = Streams} = Conn
     },
     {ok, AckFrame} = nhttp_h2_frame:settings_ack(),
     {ok, NewConn, [{settings, NewSettings}] ++ WindowEvents, AckFrame}.
+
+-spec rapid_reset_error() -> {error, nhttp_h2_frame:decode_error()}.
+rapid_reset_error() ->
+    {error,
+        {connection_error, enhance_your_calm, <<
+            "Peer stream resets exceed SETTINGS_MAX_RESET_STREAMS "
+            "(RFC 9113 Section 10.5)"
+        >>}}.
 
 -spec recv_loop(conn(), binary(), [[event()]], iodata()) -> recv_result().
 recv_loop(Conn, Data, EventsAcc, ToSend) ->
@@ -1092,6 +1165,17 @@ update_active_count_on_transition(OldState, NewState, Count) ->
         {false, true} -> Count + 1;
         {true, false} -> max(0, Count - 1);
         _ -> Count
+    end.
+
+-spec update_peer_opened_count(
+    role(), nhttp_lib:stream_id(), stream_state(), stream_state(), non_neg_integer()
+) -> non_neg_integer().
+update_peer_opened_count(Role, StreamId, OldState, NewState, Count) ->
+    WasActive = is_active_state(OldState),
+    IsActive = is_active_state(NewState),
+    case not WasActive andalso IsActive andalso is_peer_initiated(Role, StreamId) of
+        true -> Count + 1;
+        false -> Count
     end.
 
 -spec validate_decoded_headers(role(), nhttp_lib:headers(), boolean(), settings()) ->
