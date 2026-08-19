@@ -1,0 +1,2 @@
+# GOAWAY with an empty payload, so no stream identifier (RFC 9114 7.2.6).
+0700

@@ -1,0 +1,2 @@
+# A SETTINGS payload that is not a multiple of six octets (RFC 9113 6.5).
+0000050400000000000000000000

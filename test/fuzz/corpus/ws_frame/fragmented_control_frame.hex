@@ -1,0 +1,2 @@
+# A ping with FIN clear, which RFC 6455 5.5 forbids.
+098000000000
