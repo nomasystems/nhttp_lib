@@ -34,6 +34,11 @@ groups() ->
         ]},
         {section_8_content_length, [parallel], [
             no_content_length_1xx_204,
+            no_content_length_304,
+            content_length_zero_on_empty_body,
+            caller_content_length_survives_on_204,
+            no_content_length_with_transfer_encoding,
+            content_length_omit_opt_out,
             reject_malformed_content_length
         ]},
         {section_9_methods, [parallel], [
@@ -106,24 +111,88 @@ reject_or_replace_invalid_chars_in_field_value(_Config) ->
 %%% Section 8 - Content-Length
 %%%-----------------------------------------------------------------------------
 
+%% RFC 9110 Section 8.6: "A server MUST NOT send a Content-Length header
+%% field in any response with a status code of 1xx (Informational) or 204
+%% (No Content)."
 no_content_length_1xx_204(_Config) ->
-    Resp100 = #{
-        status => 100,
-        reason => <<"Continue">>,
-        headers => []
-    },
-    Io100 = nhttp_h1:encode_response(Resp100),
-    Encoded100 = iolist_to_binary(Io100),
-    ?assertEqual(nomatch, binary:match(Encoded100, <<"Content-Length">>)),
+    lists:foreach(
+        fun({Status, Reason}) ->
+            Resp = #{status => Status, reason => Reason, headers => []},
+            Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+            ?assertEqual(false, has_content_length(Encoded))
+        end,
+        [
+            {100, <<"Continue">>},
+            {101, <<"Switching Protocols">>},
+            {199, <<"Informational">>},
+            {204, <<"No Content">>}
+        ]
+    ).
 
-    Resp204 = #{
+%% RFC 9110 Section 8.6: a 304 permits Content-Length only at the length a
+%% 200 response would have carried, which the encoder cannot compute.
+no_content_length_304(_Config) ->
+    Resp = #{status => 304, reason => <<"Not Modified">>, headers => []},
+    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+    ?assertEqual(false, has_content_length(Encoded)).
+
+%% RFC 9110 Section 8.6: "in the absence of Transfer-Encoding, an origin
+%% server SHOULD send a Content-Length header field when the content size is
+%% known prior to sending the complete header section."
+content_length_zero_on_empty_body(_Config) ->
+    NoBodyKey = #{status => 200, reason => <<"OK">>, headers => []},
+    ?assertEqual(
+        {true, <<"0">>},
+        content_length_value(iolist_to_binary(nhttp_h1:encode_response(NoBodyKey)))
+    ),
+
+    EmptyBody = NoBodyKey#{body => <<>>},
+    ?assertEqual(
+        {true, <<"0">>},
+        content_length_value(iolist_to_binary(nhttp_h1:encode_response(EmptyBody)))
+    ),
+
+    NotFound = #{status => 404, reason => <<"Not Found">>, headers => [], body => <<>>},
+    ?assertEqual(
+        {true, <<"0">>},
+        content_length_value(iolist_to_binary(nhttp_h1:encode_response(NotFound)))
+    ).
+
+caller_content_length_survives_on_204(_Config) ->
+    Resp = #{
         status => 204,
         reason => <<"No Content">>,
-        headers => []
+        headers => [{<<"content-length">>, <<"42">>}]
     },
-    Io204 = nhttp_h1:encode_response(Resp204),
-    Encoded204 = iolist_to_binary(Io204),
-    ?assertEqual(nomatch, binary:match(Encoded204, <<"Content-Length">>)).
+    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+    ?assertEqual({true, <<"42">>}, content_length_value(Encoded)),
+    ?assertEqual(1, count_content_length(Encoded)).
+
+no_content_length_with_transfer_encoding(_Config) ->
+    Resp = #{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [{<<"transfer-encoding">>, <<"chunked">>}],
+        body => <<>>
+    },
+    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+    ?assertEqual(false, has_content_length(Encoded)).
+
+%% RFC 9110 Section 8.6: "A server MUST NOT send a Content-Length header
+%% field in any 2xx (Successful) response to a CONNECT request."
+content_length_omit_opt_out(_Config) ->
+    Resp = #{status => 200, reason => <<"Connection Established">>, headers => []},
+    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp, #{content_length => omit})),
+    ?assertEqual(false, has_content_length(Encoded)),
+
+    WithBody = Resp#{body => <<"hello">>},
+    EncodedWithBody = iolist_to_binary(
+        nhttp_h1:encode_response(WithBody, #{content_length => omit})
+    ),
+    ?assertEqual(false, has_content_length(EncodedWithBody)),
+
+    EncodedAuto = iolist_to_binary(nhttp_h1:encode_response(Resp, #{content_length => auto})),
+    ?assertEqual({true, <<"0">>}, content_length_value(EncodedAuto)).
 
 reject_malformed_content_length(_Config) ->
     Req1 = <<
@@ -158,16 +227,18 @@ reject_malformed_content_length(_Config) ->
 %%% Section 9 - Methods
 %%%-----------------------------------------------------------------------------
 
+%% RFC 9110 Section 8.6: a 2xx response to CONNECT carries no Content-Length.
+%% The status alone does not identify the case, so the caller opts out.
 no_body_headers_2xx_connect(_Config) ->
     Resp = #{
         status => 200,
         reason => <<"Connection Established">>,
         headers => []
     },
-    Io = nhttp_h1:encode_response(Resp),
+    Io = nhttp_h1:encode_response(Resp, #{content_length => omit}),
     Encoded = iolist_to_binary(Io),
-    ?assertEqual(nomatch, binary:match(Encoded, <<"Content-Length">>)),
-    ?assertEqual(nomatch, binary:match(Encoded, <<"Transfer-Encoding">>)).
+    ?assertEqual(false, has_content_length(Encoded)),
+    ?assertEqual(false, lists:keymember(<<"transfer-encoding">>, 1, encoded_headers(Encoded))).
 
 client_ignore_body_headers_connect(_Config) ->
     Resp = <<
@@ -214,6 +285,31 @@ no_body_in_304(_Config) ->
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
+
+-spec encoded_headers(binary()) -> nhttp_lib:headers().
+encoded_headers(Encoded) ->
+    [_StatusLine | Lines] = binary:split(Encoded, <<"\r\n">>, [global]),
+    [
+        {string:lowercase(Name), string:trim(Value, leading, " ")}
+     || Line <- Lines,
+        Line =/= <<>>,
+        [Name, Value] <- [binary:split(Line, <<":">>)]
+    ].
+
+-spec has_content_length(binary()) -> boolean().
+has_content_length(Encoded) ->
+    lists:keymember(<<"content-length">>, 1, encoded_headers(Encoded)).
+
+-spec content_length_value(binary()) -> {true, binary()} | false.
+content_length_value(Encoded) ->
+    case lists:keyfind(<<"content-length">>, 1, encoded_headers(Encoded)) of
+        {_, Value} -> {true, Value};
+        false -> false
+    end.
+
+-spec count_content_length(binary()) -> non_neg_integer().
+count_content_length(Encoded) ->
+    length([V || {<<"content-length">>, V} <- encoded_headers(Encoded)]).
 
 -spec find_header(binary(), nhttp_lib:headers()) -> {ok, binary()} | error.
 find_header(Name, Headers) ->
