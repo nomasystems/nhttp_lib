@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-08-20
+
+### Added
+
+- `nhttp_h1:encode_response/2` takes `t:nhttp_h1:enc_opts/0`.
+  `#{content_length => omit}` suppresses the automatic `Content-Length`
+  field. A server that answers a `CONNECT` request with a 2xx status uses
+  it, because RFC 9110 Section 8.6 forbids the field there and the response
+  map carries no request method
+
+### Fixed
+
+- `nhttp_h1:encode_response/1` emits `Content-Length: 0` on a response with
+  an empty body. The call omitted the field before, so a client on a
+  persistent connection read the next response as content
+- `nhttp_h1:encode_response/1` emits no `Content-Length` at a 1xx, 204, or
+  304 status (RFC 9110 Section 8.6). At 304 the field is valid only at the
+  length that a 200 response carries, which the encoder cannot compute, so a
+  caller that knows the value supplies it in the header list
+
 ## [1.0.3] - 2026-08-10
 
 ### Added
