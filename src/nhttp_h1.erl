@@ -985,31 +985,54 @@ find_chunk_crlf(<<Original/binary>>, Skip, SizeLen) ->
     {ok, nhttp_lib:method(), binary(), version(), binary()}
     | {more, pos_integer()}
     | {error, parse_error()}.
-find_path_version(Bin, Method) ->
-    case binary:split(Bin, <<" HTTP/1.">>) of
-        [Path, <<Ver:1/binary, "\r\n", Rest/binary>>] when Ver =:= <<"1">>; Ver =:= <<"0">> ->
-            case valid_request_target(Path) of
-                true ->
-                    Version =
-                        case Ver of
-                            <<"1">> -> http1_1;
-                            <<"0">> -> http1_0
-                        end,
-                    {ok, Method, Path, Version, Rest};
-                false ->
+find_path_version(<<Bin/binary>>, Method) ->
+    case scan_request_target(Bin, 0, false) of
+        {ok, Len, Bad} ->
+            case Bin of
+                <<Path:Len/binary, " HTTP/1.", Tail/binary>> ->
+                    find_version(Tail, Method, Path, Bad);
+                _ ->
                     {error, bad_request_line}
             end;
-        [_Path, <<Ver:1/binary, "\r">>] when Ver =:= <<"1">>; Ver =:= <<"0">> ->
-            {more, 1};
-        [_Path, <<Ver:1/binary>>] when Ver =:= <<"1">>; Ver =:= <<"0">> ->
-            {more, 2};
-        [_Path, <<>>] ->
-            {more, 3};
-        [_Path, <<_/binary>>] ->
-            {error, invalid_version};
-        [_] ->
+        nomatch ->
             find_path_version_cold(Bin)
     end.
+
+-spec scan_request_target(binary(), non_neg_integer(), boolean()) ->
+    {ok, non_neg_integer(), boolean()} | nomatch.
+scan_request_target(<<" HTTP/1.", _/binary>>, Pos, Bad) ->
+    {ok, Pos, Bad};
+scan_request_target(<<C, Rest/binary>>, Pos, _Bad) when C =< 16#20; C =:= 16#7F ->
+    scan_request_target(Rest, Pos + 1, true);
+scan_request_target(<<_C, Rest/binary>>, Pos, Bad) ->
+    scan_request_target(Rest, Pos + 1, Bad);
+scan_request_target(<<>>, _Pos, _Bad) ->
+    nomatch.
+
+-spec find_version(binary(), nhttp_lib:method(), binary(), boolean()) ->
+    {ok, nhttp_lib:method(), binary(), version(), binary()}
+    | {more, pos_integer()}
+    | {error, parse_error()}.
+find_version(<<"1\r\n", _/binary>>, _Method, _Path, true) ->
+    {error, bad_request_line};
+find_version(<<"0\r\n", _/binary>>, _Method, _Path, true) ->
+    {error, bad_request_line};
+find_version(<<"1\r\n", Rest/binary>>, Method, Path, false) ->
+    {ok, Method, Path, http1_1, Rest};
+find_version(<<"0\r\n", Rest/binary>>, Method, Path, false) ->
+    {ok, Method, Path, http1_0, Rest};
+find_version(<<"1\r">>, _Method, _Path, _Bad) ->
+    {more, 1};
+find_version(<<"0\r">>, _Method, _Path, _Bad) ->
+    {more, 1};
+find_version(<<"1">>, _Method, _Path, _Bad) ->
+    {more, 2};
+find_version(<<"0">>, _Method, _Path, _Bad) ->
+    {more, 2};
+find_version(<<>>, _Method, _Path, _Bad) ->
+    {more, 3};
+find_version(_Tail, _Method, _Path, _Bad) ->
+    {error, invalid_version}.
 
 -spec find_path_version_cold(binary()) ->
     {more, pos_integer()} | {error, parse_error()}.
@@ -1404,35 +1427,60 @@ parse_content_length(Bin) ->
     {ok, nhttp_lib:headers(), binary()}
     | {more, pos_integer()}
     | {error, parse_error()}.
-parse_header_value_direct(Name, PrefixLen, Rest, Acc, Count, Size, MaxSize, MaxCount) ->
-    case binary:match(Rest, persistent_term:get(?PT_CRLF)) of
-        {Pos, 2} ->
-            Value = trim_ows(binary:part(Rest, 0, Pos)),
-            case has_invalid_char(Value) of
-                true ->
-                    {error, bad_header};
-                false ->
-                    LineSize = PrefixLen + Pos + 2,
-                    NewSize = Size + LineSize,
-                    NewCount = Count + 1,
-                    case check_header_limits(NewSize, MaxSize, NewCount, MaxCount) of
-                        ok ->
-                            Remaining = binary:part(Rest, Pos + 2, byte_size(Rest) - Pos - 2),
+parse_header_value_direct(Name, PrefixLen, <<Rest/binary>>, Acc, Count, Size, MaxSize, MaxCount) ->
+    case scan_header_value(Rest, 0, 0, 0, false) of
+        {ok, Skip, Len, Drop} ->
+            LineSize = PrefixLen + Skip + Len + Drop + 2,
+            NewSize = Size + LineSize,
+            NewCount = Count + 1,
+            case check_header_limits(NewSize, MaxSize, NewCount, MaxCount) of
+                ok ->
+                    case Rest of
+                        <<_:Skip/binary, Value:Len/binary, _:Drop/binary, "\r\n", Tail/binary>> ->
                             parse_headers_acc(
-                                Remaining,
+                                Tail,
                                 [{Name, Value} | Acc],
                                 NewCount,
                                 NewSize,
                                 MaxSize,
                                 MaxCount
                             );
-                        {error, _} = Err ->
-                            Err
-                    end
+                        _ ->
+                            {error, bad_header}
+                    end;
+                {error, _} = Err ->
+                    Err
             end;
-        nomatch ->
+        {error, _} = Err ->
+            Err;
+        more ->
             {more, 2}
     end.
+
+-spec scan_header_value(
+    binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()
+) ->
+    {ok, non_neg_integer(), non_neg_integer(), non_neg_integer()}
+    | {error, bad_header}
+    | more.
+scan_header_value(<<"\r\n", _/binary>>, _Pos, _Skip, _Drop, true) ->
+    {error, bad_header};
+scan_header_value(<<"\r\n", _/binary>>, Pos, Skip, Drop, false) ->
+    {ok, Skip, Pos - Skip - Drop, Drop};
+scan_header_value(<<$\s, Rest/binary>>, Pos, Skip, Drop, Bad) when Pos =:= Skip ->
+    scan_header_value(Rest, Pos + 1, Skip + 1, Drop, Bad);
+scan_header_value(<<$\t, Rest/binary>>, Pos, Skip, Drop, Bad) when Pos =:= Skip ->
+    scan_header_value(Rest, Pos + 1, Skip + 1, Drop, Bad);
+scan_header_value(<<$\s, Rest/binary>>, Pos, Skip, Drop, Bad) ->
+    scan_header_value(Rest, Pos + 1, Skip, Drop + 1, Bad);
+scan_header_value(<<$\t, Rest/binary>>, Pos, Skip, Drop, Bad) ->
+    scan_header_value(Rest, Pos + 1, Skip, Drop + 1, Bad);
+scan_header_value(<<C, Rest/binary>>, Pos, Skip, _Drop, _Bad) when C =< 16#1F; C =:= 16#7F ->
+    scan_header_value(Rest, Pos + 1, Skip, 0, true);
+scan_header_value(<<_C, Rest/binary>>, Pos, Skip, _Drop, Bad) ->
+    scan_header_value(Rest, Pos + 1, Skip, 0, Bad);
+scan_header_value(<<>>, _Pos, _Skip, _Drop, _Bad) ->
+    more.
 
 -spec parse_headers_acc(
     binary(), nhttp_lib:headers(), non_neg_integer(), header_limit(), header_limit()

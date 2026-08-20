@@ -40,3 +40,9 @@ flake.lock
 # Temporary files
 *.tmp
 *.temp
+
+# Benchmark harness build and transient results
+bench/ebin/
+bench/results/*.terms
+!bench/results/baseline.terms
+!bench/results/pre_optimization.terms
