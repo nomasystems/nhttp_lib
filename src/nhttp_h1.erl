@@ -1092,8 +1092,6 @@ allows_content_length(Status, EncOpts) ->
         omit -> false
     end.
 
-%% RFC 9110 Section 8.6: 1xx and 204 forbid the field, and 304 permits it
-%% only at the length a 200 response would have carried, which is unknown here.
 -spec forbids_content_length(nhttp_lib:status()) -> boolean().
 forbids_content_length(Status) when Status >= 100, Status =< 199 -> true;
 forbids_content_length(204) -> true;
