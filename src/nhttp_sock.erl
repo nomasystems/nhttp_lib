@@ -104,6 +104,7 @@ application protocol was negotiated (e.g., `<<"h2">>` or `<<"http/1.1">>`).
     buffer => pos_integer(),
     certfile => file:filename(),
     keyfile => file:filename(),
+    certs_keys => [map()],
     cacertfile => file:filename(),
     cacerts => [public_key:der_encoded()],
     alpn_advertised_protocols => [binary()],
@@ -204,6 +205,7 @@ connect(Host, Port, Opts, Timeout) ->
 build_client_ssl_opts(Opts) ->
     Certfile = maps:get(certfile, Opts, undefined),
     Keyfile = maps:get(keyfile, Opts, undefined),
+    CertsKeys = maps:get(certs_keys, Opts, undefined),
     Cacertfile = maps:get(cacertfile, Opts, undefined),
     Cacerts = maps:get(cacerts, Opts, undefined),
     WildcardHostName = maps:get(wildcard_hostname, Opts, false),
@@ -241,7 +243,8 @@ build_client_ssl_opts(Opts) ->
     WithHostnameCheck =
         maybe_add_opt(customize_hostname_check, HostnameCheck, WithCacert),
     WithCert = maybe_add_opt(certfile, Certfile, WithHostnameCheck),
-    maybe_add_opt(keyfile, Keyfile, WithCert).
+    WithKey = maybe_add_opt(keyfile, Keyfile, WithCert),
+    maybe_add_opt(certs_keys, CertsKeys, WithKey).
 
 -doc "Build SSL options from opts map. Accepts any map containing SSL-related keys.".
 -spec build_ssl_opts(map()) -> [ssl:tls_server_option()].

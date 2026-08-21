@@ -40,8 +40,10 @@
     ssl_setopts/1,
     ssl_controlling_process/1,
     ssl_peername_sockname/1,
+    ssl_connect_client_certs_keys/1,
     build_ssl_opts_variants/1,
     build_client_ssl_opts_variants/1,
+    build_client_ssl_opts_certs_keys/1,
     normalize_host_variants/1,
     error_timeout/1,
     error_closed/1,
@@ -90,6 +92,7 @@ groups() ->
             ssl_setopts,
             ssl_controlling_process,
             ssl_peername_sockname,
+            ssl_connect_client_certs_keys,
             ssl_pre_handshake_ops,
             ssl_accept_error,
             ssl_connect_with_sni
@@ -97,6 +100,7 @@ groups() ->
         {opts, [parallel], [
             build_ssl_opts_variants,
             build_client_ssl_opts_variants,
+            build_client_ssl_opts_certs_keys,
             normalize_host_variants
         ]},
         {errors, [parallel], [
@@ -1092,6 +1096,28 @@ build_client_ssl_opts_variants(_Config) ->
 
     ok.
 
+build_client_ssl_opts_certs_keys(_Config) ->
+    CertsKeys = [#{cert => <<"cert-der">>, key => {'RSAPrivateKey', <<"key-der">>}}],
+
+    Opts1 = nhttp_sock:build_client_ssl_opts(#{
+        verify => verify_none,
+        certs_keys => CertsKeys
+    }),
+    ?assertEqual({certs_keys, CertsKeys}, lists:keyfind(certs_keys, 1, Opts1)),
+
+    Opts2 = nhttp_sock:build_client_ssl_opts(#{
+        verify => verify_peer,
+        cacerts => [<<"ca-der">>],
+        certs_keys => CertsKeys
+    }),
+    ?assertEqual({certs_keys, CertsKeys}, lists:keyfind(certs_keys, 1, Opts2)),
+    ?assertEqual({cacerts, [<<"ca-der">>]}, lists:keyfind(cacerts, 1, Opts2)),
+
+    Opts3 = nhttp_sock:build_client_ssl_opts(#{verify => verify_none}),
+    ?assertNot(lists:keymember(certs_keys, 1, Opts3)),
+
+    ok.
+
 normalize_host_variants(_Config) ->
     {ok, ListenSock} = nhttp_sock:listen(#{port => 0, transport => tcp}),
     {ok, {_, Port}} = nhttp_sock:sockname(ListenSock),
@@ -1122,6 +1148,94 @@ normalize_host_variants(_Config) ->
 
     nhttp_sock:close(ListenSock),
     ok.
+
+ssl_connect_client_certs_keys(Config) ->
+    CertFile = ?config(certfile, Config),
+    KeyFile = ?config(keyfile, Config),
+    ConfDir = filename:dirname(CertFile),
+    CaFile = filename:join(ConfDir, "ca.pem"),
+    ClientCertFile = filename:join(ConfDir, "client.pem"),
+    ClientKeyFile = filename:join(ConfDir, "client.key"),
+    case filelib:is_file(ClientCertFile) andalso filelib:is_file(CaFile) of
+        false ->
+            {skip, "client/CA certificates not found"};
+        true ->
+            {ok, ListenSock} = nhttp_sock:listen(#{
+                port => 0,
+                transport => ssl,
+                certfile => CertFile,
+                keyfile => KeyFile
+            }),
+            {ok, {_, Port}} = nhttp_sock:sockname(ListenSock),
+
+            ServerSslOpts =
+                nhttp_sock:build_ssl_opts(#{
+                    certfile => CertFile,
+                    keyfile => KeyFile,
+                    cacertfile => CaFile,
+                    verify => verify_peer
+                }) ++ [{fail_if_no_peer_cert, true}],
+
+            Self = self(),
+            spawn_link(fun() ->
+                case nhttp_sock:accept(ListenSock, 5000) of
+                    {ok, PreSock} ->
+                        case nhttp_sock:handshake(PreSock, 5000, ServerSslOpts) of
+                            {ok, ServerSock} ->
+                                {ok, Data} = nhttp_sock:recv(ServerSock, 0, 5000),
+                                Self ! {server_recv, Data},
+                                nhttp_sock:close(ServerSock);
+                            {error, Reason} ->
+                                Self ! {server_error, Reason}
+                        end;
+                    {error, Reason} ->
+                        Self ! {server_error, Reason}
+                end
+            end),
+
+            CertsKeys = load_certs_keys(ClientCertFile, ClientKeyFile),
+            {ok, ClientSock} = nhttp_sock:connect("127.0.0.1", Port, #{
+                transport => ssl,
+                verify => verify_none,
+                certs_keys => CertsKeys,
+                alpn_advertised_protocols => []
+            }),
+            ?assertEqual(ssl, nhttp_sock:transport(ClientSock)),
+
+            ok = nhttp_sock:send(ClientSock, <<"mtls ping">>),
+            receive
+                {server_recv, RecvData} ->
+                    ?assertEqual(<<"mtls ping">>, RecvData);
+                {server_error, Err} ->
+                    ct:fail("mTLS handshake failed: ~p", [Err])
+            after 5000 ->
+                ct:fail("Server did not complete mTLS handshake")
+            end,
+
+            nhttp_sock:close(ClientSock),
+            nhttp_sock:close(ListenSock),
+            ok
+    end.
+
+-doc "Load an in-memory certs_keys entry from PEM cert/key files.".
+load_certs_keys(CertFile, KeyFile) ->
+    {ok, CertPem} = file:read_file(CertFile),
+    {ok, KeyPem} = file:read_file(KeyFile),
+    {'Certificate', CertDer, _} =
+        lists:keyfind('Certificate', 1, public_key:pem_decode(CertPem)),
+    {KeyType, KeyDer, _} = private_key_entry(public_key:pem_decode(KeyPem)),
+    [#{cert => CertDer, key => {KeyType, KeyDer}}].
+
+private_key_entry(Entries) ->
+    [Key | _] = [
+        Entry
+     || {Type, _Der, _} = Entry <- Entries,
+        Type =:= 'PrivateKeyInfo' orelse
+            Type =:= 'RSAPrivateKey' orelse
+            Type =:= 'ECPrivateKey' orelse
+            Type =:= 'DSAPrivateKey'
+    ],
+    Key.
 
 %%%-----------------------------------------------------------------------------
 %%% ADDITIONAL COVERAGE TESTS

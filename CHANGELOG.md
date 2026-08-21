@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-08-21
+
+### Added
+
+- `certs_keys` client TLS option in `nhttp_sock:build_client_ssl_opts/1` and
+  `t:nhttp_sock:connect_opts/0`, forwarding in-memory client certificates for
+  mutual TLS (mTLS) without writing cert/key to disk
+
 ## [1.0.4] - 2026-08-20
 
 ### Added
