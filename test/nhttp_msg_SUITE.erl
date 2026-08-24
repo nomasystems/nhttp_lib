@@ -84,10 +84,19 @@ groups() ->
             erp_method_decoded_to_atom
         ]},
         {extract_response_pseudo, [parallel], [
-            rsp_empty_default_zero,
+            rsp_empty_is_missing_status,
             rsp_status_parsed,
             rsp_unknown_pseudo_dropped,
-            rsp_regular_order_preserved
+            rsp_regular_order_preserved,
+            rsp_non_numeric_rejected,
+            rsp_empty_value_rejected,
+            rsp_two_digits_rejected,
+            rsp_four_digits_rejected,
+            rsp_signed_rejected,
+            rsp_leading_space_rejected,
+            rsp_class_out_of_range_rejected,
+            rsp_class_boundaries_parsed,
+            rsp_never_raises_on_arbitrary_value
         ]},
         {validate_wire_scheme, [parallel], [
             vws_http_ok,
@@ -116,7 +125,9 @@ groups() ->
         {build_response, [parallel], [
             brsp_h2,
             brsp_h3,
-            brsp_status_and_filtered_headers
+            brsp_status_and_filtered_headers,
+            brsp_invalid_status_rejected,
+            brsp_missing_status_rejected
         ]},
         {check_extended_connect, [parallel], [
             cec_no_protocol_ok,
@@ -392,12 +403,12 @@ erp_method_decoded_to_atom(_Config) ->
 %%% extract_response_pseudo
 %%%-----------------------------------------------------------------------------
 
-rsp_empty_default_zero(_Config) ->
-    ?assertEqual({0, []}, nhttp_msg:extract_response_pseudo([])).
+rsp_empty_is_missing_status(_Config) ->
+    ?assertEqual({error, missing_status}, nhttp_msg:extract_response_pseudo([])).
 
 rsp_status_parsed(_Config) ->
     ?assertEqual(
-        {200, []},
+        {ok, {200, []}},
         nhttp_msg:extract_response_pseudo([{<<":status">>, <<"200">>}])
     ).
 
@@ -408,7 +419,7 @@ rsp_unknown_pseudo_dropped(_Config) ->
         {<<"x-foo">>, <<"bar">>}
     ],
     ?assertEqual(
-        {404, [{<<"x-foo">>, <<"bar">>}]},
+        {ok, {404, [{<<"x-foo">>, <<"bar">>}]}},
         nhttp_msg:extract_response_pseudo(Headers)
     ).
 
@@ -419,8 +430,108 @@ rsp_regular_order_preserved(_Config) ->
         {<<"x-b">>, <<"2">>}
     ],
     ?assertEqual(
-        {200, [{<<"x-a">>, <<"1">>}, {<<"x-b">>, <<"2">>}]},
+        {ok, {200, [{<<"x-a">>, <<"1">>}, {<<"x-b">>, <<"2">>}]}},
         nhttp_msg:extract_response_pseudo(Headers)
+    ).
+
+%% RFC 9113 Section 8.3.2 and RFC 9114 Section 4.3.2: `:status` is a
+%% string of three digits. RFC 9110 Section 15.1: the first digit
+%% selects one of exactly five classes.
+
+rsp_non_numeric_rejected(_Config) ->
+    ?assertEqual(
+        {error, invalid_status},
+        nhttp_msg:extract_response_pseudo([{<<":status">>, <<"abc">>}])
+    ).
+
+rsp_empty_value_rejected(_Config) ->
+    ?assertEqual(
+        {error, invalid_status},
+        nhttp_msg:extract_response_pseudo([{<<":status">>, <<>>}])
+    ).
+
+rsp_two_digits_rejected(_Config) ->
+    ?assertEqual(
+        {error, invalid_status},
+        nhttp_msg:extract_response_pseudo([{<<":status">>, <<"20">>}])
+    ).
+
+rsp_four_digits_rejected(_Config) ->
+    ?assertEqual(
+        {error, invalid_status},
+        nhttp_msg:extract_response_pseudo([{<<":status">>, <<"2000">>}])
+    ).
+
+rsp_signed_rejected(_Config) ->
+    lists:foreach(
+        fun(V) ->
+            ?assertEqual(
+                {error, invalid_status},
+                nhttp_msg:extract_response_pseudo([{<<":status">>, V}])
+            )
+        end,
+        [<<"+200">>, <<"-200">>, <<"+20">>, <<"-20">>]
+    ).
+
+rsp_leading_space_rejected(_Config) ->
+    lists:foreach(
+        fun(V) ->
+            ?assertEqual(
+                {error, invalid_status},
+                nhttp_msg:extract_response_pseudo([{<<":status">>, V}])
+            )
+        end,
+        [<<" 200">>, <<"200 ">>, <<"2 0">>]
+    ).
+
+rsp_class_out_of_range_rejected(_Config) ->
+    lists:foreach(
+        fun(V) ->
+            ?assertEqual(
+                {error, invalid_status},
+                nhttp_msg:extract_response_pseudo([{<<":status">>, V}])
+            )
+        end,
+        [<<"000">>, <<"099">>, <<"600">>, <<"999">>]
+    ).
+
+rsp_class_boundaries_parsed(_Config) ->
+    lists:foreach(
+        fun({V, Expected}) ->
+            ?assertEqual(
+                {ok, {Expected, []}},
+                nhttp_msg:extract_response_pseudo([{<<":status">>, V}])
+            )
+        end,
+        [
+            {<<"100">>, 100},
+            {<<"200">>, 200},
+            {<<"404">>, 404},
+            {<<"500">>, 500},
+            {<<"599">>, 599}
+        ]
+    ).
+
+rsp_never_raises_on_arbitrary_value(_Config) ->
+    Values = [
+        <<>>,
+        <<0>>,
+        <<255, 255, 255>>,
+        <<"abc">>,
+        <<"20a">>,
+        <<"1e2">>,
+        <<"0x10">>,
+        <<"200\n">>,
+        binary:copy(<<"9">>, 4096)
+    ],
+    lists:foreach(
+        fun(V) ->
+            ?assertEqual(
+                {error, invalid_status},
+                nhttp_msg:extract_response_pseudo([{<<":status">>, V}])
+            )
+        end,
+        Values
     ).
 
 %%%-----------------------------------------------------------------------------
@@ -572,24 +683,36 @@ br_unknown_pseudo_dropped(_Config) ->
 %%%-----------------------------------------------------------------------------
 
 brsp_h2(_Config) ->
-    Resp = nhttp_msg:build_response(http2, [{<<":status">>, <<"200">>}]),
+    {ok, Resp} = nhttp_msg:build_response(http2, [{<<":status">>, <<"200">>}]),
     ?assertEqual(200, maps:get(status, Resp)),
     ?assertEqual(http2, maps:get(version, Resp)),
     ?assertEqual(<<>>, maps:get(reason, Resp)),
     ?assertEqual([], maps:get(headers, Resp)).
 
 brsp_h3(_Config) ->
-    Resp = nhttp_msg:build_response(http3, [{<<":status">>, <<"204">>}]),
+    {ok, Resp} = nhttp_msg:build_response(http3, [{<<":status">>, <<"204">>}]),
     ?assertEqual(204, maps:get(status, Resp)),
     ?assertEqual(http3, maps:get(version, Resp)).
 
 brsp_status_and_filtered_headers(_Config) ->
-    Resp = nhttp_msg:build_response(http2, [
+    {ok, Resp} = nhttp_msg:build_response(http2, [
         {<<":status">>, <<"301">>},
         {<<"location">>, <<"/elsewhere">>}
     ]),
     ?assertEqual(301, maps:get(status, Resp)),
     ?assertEqual([{<<"location">>, <<"/elsewhere">>}], maps:get(headers, Resp)).
+
+brsp_invalid_status_rejected(_Config) ->
+    ?assertEqual(
+        {error, invalid_status},
+        nhttp_msg:build_response(http2, [{<<":status">>, <<"abc">>}])
+    ).
+
+brsp_missing_status_rejected(_Config) ->
+    ?assertEqual(
+        {error, missing_status},
+        nhttp_msg:build_response(http3, [{<<"x-foo">>, <<"bar">>}])
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% check_extended_connect

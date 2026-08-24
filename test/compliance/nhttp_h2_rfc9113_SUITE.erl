@@ -72,6 +72,10 @@ groups() ->
             request_pseudo_after_regular_is_stream_error,
             request_unknown_pseudo_is_stream_error,
             response_missing_status_is_stream_error,
+            response_non_digit_status_is_stream_error,
+            response_status_not_three_digits_is_stream_error,
+            response_status_outside_class_range_is_stream_error,
+            response_three_digit_status_accepted,
             connection_header_forbidden,
             keep_alive_header_forbidden,
             proxy_connection_header_forbidden,
@@ -360,6 +364,57 @@ response_missing_status_is_stream_error(_Config) ->
     {ok, {rst_stream, 2, protocol_error}, _} =
         nhttp_h2_frame:decode(iolist_to_binary(OutData)),
     ok.
+
+%% RFC9113-8.3.2-1: the `:status` pseudo-header field carries the HTTP
+%% status code as a string of three digits.
+%% RFC9110-15.1-1: the first digit of the status code defines the class
+%% of the response, and there are exactly five classes, so a valid code
+%% is in the range 100 to 599.
+%% RFC9113-8.1.1-1: a malformed response is a stream error of type
+%% PROTOCOL_ERROR.
+
+-spec assert_response_status_rejected(binary()) -> ok.
+assert_response_status_rejected(StatusValue) ->
+    Conn0 = client_with_server_preface(),
+    {ok, _StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    HeaderBlock = encode_headers([{<<":status">>, StatusValue}]),
+    {ok, Frame} = nhttp_h2_frame:headers(2, fin, fin, HeaderBlock),
+    {ok, Events, _Conn2, OutData} = nhttp_h2:recv(Conn1, iolist_to_binary(Frame)),
+    ?assertEqual([], Events),
+    {ok, {rst_stream, 2, protocol_error}, _} =
+        nhttp_h2_frame:decode(iolist_to_binary(OutData)),
+    ok.
+
+response_non_digit_status_is_stream_error(_Config) ->
+    lists:foreach(
+        fun assert_response_status_rejected/1,
+        [<<"abc">>, <<"20a">>, <<"1e2">>, <<"0x1">>]
+    ).
+
+response_status_not_three_digits_is_stream_error(_Config) ->
+    lists:foreach(
+        fun assert_response_status_rejected/1,
+        [<<>>, <<"2">>, <<"20">>, <<"2000">>, <<"+200">>, <<"-200">>, <<" 200">>, <<"200 ">>]
+    ).
+
+response_status_outside_class_range_is_stream_error(_Config) ->
+    lists:foreach(
+        fun assert_response_status_rejected/1,
+        [<<"000">>, <<"099">>, <<"600">>, <<"999">>]
+    ).
+
+response_three_digit_status_accepted(_Config) ->
+    lists:foreach(
+        fun({Value, Expected}) ->
+            Conn0 = client_with_server_preface(),
+            {ok, _StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+            HeaderBlock = encode_headers([{<<":status">>, Value}]),
+            {ok, Frame} = nhttp_h2_frame:headers(2, fin, fin, HeaderBlock),
+            {ok, Events, _Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(Frame)),
+            ?assertMatch([{response, 2, #{status := Expected}, fin}], Events)
+        end,
+        [{<<"100">>, 100}, {<<"200">>, 200}, {<<"404">>, 404}, {<<"599">>, 599}]
+    ).
 
 connection_header_forbidden(_Config) ->
     assert_request_rejected(minimal_request_headers() ++ [{<<"connection">>, <<"close">>}]).

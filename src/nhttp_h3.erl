@@ -819,10 +819,20 @@ decode_headers(
                             0 -> [];
                             _ -> [{send, DecStreamId, DecStreamData}]
                         end,
-                    Event = build_initial_headers_event(
-                        Conn#h3_conn.role, StreamId, Headers, FinAtom, NewConn1
-                    ),
-                    {ok, NewConn1, [Event], DecActions};
+                    case
+                        build_initial_headers_event(
+                            Conn#h3_conn.role, StreamId, Headers, FinAtom, NewConn1
+                        )
+                    of
+                        {ok, Event} ->
+                            {ok, NewConn1, [Event], DecActions};
+                        {error, _} ->
+                            {error,
+                                {stream_error, StreamId, h3_message_error, <<
+                                    "Malformed response: :status is not three digits in "
+                                    "100-599 (RFC 9114 Section 4.1.2, Section 4.3.2)"
+                                >>}}
+                    end;
                 {error, Reason} ->
                     {error, {stream_error, StreamId, h3_message_error, Reason}}
             end;
@@ -894,19 +904,22 @@ validate_headers(client, Headers, false, _Settings) ->
 -define(H3_CONNECTION_HEADERS_SET, ?NHTTP_MSG_CONNECTION_HEADERS_SET).
 -spec build_initial_headers_event(
     role(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin(), conn()
-) -> event().
+) -> {ok, event()} | {error, nhttp_msg:status_error()}.
 build_initial_headers_event(server, StreamId, Headers, Fin, Conn) ->
     Request = build_request(Conn, Headers),
-    {request, StreamId, Request, Fin};
+    {ok, {request, StreamId, Request, Fin}};
 build_initial_headers_event(client, StreamId, Headers, Fin, _Conn) ->
-    Response = build_response(Headers),
-    {response, StreamId, Response, Fin}.
+    maybe
+        {ok, Response} ?= build_response(Headers),
+        {ok, {response, StreamId, Response, Fin}}
+    end.
 
 -spec build_request(conn(), nhttp_lib:headers()) -> nhttp_lib:request().
 build_request(#h3_conn{peer = Peer}, Headers) ->
     nhttp_msg:build_request(http3, Peer, Headers).
 
--spec build_response(nhttp_lib:headers()) -> nhttp_lib:response().
+-spec build_response(nhttp_lib:headers()) ->
+    {ok, nhttp_lib:response()} | {error, nhttp_msg:status_error()}.
 build_response(Headers) ->
     nhttp_msg:build_response(http3, Headers).
 
