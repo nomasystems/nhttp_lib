@@ -123,6 +123,23 @@ Flow-control and END_STREAM ride on the DATA frame.
 
 -type error_code() :: nhttp_lib:error_code().
 
+-doc """
+Connection settings.
+
+Most keys map to a SETTINGS parameter of RFC 9113 Section 6.5.2 and go on
+the wire. `max_continuation_frames` and `max_reset_streams` are local
+policy. They bound work that a peer can request, they have no wire
+representation, and the encoder drops them.
+
+`max_continuation_frames` bounds the number of CONTINUATION frames in one
+field section, per RFC 9113 Section 10.5. An empty CONTINUATION frame adds
+no bytes, so `max_header_list_size` alone does not bound it. When the key
+is absent, the bound is
+`ceil(max_header_list_size / max_frame_size) + 8`, and it is `infinity`
+when `max_header_list_size` is `infinity`. The derived value tracks the
+byte bound, so a caller that raises `max_header_list_size` keeps the
+CONTINUATION frames that carry the larger field section.
+""".
 -type settings() :: #{
     header_table_size => non_neg_integer(),
     enable_push => boolean(),
@@ -130,6 +147,7 @@ Flow-control and END_STREAM ride on the DATA frame.
     initial_window_size => 1..16#7fffffff,
     max_frame_size => 16#4000..16#ffffff,
     max_header_list_size => pos_integer() | infinity,
+    max_continuation_frames => pos_integer() | infinity,
     enable_connect_protocol => boolean(),
     max_reset_streams => pos_integer() | infinity
 }.
@@ -177,6 +195,8 @@ Flow-control and END_STREAM ride on the DATA frame.
 %%%-----------------------------------------------------------------------------
 -define(H2_DEFAULT_INITIAL_WINDOW_SIZE, 65535).
 -define(H2_MAX_WINDOW_SIZE, 16#7fffffff).
+-define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
+-define(H2_PREFACE_LEN, 24).
 
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS (RFC 9113 SECTION 6.5.2)
@@ -184,6 +204,7 @@ Flow-control and END_STREAM ride on the DATA frame.
 -define(H2_DEFAULT_HEADER_TABLE_SIZE, 4096).
 -define(H2_DEFAULT_MAX_FRAME_SIZE, 16384).
 -define(H2_DEFAULT_MAX_HEADER_LIST_SIZE, 16384).
+-define(H2_CONTINUATION_HEADROOM, 8).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL RECORDS
@@ -217,6 +238,7 @@ Flow-control and END_STREAM ride on the DATA frame.
     hpack_enc :: nhttp_hpack:state(),
     hpack_dec :: nhttp_hpack:state(),
     continuation_stream = undefined :: undefined | nhttp_lib:stream_id(),
+    continuation_frames = 0 :: non_neg_integer(),
     buffer = <<>> :: binary(),
     goaway_sent = false :: boolean(),
     goaway_received = false :: boolean(),
@@ -444,6 +466,19 @@ stream_stats(#h2_conn{
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
+-spec check_continuation_allowance(conn(), pos_integer()) -> ok | {error, too_many_continuations}.
+check_continuation_allowance(#h2_conn{local_settings = Settings}, Count) ->
+    Max =
+        case maps:find(max_continuation_frames, Settings) of
+            {ok, Configured} -> Configured;
+            error -> derived_continuation_bound(Settings)
+        end,
+    case Max of
+        infinity -> ok;
+        _ when Count =< Max -> ok;
+        _ -> {error, too_many_continuations}
+    end.
+
 -spec check_header_block_size(conn(), non_neg_integer()) -> ok | {error, exceeded}.
 check_header_block_size(#h2_conn{local_settings = Settings}, Size) ->
     case maps:get(max_header_list_size, Settings, infinity) of
@@ -490,6 +525,14 @@ close_stream(#h2_conn{streams = Streams, active_stream_count = Count} = Conn, St
                 active_stream_count = NewCount
             }
     end.
+
+-spec continuation_flood_error() -> {error, nhttp_h2_frame:decode_error()}.
+continuation_flood_error() ->
+    {error,
+        {connection_error, enhance_your_calm, <<
+            "CONTINUATION frames for one field section exceed "
+            "SETTINGS_MAX_CONTINUATION_FRAMES (RFC 9113 Section 10.5)"
+        >>}}.
 
 -spec decode_and_emit_headers(conn(), nhttp_lib:stream_id(), fin(), binary()) ->
     {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
@@ -638,6 +681,16 @@ default_settings() ->
         max_header_list_size => ?H2_DEFAULT_MAX_HEADER_LIST_SIZE
     }.
 
+-spec derived_continuation_bound(settings()) -> pos_integer() | infinity.
+derived_continuation_bound(Settings) ->
+    case maps:get(max_header_list_size, Settings, infinity) of
+        infinity ->
+            infinity;
+        MaxList ->
+            MaxFrame = maps:get(max_frame_size, Settings, ?H2_DEFAULT_MAX_FRAME_SIZE),
+            (MaxList + MaxFrame - 1) div MaxFrame + ?H2_CONTINUATION_HEADROOM
+    end.
+
 -spec do_send_data(conn(), nhttp_lib:stream_id(), iodata(), fin()) -> send_result().
 do_send_data(
     #h2_conn{streams = Streams, send_window = ConnWindow, peer_settings = PeerSettings} = Conn,
@@ -744,6 +797,11 @@ hpack_decode_opts(#h2_conn{local_settings = Settings}) ->
 initial_stream_id(client) -> 1;
 initial_stream_id(server) -> 2.
 
+-spec invalid_preface_error() -> {error, nhttp_h2_frame:decode_error()}.
+invalid_preface_error() ->
+    {error,
+        {connection_error, protocol_error, <<"Invalid connection preface (RFC 9113 Section 3.4)">>}}.
+
 -spec is_active_state(stream_state()) -> boolean().
 is_active_state(open) -> true;
 is_active_state(half_closed_local) -> true;
@@ -768,27 +826,33 @@ process_continuation(
     #h2_stream{header_buffer = Buffer, header_end_stream = EndStream} =
         Stream =
         maps:get(StreamId, Conn#h2_conn.streams),
-    NewBuffer = <<Buffer/binary, HeaderBlock/binary>>,
-    case check_header_block_size(Conn, byte_size(NewBuffer)) of
-        ok ->
-            case EndHeaders of
-                fin ->
-                    NewConn = Conn#h2_conn{continuation_stream = undefined},
-                    EndStreamFin =
-                        case EndStream of
-                            true -> fin;
-                            false -> nofin
-                        end,
-                    decode_and_emit_headers(NewConn, StreamId, EndStreamFin, NewBuffer);
-                nofin ->
-                    NewStream = Stream#h2_stream{header_buffer = NewBuffer},
-                    NewConn = Conn#h2_conn{
-                        streams = (Conn#h2_conn.streams)#{StreamId => NewStream}
-                    },
-                    {ok, NewConn, [], []}
-            end;
-        {error, exceeded} ->
-            header_block_too_large_error()
+    FrameCount = Conn#h2_conn.continuation_frames + 1,
+    maybe
+        ok ?= check_continuation_allowance(Conn, FrameCount),
+        NewBuffer = <<Buffer/binary, HeaderBlock/binary>>,
+        ok ?= check_header_block_size(Conn, byte_size(NewBuffer)),
+        case EndHeaders of
+            fin ->
+                NewConn = Conn#h2_conn{
+                    continuation_stream = undefined, continuation_frames = 0
+                },
+                EndStreamFin =
+                    case EndStream of
+                        true -> fin;
+                        false -> nofin
+                    end,
+                decode_and_emit_headers(NewConn, StreamId, EndStreamFin, NewBuffer);
+            nofin ->
+                NewStream = Stream#h2_stream{header_buffer = NewBuffer},
+                NewConn = Conn#h2_conn{
+                    streams = (Conn#h2_conn.streams)#{StreamId => NewStream},
+                    continuation_frames = FrameCount
+                },
+                {ok, NewConn, [], []}
+        end
+    else
+        {error, too_many_continuations} -> continuation_flood_error();
+        {error, exceeded} -> header_block_too_large_error()
     end;
 process_continuation(#h2_conn{continuation_stream = Expected}, StreamId, _EndHeaders, _HeaderBlock) ->
     {error,
@@ -982,7 +1046,8 @@ process_headers(
                     },
                     NewConn = Conn#h2_conn{
                         streams = (Conn#h2_conn.streams)#{StreamId => NewStream},
-                        continuation_stream = StreamId
+                        continuation_stream = StreamId,
+                        continuation_frames = 0
                     },
                     {ok, NewConn, [], []}
             end;
@@ -1081,8 +1146,8 @@ rapid_reset_error() ->
             "(RFC 9113 Section 10.5)"
         >>}}.
 
--spec recv_loop(conn(), binary(), [[event()]], iodata()) -> recv_result().
-recv_loop(Conn, Data, EventsAcc, ToSend) ->
+-spec recv_frames(conn(), binary(), [[event()]], iodata()) -> recv_result().
+recv_frames(Conn, Data, EventsAcc, ToSend) ->
     MaxFrameSize = maps:get(
         max_frame_size, Conn#h2_conn.local_settings, ?H2_DEFAULT_MAX_FRAME_SIZE
     ),
@@ -1106,20 +1171,24 @@ recv_loop(Conn, Data, EventsAcc, ToSend) ->
                     Error
             end;
         {more, _} ->
-            case validate_preface_buffer(Conn, Data) of
-                ok ->
-                    FinalConn = Conn#h2_conn{buffer = Data},
-                    FinalEvents = lists:append(lists:reverse(EventsAcc)),
-                    case iolist_size(ToSend) of
-                        0 -> {ok, FinalEvents, FinalConn};
-                        _ -> {ok, FinalEvents, FinalConn, ToSend}
-                    end;
-                {error, _} = Error ->
-                    Error
+            FinalConn = Conn#h2_conn{buffer = Data},
+            FinalEvents = lists:append(lists:reverse(EventsAcc)),
+            case iolist_size(ToSend) of
+                0 -> {ok, FinalEvents, FinalConn};
+                _ -> {ok, FinalEvents, FinalConn, ToSend}
             end;
         {error, _} = Error ->
             Error
     end.
+
+-spec recv_loop(conn(), binary(), [[event()]], iodata()) -> recv_result().
+recv_loop(#h2_conn{role = server, state = preface} = Conn, Data, EventsAcc, ToSend) ->
+    case validate_preface_buffer(Data) of
+        ok -> recv_frames(Conn, Data, EventsAcc, ToSend);
+        {error, _} = Error -> Error
+    end;
+recv_loop(Conn, Data, EventsAcc, ToSend) ->
+    recv_frames(Conn, Data, EventsAcc, ToSend).
 
 -spec store_or_remove_stream(
     #{nhttp_lib:stream_id() => #h2_stream{}}, nhttp_lib:stream_id(), #h2_stream{}
@@ -1216,20 +1285,14 @@ validate_peer_stream_id(#h2_conn{role = client, last_peer_stream_id = LastPeer},
             ok
     end.
 
--spec validate_preface_buffer(conn(), binary()) -> ok | {error, nhttp_h2_frame:decode_error()}.
-validate_preface_buffer(#h2_conn{role = server, state = preface}, Data) when
-    byte_size(Data) >= 24
-->
+-spec validate_preface_buffer(binary()) -> ok | {error, nhttp_h2_frame:decode_error()}.
+validate_preface_buffer(Data) ->
+    PrefixLen = min(byte_size(Data), ?H2_PREFACE_LEN),
+    <<Expected:PrefixLen/binary, _/binary>> = ?H2_PREFACE,
     case Data of
-        <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", _/binary>> ->
-            ok;
-        _ ->
-            {error,
-                {connection_error, protocol_error,
-                    <<"Invalid connection preface (RFC 9113 Section 3.4)">>}}
-    end;
-validate_preface_buffer(_, _) ->
-    ok.
+        <<Expected:PrefixLen/binary, _/binary>> -> ok;
+        _ -> invalid_preface_error()
+    end.
 
 -spec validate_recv_data(stream_state()) -> ok | {error, binary()}.
 validate_recv_data(open) -> ok;
