@@ -47,6 +47,7 @@ error format (atom for H2, descriptive binary for H3).
     extended_connect_error/0,
     request_shape/0,
     request_shape_error/0,
+    status_error/0,
     trailers_error/0
 ]).
 
@@ -58,6 +59,8 @@ error format (atom for H2, descriptive binary for H3).
 -type content_length_error() :: content_length_mismatch.
 
 -type extended_connect_error() :: missing_authority | bad_method | not_enabled.
+
+-type status_error() :: invalid_status | missing_status.
 
 -type request_shape() :: #{
     method := binary(),
@@ -131,17 +134,22 @@ build_request(Version, Peer, Headers) ->
 Assemble the canonical `t:nhttp_lib:response/0` map. `Version` is
 stamped onto the map; `reason` is the empty binary (HTTP/2 and HTTP/3
 do not carry a reason phrase, RFC 9113 §8.3.2, RFC 9114 §4.3.2).
+
+Fails with `t:status_error/0` when the `:status` pseudo-header is
+absent or malformed. See `extract_response_pseudo/1`.
 """.
 -spec build_response(nhttp_lib:version(), nhttp_lib:headers()) ->
-    nhttp_lib:response().
+    {ok, nhttp_lib:response()} | {error, status_error()}.
 build_response(Version, Headers) ->
-    {Status, Filtered} = extract_response_pseudo(Headers),
-    #{
-        status => Status,
-        version => Version,
-        reason => <<>>,
-        headers => Filtered
-    }.
+    maybe
+        {ok, {Status, Filtered}} ?= extract_response_pseudo(Headers),
+        {ok, #{
+            status => Status,
+            version => Version,
+            reason => <<>>,
+            headers => Filtered
+        }}
+    end.
 
 -doc """
 When both `:authority` and `Host` are present they must carry the
@@ -297,27 +305,57 @@ extract_request_pseudo([Header | Rest], M, P, S, A, CP, Acc) ->
     extract_request_pseudo(Rest, M, P, S, A, CP, [Header | Acc]).
 
 -doc """
-Project `:status` out of a response header list, returning the
-integer status and the regular headers in their original order.
-Unknown pseudo-headers are dropped (already rejected at validation).
+Project `:status` out of a response header list, returning the integer
+status and the regular headers in their original order. Unknown
+pseudo-headers are dropped (already rejected at validation).
+
+Returns `{error, invalid_status}` when the value is not a valid status
+code, and `{error, missing_status}` when no `:status` is present. The
+caller maps both onto the wire error for its protocol: RFC 9113
+Section 8.1.1 makes a malformed response a stream error of type
+`PROTOCOL_ERROR`, and RFC 9114 Section 4.1.2 makes it
+`H3_MESSAGE_ERROR`. This function never raises on peer input.
 """.
 -spec extract_response_pseudo(nhttp_lib:headers()) ->
-    {nhttp_lib:status() | 0, nhttp_lib:headers()}.
+    {ok, {nhttp_lib:status(), nhttp_lib:headers()}} | {error, status_error()}.
 extract_response_pseudo(Headers) ->
-    extract_response_pseudo(Headers, 0, []).
+    extract_response_pseudo(Headers, undefined, []).
 
 -spec extract_response_pseudo(
-    nhttp_lib:headers(), nhttp_lib:status() | 0, nhttp_lib:headers()
+    nhttp_lib:headers(), nhttp_lib:status() | undefined, nhttp_lib:headers()
 ) ->
-    {nhttp_lib:status() | 0, nhttp_lib:headers()}.
+    {ok, {nhttp_lib:status(), nhttp_lib:headers()}} | {error, status_error()}.
+extract_response_pseudo([], undefined, _Acc) ->
+    {error, missing_status};
 extract_response_pseudo([], Status, Acc) ->
-    {Status, lists:reverse(Acc)};
+    {ok, {Status, lists:reverse(Acc)}};
 extract_response_pseudo([{<<":status">>, V} | Rest], _Status, Acc) ->
-    extract_response_pseudo(Rest, binary_to_integer(V), Acc);
+    maybe
+        {ok, Status} ?= decode_status(V),
+        extract_response_pseudo(Rest, Status, Acc)
+    end;
 extract_response_pseudo([{<<":", _/binary>>, _} | Rest], Status, Acc) ->
     extract_response_pseudo(Rest, Status, Acc);
 extract_response_pseudo([Header | Rest], Status, Acc) ->
     extract_response_pseudo(Rest, Status, [Header | Acc]).
+
+-doc """
+Decode a `:status` pseudo-header value. RFC 9113 Section 8.3.2 and
+RFC 9114 Section 4.3.2 both give the value as a string of exactly
+three digits. RFC 9110 Section 15.1 defines the first digit as the
+response class, of which there are exactly five, so the accepted range
+is `100` to `599`. That range is `t:nhttp_lib:status/0`.
+
+The conversion is arithmetic on the three guarded bytes, so no
+`binary_to_integer/1` call can see peer input on this path.
+""".
+-spec decode_status(binary()) -> {ok, nhttp_lib:status()} | {error, invalid_status}.
+decode_status(<<D1, D2, D3>>) when
+    D1 >= $1, D1 =< $5, D2 >= $0, D2 =< $9, D3 >= $0, D3 =< $9
+->
+    {ok, (D1 - $0) * 100 + (D2 - $0) * 10 + (D3 - $0)};
+decode_status(_) ->
+    {error, invalid_status}.
 
 -spec finalise_request_shape(map()) ->
     {ok, request_shape()} | {error, request_shape_error()}.
