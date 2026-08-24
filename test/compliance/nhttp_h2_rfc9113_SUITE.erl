@@ -93,7 +93,9 @@ groups() ->
         {section_10_denial_of_service, [parallel], [
             max_concurrent_streams_does_not_bound_stream_turnover,
             stream_turnover_is_tracked_on_the_connection,
-            reset_allowance_is_connection_error_enhance_your_calm
+            reset_allowance_is_connection_error_enhance_your_calm,
+            empty_continuation_flood_is_connection_error_enhance_your_calm,
+            continuation_allowance_scales_with_max_header_list_size
         ]}
     ].
 
@@ -571,9 +573,50 @@ reset_allowance_is_connection_error_enhance_your_calm(_Config) ->
     ),
     ok.
 
+%% RFC9113-10.5-3: "Large numbers of small or empty frames can be abused to
+%% cause a peer to expend time processing frame headers." An empty CONTINUATION
+%% frame adds no bytes, so the byte bound of Section 10.5.1 never fires on it.
+%% The frame count is the bound that does.
+empty_continuation_flood_is_connection_error_enhance_your_calm(_Config) ->
+    Conn0 = server_with_preface_settings(#{}),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, <<"a">>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    ?assertMatch(
+        {refused, _, {connection_error, enhance_your_calm, _}},
+        h2_empty_continuations(Conn1, 1, 500)
+    ),
+    ok.
+
+%% RFC9113-10.5-4: the count bound must not contradict the byte bound of
+%% Section 10.5.1. A peer that is allowed a larger field section is allowed the
+%% CONTINUATION frames that carry it.
+continuation_allowance_scales_with_max_header_list_size(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_header_list_size => 1048576}),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, <<"a">>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    ?assertMatch({ok, _}, h2_empty_continuations(Conn1, 1, 64)),
+    ok.
+
 %%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
+
+-spec h2_empty_continuations(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
+    {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+h2_empty_continuations(Conn, StreamId, Count) ->
+    h2_empty_continuations(Conn, StreamId, Count, 1).
+
+-spec h2_empty_continuations(
+    nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer(), pos_integer()
+) -> {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+h2_empty_continuations(Conn, _StreamId, 0, _Sent) ->
+    {ok, Conn};
+h2_empty_continuations(Conn, StreamId, Count, Sent) ->
+    {ok, ContFrame} = nhttp_h2_frame:continuation(StreamId, nofin, <<>>),
+    case nhttp_h2:recv(Conn, iolist_to_binary(ContFrame)) of
+        {ok, [], Conn1} -> h2_empty_continuations(Conn1, StreamId, Count - 1, Sent + 1);
+        {error, Reason} -> {refused, Sent, Reason}
+    end.
 
 -spec h2_reset_rounds(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
     {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.

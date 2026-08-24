@@ -117,6 +117,9 @@ Tests RFC 9113 compliance for:
     stream_concurrency_count_tracking/1,
     stream_concurrency_decrement_on_close/1,
     continuation_flood_protection_test/1,
+    continuation_exceeds_header_list_size_test/1,
+    continuation_count_resets_between_field_sections_test/1,
+    continuation_count_infinity_allows_flood_test/1,
     oversized_initial_headers_test/1,
     decoded_header_list_too_large_test/1
 ]).
@@ -253,6 +256,9 @@ groups() ->
             stream_concurrency_count_tracking,
             stream_concurrency_decrement_on_close,
             continuation_flood_protection_test,
+            continuation_exceeds_header_list_size_test,
+            continuation_count_resets_between_field_sections_test,
+            continuation_count_infinity_allows_flood_test,
             oversized_initial_headers_test,
             decoded_header_list_too_large_test
         ]},
@@ -759,6 +765,16 @@ continuation_unexpected(_Config) ->
     ok.
 
 continuation_flood_protection_test(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, <<"a">>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    ?assertMatch(
+        {refused, 10, {connection_error, enhance_your_calm, _}},
+        send_empty_continuations(Conn1, 1, 200)
+    ),
+    ok.
+
+continuation_exceeds_header_list_size_test(_Config) ->
     Settings = #{max_header_list_size => 200},
     Conn0 = nhttp_h2:new(server, Settings),
     {ok, Preface} = nhttp_h2_frame:preface(),
@@ -770,6 +786,27 @@ continuation_flood_protection_test(_Config) ->
     {ok, ContFrame} = nhttp_h2_frame:continuation(1, fin, Tail),
     {error, {connection_error, enhance_your_calm, _}} =
         nhttp_h2:recv(Conn2, iolist_to_binary(ContFrame)),
+    ok.
+
+continuation_count_resets_between_field_sections_test(_Config) ->
+    Settings = #{max_continuation_frames => 3},
+    Conn0 = server_with_preface(nhttp_h2:new(server, Settings)),
+    Conn1 = recv_field_section_in_four_frames(Conn0, 1),
+    Conn2 = recv_field_section_in_four_frames(Conn1, 3),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(5, fin, nofin, <<"a">>),
+    {ok, [], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(HeadersFrame)),
+    ?assertMatch(
+        {refused, 4, {connection_error, enhance_your_calm, _}},
+        send_empty_continuations(Conn3, 5, 10)
+    ),
+    ok.
+
+continuation_count_infinity_allows_flood_test(_Config) ->
+    Settings = #{max_continuation_frames => infinity},
+    Conn0 = server_with_preface(nhttp_h2:new(server, Settings)),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, <<"a">>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    ?assertMatch({ok, _}, send_empty_continuations(Conn1, 1, 200)),
     ok.
 
 oversized_initial_headers_test(_Config) ->
@@ -1618,3 +1655,36 @@ send_local_resets(Conn, BaseId, N) ->
     {_, Conn1} = recv_events(Conn, iolist_to_binary(HeadersFrame)),
     {ok, Conn2, _RstFrame} = nhttp_h2:send_rst_stream(Conn1, BaseId, cancel),
     send_local_resets(Conn2, BaseId + 2, N - 1).
+
+-spec send_empty_continuations(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
+    {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+send_empty_continuations(Conn, StreamId, Count) ->
+    send_empty_continuations(Conn, StreamId, Count, 1).
+
+-spec send_empty_continuations(
+    nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer(), pos_integer()
+) -> {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+send_empty_continuations(Conn, _StreamId, 0, _Sent) ->
+    {ok, Conn};
+send_empty_continuations(Conn, StreamId, Count, Sent) ->
+    {ok, ContFrame} = nhttp_h2_frame:continuation(StreamId, nofin, <<>>),
+    case nhttp_h2:recv(Conn, iolist_to_binary(ContFrame)) of
+        {ok, [], Conn1} -> send_empty_continuations(Conn1, StreamId, Count - 1, Sent + 1);
+        {error, Reason} -> {refused, Sent, Reason}
+    end.
+
+-spec recv_field_section_in_four_frames(nhttp_h2:conn(), nhttp_lib:stream_id()) ->
+    nhttp_h2:conn().
+recv_field_section_in_four_frames(Conn0, StreamId) ->
+    HeaderBlock = encode_headers(minimal_request_headers()),
+    Size = byte_size(HeaderBlock) div 4,
+    <<P1:Size/binary, P2:Size/binary, P3:Size/binary, P4/binary>> = HeaderBlock,
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(StreamId, fin, nofin, P1),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    {ok, C1} = nhttp_h2_frame:continuation(StreamId, nofin, P2),
+    {ok, [], Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(C1)),
+    {ok, C2} = nhttp_h2_frame:continuation(StreamId, nofin, P3),
+    {ok, [], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(C2)),
+    {ok, C3} = nhttp_h2_frame:continuation(StreamId, fin, P4),
+    {ok, [{request, StreamId, _, fin}], Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(C3)),
+    Conn4.

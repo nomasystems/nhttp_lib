@@ -101,6 +101,8 @@ groups() ->
             reject_window_update_zero_increment_stream,
             reject_continuation_stream_id_zero,
             reject_frame_exceeds_max_size,
+            reject_oversize_frame_from_header_alone,
+            reject_oversize_frame_before_payload_arrives,
             reject_invalid_padding
         ]},
         {settings, [parallel], [
@@ -116,7 +118,10 @@ groups() ->
         {incomplete, [parallel], [
             incomplete_frame_header,
             incomplete_frame_payload,
-            incomplete_returns_min_bytes
+            incomplete_returns_min_bytes,
+            frame_at_max_size_still_awaits_payload,
+            frame_at_max_size_decodes,
+            truncated_header_declaring_oversize_returns_more
         ]}
     ].
 
@@ -542,6 +547,21 @@ reject_invalid_padding(_Config) ->
     Frame = <<8:24, 0:8, 16#09:8, 0:1, 1:31, 2:8, "hello", 1, 0>>,
     {error, {connection_error, protocol_error, _}} = nhttp_h2_frame:decode(Frame).
 
+reject_oversize_frame_from_header_alone(_Config) ->
+    Header = <<16385:24, 0:8, 0:8, 0:1, 1:31>>,
+    ?assertEqual(9, byte_size(Header)),
+    ?assertMatch(
+        {error, {connection_error, frame_size_error, _}},
+        nhttp_h2_frame:decode(Header, 16384)
+    ).
+
+reject_oversize_frame_before_payload_arrives(_Config) ->
+    Header = <<16#ffffff:24, 0:8, 0:8, 0:1, 1:31>>,
+    ?assertMatch(
+        {error, {connection_error, frame_size_error, _}},
+        nhttp_h2_frame:decode(<<Header/binary, "partial">>, 16384)
+    ).
+
 %%%-----------------------------------------------------------------------------
 %%% SETTINGS TESTS
 %%%-----------------------------------------------------------------------------
@@ -600,3 +620,15 @@ incomplete_returns_min_bytes(_Config) ->
     ?assertEqual(9, N1),
     {more, N2} = nhttp_h2_frame:decode(<<0, 0, 100, 0, 0, 0, 0, 0, 0>>),
     ?assertEqual(100, N2).
+
+frame_at_max_size_still_awaits_payload(_Config) ->
+    Header = <<16384:24, 0:8, 0:8, 0:1, 1:31>>,
+    ?assertEqual({more, 16384}, nhttp_h2_frame:decode(Header, 16384)).
+
+frame_at_max_size_decodes(_Config) ->
+    Payload = binary:copy(<<0>>, 16384),
+    Frame = <<16384:24, 0:8, 0:8, 0:1, 1:31, Payload/binary>>,
+    ?assertEqual({ok, {data, 1, nofin, Payload}, 16393}, nhttp_h2_frame:decode(Frame, 16384)).
+
+truncated_header_declaring_oversize_returns_more(_Config) ->
+    ?assertEqual({more, 1}, nhttp_h2_frame:decode(<<16#ffffff:24, 0:8, 0:8, 0:24>>, 16384)).
