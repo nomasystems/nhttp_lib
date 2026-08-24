@@ -191,14 +191,12 @@ decode(<<"PRI ", _/binary>> = Data, _MaxFrameSize) ->
     {more, ?PREFACE_LEN - byte_size(Data)};
 decode(<<Data/binary>>, _MaxFrameSize) when byte_size(Data) < ?FRAME_HEADER_SIZE ->
     {more, ?FRAME_HEADER_SIZE - byte_size(Data)};
+decode(<<Len:24, _:48, _/binary>>, MaxFrameSize) when Len > MaxFrameSize ->
+    frame_too_large_error(Len, MaxFrameSize);
 decode(<<Len:24, _:48, _/binary>> = Data, _MaxFrameSize) when
     byte_size(Data) < Len + ?FRAME_HEADER_SIZE
 ->
     {more, Len + ?FRAME_HEADER_SIZE - byte_size(Data)};
-decode(<<Len:24, _:48, _/binary>>, MaxFrameSize) when Len > MaxFrameSize ->
-    {error,
-        {connection_error, frame_size_error,
-            <<"Frame size exceeds SETTINGS_MAX_FRAME_SIZE (RFC 9113 Section 4.2)">>}};
 decode(<<Data/binary>>, _MaxFrameSize) ->
     decode_frame(Data, 0).
 
@@ -850,6 +848,18 @@ fin_to_end_headers(nofin) -> 0.
 -spec fin_to_end_stream(nhttp_h2:fin()) -> 0 | 1.
 fin_to_end_stream(fin) -> ?FLAG_END_STREAM;
 fin_to_end_stream(nofin) -> 0.
+
+-spec frame_too_large_error(non_neg_integer(), pos_integer()) -> {error, decode_error()}.
+frame_too_large_error(Len, MaxFrameSize) ->
+    {error,
+        {connection_error, frame_size_error,
+            iolist_to_binary([
+                <<"Frame length ">>,
+                integer_to_binary(Len),
+                <<" exceeds SETTINGS_MAX_FRAME_SIZE ">>,
+                integer_to_binary(MaxFrameSize),
+                <<" (RFC 9113 Section 4.2)">>
+            ])}}.
 
 -spec int_to_error_code(non_neg_integer()) -> nhttp_h2:error_code().
 int_to_error_code(16#00) -> no_error;

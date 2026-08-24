@@ -41,6 +41,7 @@ groups() ->
         {section_4_frame_format, [parallel], [
             incomplete_header_yields_more,
             frame_exceeding_max_size_is_frame_size_error,
+            frame_size_error_comes_from_the_header_alone,
             reserved_bit_ignored_on_decode,
             undefined_flag_bits_ignored
         ]},
@@ -140,6 +141,15 @@ incomplete_header_yields_more(_Config) ->
 frame_exceeding_max_size_is_frame_size_error(_Config) ->
     Frame = <<16385:24, 16#00:8, 0:8, 0:1, 1:31, 0:(16385 * 8)>>,
     {error, {connection_error, frame_size_error, _}} = nhttp_h2_frame:decode(Frame),
+    ok.
+
+%% RFC9113-4.2-2: "An endpoint MUST send an error code of FRAME_SIZE_ERROR if a
+%% frame exceeds the size defined in SETTINGS_MAX_FRAME_SIZE". The length sits
+%% in the 9-octet header of Section 4.1, so the payload need not arrive first.
+frame_size_error_comes_from_the_header_alone(_Config) ->
+    Header = <<16#ffffff:24, 16#00:8, 0:8, 0:1, 1:31>>,
+    ?assertEqual(9, byte_size(Header)),
+    {error, {connection_error, frame_size_error, _}} = nhttp_h2_frame:decode(Header, 16384),
     ok.
 
 reserved_bit_ignored_on_decode(_Config) ->
