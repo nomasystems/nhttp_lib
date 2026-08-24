@@ -114,7 +114,11 @@ groups() ->
             response_duplicate_status,
             response_invalid_pseudo_header,
             response_te_header_forbidden,
-            response_connection_header_forbidden
+            response_connection_header_forbidden,
+            response_non_numeric_status_message_error,
+            response_malformed_status_shapes_message_error,
+            response_status_out_of_class_message_error,
+            response_bad_status_connection_survives
         ]},
         {stream_lifecycle, [parallel], [
             stream_reset_event,
@@ -893,6 +897,57 @@ trailers_with_pseudo_headers_error(_Config) ->
 %%%-----------------------------------------------------------------------------
 %%% RESPONSE VALIDATION TESTS
 %%%-----------------------------------------------------------------------------
+
+%% RFC 9114 Section 4.3.2: `:status` is a string of three digits.
+%% RFC 9110 Section 15.1: the first digit selects one of five classes.
+%% RFC 9114 Section 4.1.2: a malformed response is a stream error of
+%% type H3_MESSAGE_ERROR. It must not kill the connection.
+
+response_non_numeric_status_message_error(_Config) ->
+    {ok, Client} = init_client_with_peer_settings(),
+    Headers = [{<<":status">>, <<"abc">>}],
+    HeadersData = encode_headers_for_test(Headers),
+    ?assertMatch(
+        {error, {stream_error, 4, h3_message_error, _}},
+        nhttp_h3:recv(Client, 4, HeadersData, fin)
+    ).
+
+response_malformed_status_shapes_message_error(_Config) ->
+    lists:foreach(
+        fun(V) ->
+            {ok, Client} = init_client_with_peer_settings(),
+            HeadersData = encode_headers_for_test([{<<":status">>, V}]),
+            ?assertMatch(
+                {error, {stream_error, 4, h3_message_error, _}},
+                nhttp_h3:recv(Client, 4, HeadersData, fin)
+            )
+        end,
+        [<<>>, <<"20">>, <<"2000">>, <<"+200">>, <<"-200">>, <<" 200">>]
+    ).
+
+response_status_out_of_class_message_error(_Config) ->
+    lists:foreach(
+        fun(V) ->
+            {ok, Client} = init_client_with_peer_settings(),
+            HeadersData = encode_headers_for_test([{<<":status">>, V}]),
+            ?assertMatch(
+                {error, {stream_error, 4, h3_message_error, _}},
+                nhttp_h3:recv(Client, 4, HeadersData, fin)
+            )
+        end,
+        [<<"000">>, <<"099">>, <<"600">>, <<"999">>]
+    ).
+
+response_bad_status_connection_survives(_Config) ->
+    {ok, Client} = init_client_with_peer_settings(),
+    BadData = encode_headers_for_test([{<<":status">>, <<"abc">>}]),
+    ?assertMatch(
+        {error, {stream_error, 4, h3_message_error, _}},
+        nhttp_h3:recv(Client, 4, BadData, fin)
+    ),
+    GoodData = encode_headers_for_test([{<<":status">>, <<"200">>}]),
+    {ok, Events, _Client1, _} = nhttp_h3:recv(Client, 8, GoodData, fin),
+    ?assertMatch([{response, 8, #{status := 200}, fin}], Events).
 
 response_valid_with_body(_Config) ->
     {ok, Client} = init_client_with_peer_settings(),

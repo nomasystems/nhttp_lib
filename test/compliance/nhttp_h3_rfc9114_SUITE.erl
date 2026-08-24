@@ -43,6 +43,10 @@ groups() ->
             request_unknown_pseudo_is_stream_error,
             request_pseudo_after_regular_is_stream_error,
             response_missing_status_is_stream_error,
+            response_non_digit_status_is_stream_error,
+            response_status_not_three_digits_is_stream_error,
+            response_status_outside_class_range_is_stream_error,
+            response_three_digit_status_accepted,
             te_header_forbidden,
             connection_header_forbidden,
             trailers_with_pseudo_forbidden,
@@ -185,6 +189,50 @@ response_missing_status_is_stream_error(_Config) ->
     ]),
     Result = nhttp_h3:recv(Client, 1, Bytes, fin),
     assert_h3_stream_error(Result, h3_message_error).
+
+%% RFC9114-4.3.2-1: the `:status` pseudo-header field carries the HTTP
+%% status code as a string of three digits.
+%% RFC9110-15.1-1: the first digit of the status code defines the class
+%% of the response, and there are exactly five classes, so a valid code
+%% is in the range 100 to 599.
+%% RFC9114-4.1.2-1: a malformed response is a stream error of type
+%% H3_MESSAGE_ERROR.
+
+-spec assert_response_status_stream_error(binary()) -> ok.
+assert_response_status_stream_error(StatusValue) ->
+    Client = fresh_client(),
+    Bytes = encode_request_stream_headers(Client, 1, [{<<":status">>, StatusValue}]),
+    Result = nhttp_h3:recv(Client, 1, Bytes, fin),
+    assert_h3_stream_error(Result, h3_message_error).
+
+response_non_digit_status_is_stream_error(_Config) ->
+    lists:foreach(
+        fun assert_response_status_stream_error/1,
+        [<<"abc">>, <<"20a">>, <<"1e2">>, <<"0x1">>]
+    ).
+
+response_status_not_three_digits_is_stream_error(_Config) ->
+    lists:foreach(
+        fun assert_response_status_stream_error/1,
+        [<<>>, <<"2">>, <<"20">>, <<"2000">>, <<"+200">>, <<"-200">>, <<" 200">>, <<"200 ">>]
+    ).
+
+response_status_outside_class_range_is_stream_error(_Config) ->
+    lists:foreach(
+        fun assert_response_status_stream_error/1,
+        [<<"000">>, <<"099">>, <<"600">>, <<"999">>]
+    ).
+
+response_three_digit_status_accepted(_Config) ->
+    lists:foreach(
+        fun({Value, Expected}) ->
+            Client = fresh_client(),
+            Bytes = encode_request_stream_headers(Client, 1, [{<<":status">>, Value}]),
+            {ok, Events, _Client1, _} = nhttp_h3:recv(Client, 1, Bytes, fin),
+            ?assertMatch([{response, 1, #{status := Expected}, fin}], Events)
+        end,
+        [{<<"100">>, 100}, {<<"200">>, 200}, {<<"404">>, 404}, {<<"599">>, 599}]
+    ).
 
 te_header_forbidden(_Config) ->
     assert_request_stream_error(

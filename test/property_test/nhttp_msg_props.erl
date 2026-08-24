@@ -42,9 +42,64 @@ prop_validate_request_pseudo_shape_valid_roundtrip() ->
         )
     ).
 
+%% RFC 9113 Section 8.3.2 and RFC 9114 Section 4.3.2: `:status` is a
+%% string of three digits. RFC 9110 Section 15.1: the first digit
+%% selects one of exactly five response classes, so the accepted range
+%% is 100 to 599. The properties below state that no peer-supplied
+%% value can raise, and that the accepted set is exactly that range.
+
+-spec prop_extract_response_pseudo_never_raises() -> triq:property().
+prop_extract_response_pseudo_never_raises() ->
+    ?FORALL(
+        {Value, Regulars},
+        {status_value_gen(), regular_headers_gen()},
+        begin
+            Headers = [{<<":status">>, Value} | Regulars],
+            case nhttp_msg:extract_response_pseudo(Headers) of
+                {ok, {Status, Filtered}} ->
+                    is_integer(Status) andalso Status >= 100 andalso Status =< 599 andalso
+                        Filtered =:= Regulars;
+                {error, Reason} ->
+                    lists:member(Reason, [invalid_status, missing_status])
+            end
+        end
+    ).
+
+-spec prop_extract_response_pseudo_accepts_exactly_valid_status() -> triq:property().
+prop_extract_response_pseudo_accepts_exactly_valid_status() ->
+    ?FORALL(
+        Value,
+        status_value_gen(),
+        begin
+            Accepted =
+                case nhttp_msg:extract_response_pseudo([{<<":status">>, Value}]) of
+                    {ok, {Status, []}} -> {yes, Status};
+                    {error, invalid_status} -> no
+                end,
+            Accepted =:= reference_status(Value)
+        end
+    ).
+
+-spec prop_extract_response_pseudo_missing_status() -> triq:property().
+prop_extract_response_pseudo_missing_status() ->
+    ?FORALL(
+        Regulars,
+        regular_headers_gen(),
+        nhttp_msg:extract_response_pseudo(Regulars) =:= {error, missing_status}
+    ).
+
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
+
+%% Independent restatement of the rule, written without reference to
+%% the implementation. Three bytes, all ASCII digits, first digit 1-5.
+reference_status(<<D1, D2, D3>>) when
+    D1 >= $1, D1 =< $5, D2 >= $0, D2 =< $9, D3 >= $0, D3 =< $9
+->
+    {yes, list_to_integer([D1, D2, D3])};
+reference_status(_) ->
+    no.
 
 shape_error_atoms() ->
     [
@@ -152,6 +207,22 @@ authority_opt_gen() ->
 
 protocol_opt_gen() ->
     oneof([undefined, <<"websocket">>]).
+
+%% Mixes wholly arbitrary binaries with shapes that sit on the accept
+%% boundary, so the generator reaches the interesting cases without
+%% relying on `binary()` to produce a three-byte digit run by chance.
+status_value_gen() ->
+    oneof([
+        binary(),
+        ?LET(N, choose(0, 999), integer_to_binary(N)),
+        ?LET(N, choose(0, 999), list_to_binary(io_lib:format("~3..0b", [N]))),
+        ?LET({A, B, C}, {digit_byte_gen(), digit_byte_gen(), digit_byte_gen()}, <<A, B, C>>),
+        ?LET(B, binary(3), B),
+        oneof([<<>>, <<"200">>, <<"099">>, <<"600">>, <<"+200">>, <<"-200">>, <<" 200">>])
+    ]).
+
+digit_byte_gen() ->
+    choose($0, $9).
 
 regular_headers_gen() ->
     list(regular_header_gen()).

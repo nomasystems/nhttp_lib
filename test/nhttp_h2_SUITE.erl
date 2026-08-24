@@ -126,6 +126,10 @@ Tests RFC 9113 compliance for:
     client_receives_even_stream_id_test/1,
     window_update_on_closed_stream_test/1,
     response_missing_status_test/1,
+    response_non_numeric_status_test/1,
+    response_malformed_status_shapes_test/1,
+    response_status_out_of_class_test/1,
+    response_bad_status_connection_survives_test/1,
     duplicate_pseudo_header_test/1,
     pseudo_header_after_regular_test/1,
     empty_path_test/1,
@@ -256,6 +260,10 @@ groups() ->
             client_receives_even_stream_id_test,
             window_update_on_closed_stream_test,
             response_missing_status_test,
+            response_non_numeric_status_test,
+            response_malformed_status_shapes_test,
+            response_status_out_of_class_test,
+            response_bad_status_connection_survives_test,
             duplicate_pseudo_header_test,
             pseudo_header_after_regular_test,
             empty_path_test,
@@ -1323,6 +1331,67 @@ response_missing_status_test(_Config) ->
     {ok, {rst_stream, StreamId, protocol_error}, _} = nhttp_h2_frame:decode(
         iolist_to_binary(RstFrame)
     ),
+    ok.
+
+%% RFC 9113 Section 8.3.2: `:status` is a string of three digits.
+%% RFC 9110 Section 15.1: the first digit selects one of five classes.
+%% RFC 9113 Section 8.1.1: a malformed response is a stream error of
+%% type PROTOCOL_ERROR. It must not kill the connection.
+
+-spec recv_client_response_status(binary()) -> {ok, [term()], term(), iodata()}.
+recv_client_response_status(StatusValue) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    ReqHeaders = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, ReqHeaders, fin),
+    RespBlock = encode_headers([{<<":status">>, StatusValue}]),
+    {ok, RespFrame} = nhttp_h2_frame:headers(StreamId, fin, fin, RespBlock),
+    {ok, Events, Conn3, ToSend} = nhttp_h2:recv(Conn2, iolist_to_binary(RespFrame)),
+    {ok, Events, Conn3, ToSend}.
+
+-spec assert_status_rejected(binary()) -> ok.
+assert_status_rejected(StatusValue) ->
+    {ok, Events, _Conn, RstFrame} = recv_client_response_status(StatusValue),
+    ?assertEqual([], Events),
+    ?assertMatch(
+        {ok, {rst_stream, 1, protocol_error}, _},
+        nhttp_h2_frame:decode(iolist_to_binary(RstFrame))
+    ),
+    ok.
+
+response_non_numeric_status_test(_Config) ->
+    assert_status_rejected(<<"abc">>).
+
+response_malformed_status_shapes_test(_Config) ->
+    lists:foreach(
+        fun assert_status_rejected/1,
+        [<<>>, <<"20">>, <<"2000">>, <<"+200">>, <<"-200">>, <<" 200">>]
+    ).
+
+response_status_out_of_class_test(_Config) ->
+    lists:foreach(
+        fun assert_status_rejected/1,
+        [<<"000">>, <<"099">>, <<"600">>, <<"999">>]
+    ).
+
+response_bad_status_connection_survives_test(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, Stream1, Conn1} = nhttp_h2:open_stream(Conn0),
+    ReqHeaders = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, Stream1, ReqHeaders, fin),
+    BadBlock = encode_headers([{<<":status">>, <<"abc">>}]),
+    {ok, BadFrame} = nhttp_h2_frame:headers(Stream1, fin, fin, BadBlock),
+    {ok, [], Conn3, RstFrame} = nhttp_h2:recv(Conn2, iolist_to_binary(BadFrame)),
+    ?assertMatch(
+        {ok, {rst_stream, Stream1, protocol_error}, _},
+        nhttp_h2_frame:decode(iolist_to_binary(RstFrame))
+    ),
+    {ok, Stream2, Conn4} = nhttp_h2:open_stream(Conn3),
+    {ok, Conn5, _} = nhttp_h2:send_headers(Conn4, Stream2, ReqHeaders, fin),
+    GoodBlock = encode_headers([{<<":status">>, <<"200">>}]),
+    {ok, GoodFrame} = nhttp_h2_frame:headers(Stream2, fin, fin, GoodBlock),
+    {ok, Events, _Conn6} = nhttp_h2:recv(Conn5, iolist_to_binary(GoodFrame)),
+    ?assertMatch([{response, Stream2, #{status := 200}, fin}], Events),
     ok.
 
 duplicate_pseudo_header_test(_Config) ->
