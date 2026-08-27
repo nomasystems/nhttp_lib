@@ -1,4 +1,4 @@
-.PHONY: all compile clean check test compliance cover doc binopt fuzz bench bench-compare
+.PHONY: all compile clean check test compliance cover doc binopt fuzz
 
 # Tools
 REBAR3 := rebar3
@@ -52,23 +52,6 @@ fuzz:
 		$(REBAR3) ct --dir test/fuzz --suite nhttp_fuzz_SUITE --group campaign
 
 #==============================================================================
-# Benchmarks
-#==============================================================================
-
-# Cost per call for every wire-facing entry point: reductions, heap words,
-# binary octets, microseconds. Compare two trees with
-# make bench-compare BENCH_BASE=../nhttp_lib-base
-BENCH_LABEL ?= head
-BENCH_BASE ?=
-
-bench:
-	@bench/run.sh run $(CURDIR) $(BENCH_LABEL)
-
-bench-compare:
-	@test -n "$(BENCH_BASE)" || { echo "set BENCH_BASE to a second compiled tree"; exit 2; }
-	@bench/run.sh compare $(BENCH_BASE) base $(CURDIR) $(BENCH_LABEL)
-
-#==============================================================================
 # Binary optimization analysis
 #==============================================================================
 
@@ -101,8 +84,6 @@ help:
 	@echo ""
 	@echo "  Analysis:"
 	@echo "    make binopt       - Analyze binary optimization opportunities"
-	@echo "    make bench        - Cost per call for every wire-facing entry point"
-	@echo "    make bench-compare BENCH_BASE=<tree> - Delta against a second tree"
 	@echo ""
 	@echo "  Fuzzing:"
 	@echo "    make fuzz         - Long seeded campaign (ITERATIONS=, SEED=)"
