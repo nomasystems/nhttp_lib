@@ -707,6 +707,162 @@ single_header_terminator(_Config) ->
     ?assertEqual(1, count_terminators(iolist_to_binary(ReqIo))).
 
 %%%-----------------------------------------------------------------------------
+%%% Section 11.1 - Response Splitting
+%%%-----------------------------------------------------------------------------
+
+%% RFC 9112 Section 11.1: "A more effective mitigation is to prevent anything
+%% other than the server's core protocol libraries from sending a CR or LF
+%% within the header section, which means restricting the output of header
+%% fields to APIs that filter for bad octets."
+%% RFC 9110 Section 5.5: "Field values containing CR, LF, or NUL characters
+%% are invalid and dangerous."
+reject_field_value_injection(_Config) ->
+    Split = <<"a\r\nSet-Cookie: evil=1">>,
+    ?assertEqual(
+        {error, {invalid_field_value, Split}},
+        nhttp_h1:encode_response(#{
+            status => 200, headers => [{<<"x">>, Split}], body => <<>>
+        })
+    ),
+    lists:foreach(
+        fun(Value) ->
+            Resp = #{status => 200, reason => <<"OK">>, headers => [{<<"x">>, Value}]},
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_response(Resp)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_response(Resp, #{content_length => omit})
+            ),
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_response_head(http1_1, 200, [{<<"x">>, Value}])
+            ),
+            Req = #{method => get, path => <<"/">>, headers => [{<<"x">>, Value}]},
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_request(Req)
+            )
+        end,
+        injection_values()
+    ).
+
+%% RFC 9110 Section 5.1: "field-name = token". RFC 9110 Section 5.6.2 defines
+%% token as 1*tchar, which excludes CR, LF, NUL, DEL, SP, and ":".
+reject_field_name_injection(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            Resp = #{status => 200, reason => <<"OK">>, headers => [{Name, <<"v">>}]},
+            ?assertEqual(
+                {error, {invalid_field_name, Name}},
+                nhttp_h1:encode_response(Resp)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_name, Name}},
+                nhttp_h1:encode_response_head(http1_1, 200, [{Name, <<"v">>}])
+            ),
+            Req = #{method => get, path => <<"/">>, headers => [{Name, <<"v">>}]},
+            ?assertEqual(
+                {error, {invalid_field_name, Name}},
+                nhttp_h1:encode_request(Req)
+            )
+        end,
+        injection_values() ++ [<<"x y">>, <<"x:y">>, <<>>]
+    ).
+
+%% RFC 9112 Section 4.1: "reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )".
+%% The status-line grammar makes the element optional, so an empty phrase is
+%% legal and still encodes.
+reject_reason_phrase_injection(_Config) ->
+    lists:foreach(
+        fun(Reason) ->
+            Resp = #{status => 200, reason => Reason, headers => []},
+            ?assertEqual(
+                {error, {invalid_reason_phrase, Reason}},
+                nhttp_h1:encode_response(Resp)
+            ),
+            ?assertEqual(
+                {error, {invalid_reason_phrase, Reason}},
+                nhttp_h1:encode_response(Resp, #{content_length => omit})
+            )
+        end,
+        injection_values()
+    ),
+    {ok, Io} = nhttp_h1:encode_response(#{status => 200, reason => <<>>, headers => []}),
+    ?assertMatch(<<"HTTP/1.1 200 \r\n", _/binary>>, iolist_to_binary(Io)).
+
+%% RFC 9112 Section 2.2: "A sender MUST NOT generate a bare CR (a CR character
+%% not immediately followed by LF) within any protocol elements other than the
+%% content." A request target carrying SP or CRLF injects a second request line.
+reject_request_target_injection(_Config) ->
+    Smuggle = <<"/a HTTP/1.1\r\nHost: evil\r\n\r\nGET /b">>,
+    ?assertEqual(
+        {error, {invalid_request_target, Smuggle}},
+        nhttp_h1:encode_request(#{method => get, path => Smuggle, headers => []})
+    ),
+    lists:foreach(
+        fun(Target) ->
+            Req = #{method => get, path => Target, headers => []},
+            ?assertEqual(
+                {error, {invalid_request_target, Target}},
+                nhttp_h1:encode_request(Req)
+            )
+        end,
+        [<<"/a\rb">>, <<"/a\nb">>, <<"/a\r\nb">>, <<"/a", 0, "b">>, <<"/a", 16#7F, "b">>,
+            <<"/a b">>, <<"/a\tb">>, <<>>]
+    ).
+
+%% RFC 9110 Section 5.5: SP, HTAB, VCHAR, and obs-text (%x80-FF) are all legal
+%% inside a field value, so validation refuses nothing that the grammar permits.
+valid_message_still_encodes(_Config) ->
+    Headers = [
+        {<<"X-Tab">>, <<"a\tb">>},
+        {<<"X-Space">>, <<"a b">>},
+        {<<"X-Obs-Text">>, <<"caf", 16#E9>>},
+        {<<"X-Vchar">>, <<"!#$%&'*+-.^_`|~">>},
+        {<<"X-Empty">>, <<>>}
+    ],
+    {ok, Io} = nhttp_h1:encode_response(#{
+        status => 200, reason => <<"OK">>, headers => Headers, body => <<>>
+    }),
+    Encoded = iolist_to_binary(Io),
+    lists:foreach(
+        fun({Name, Value}) ->
+            Line = <<Name/binary, ": ", Value/binary, "\r\n">>,
+            ?assertNotEqual(nomatch, binary:match(Encoded, Line))
+        end,
+        Headers
+    ),
+
+    {ok, ReqIo} = nhttp_h1:encode_request(#{
+        method => get, path => <<"/a%20b?q=1">>, headers => Headers
+    }),
+    ?assertMatch(<<"GET /a%20b?q=1 HTTP/1.1\r\n", _/binary>>, iolist_to_binary(ReqIo)),
+
+    {ok, HeadIo} = nhttp_h1:encode_response_head(http1_1, 200, Headers),
+    ?assertMatch(<<"HTTP/1.1 200 OK\r\n", _/binary>>, iolist_to_binary(HeadIo)).
+
+%% RFC 9112 Section 2.1: the empty line that ends the header section appears
+%% exactly once, which is the invariant response splitting breaks.
+single_header_terminator(_Config) ->
+    {ok, Io} = nhttp_h1:encode_response(#{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [{<<"x">>, <<"a">>}, {<<"y">>, <<"b">>}],
+        body => <<"payload">>
+    }),
+    ?assertEqual(1, count_terminators(iolist_to_binary(Io))),
+
+    {ok, ReqIo} = nhttp_h1:encode_request(#{
+        method => post,
+        path => <<"/">>,
+        headers => [{<<"x">>, <<"a">>}],
+        body => <<"payload">>
+    }),
+    ?assertEqual(1, count_terminators(iolist_to_binary(ReqIo))).
+
+%%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
 
