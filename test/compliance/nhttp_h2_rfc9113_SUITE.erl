@@ -29,7 +29,8 @@ all() ->
         {group, section_4_frames},
         {group, section_5_streams},
         {group, section_6_settings_and_flow_control},
-        {group, section_8_http_semantics}
+        {group, section_8_http_semantics},
+        {group, section_10_denial_of_service}
     ].
 
 groups() ->
@@ -88,6 +89,13 @@ groups() ->
             trailers_deliver_after_fin,
             content_length_mismatch_is_stream_error,
             content_length_exceeded_is_stream_error
+        ]},
+        {section_10_denial_of_service, [parallel], [
+            max_concurrent_streams_does_not_bound_stream_turnover,
+            stream_turnover_is_tracked_on_the_connection,
+            reset_allowance_is_connection_error_enhance_your_calm,
+            empty_continuation_flood_is_connection_error_enhance_your_calm,
+            continuation_allowance_scales_with_max_header_list_size
         ]}
     ].
 
@@ -523,8 +531,107 @@ content_length_exceeded_is_stream_error(_Config) ->
     ok.
 
 %%%-----------------------------------------------------------------------------
+%%% Section 10 - Denial-of-Service Considerations
+%%%-----------------------------------------------------------------------------
+
+%% RFC9113-5.1.2-1: SETTINGS_MAX_CONCURRENT_STREAMS bounds the streams in the
+%% "open" state or in either "half-closed" state. It bounds no other quantity.
+%% A peer that sends HEADERS and RST_STREAM in turn holds the active count at
+%% zero, so the limit never applies, and the peer drives stream turnover
+%% without bound. This case is the record of that gap.
+max_concurrent_streams_does_not_bound_stream_turnover(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_concurrent_streams => 1}),
+    {ok, Conn1} = h2_reset_rounds(Conn0, 1, 200),
+    ?assertEqual(
+        #{active => 0, peer_opened => 200, peer_reset => 200},
+        nhttp_h2:stream_stats(Conn1)
+    ),
+    ok.
+
+%% RFC9113-10.5-1: an implementation tracks the use of features that a peer can
+%% abuse, and sets a limit on that use. `stream_stats/1` reports the counters
+%% that carry stream turnover.
+stream_turnover_is_tracked_on_the_connection(_Config) ->
+    Conn0 = server_with_preface_settings(#{}),
+    ?assertEqual(
+        #{active => 0, peer_opened => 0, peer_reset => 0}, nhttp_h2:stream_stats(Conn0)
+    ),
+    {ok, Conn1} = h2_reset_rounds(Conn0, 1, 3),
+    ?assertEqual(
+        #{active => 0, peer_opened => 3, peer_reset => 3}, nhttp_h2:stream_stats(Conn1)
+    ),
+    ok.
+
+%% RFC9113-10.5-2: an endpoint can treat suspicious activity as a connection
+%% error of type ENHANCE_YOUR_CALM. `max_reset_streams` sets the point at which
+%% peer stream resets become suspicious.
+reset_allowance_is_connection_error_enhance_your_calm(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_reset_streams => 10}),
+    ?assertMatch(
+        {refused, 21, {connection_error, enhance_your_calm, _}},
+        h2_reset_rounds(Conn0, 1, 200)
+    ),
+    ok.
+
+%% RFC9113-10.5-3: "Large numbers of small or empty frames can be abused to
+%% cause a peer to expend time processing frame headers." An empty CONTINUATION
+%% frame adds no bytes, so the byte bound of Section 10.5.1 never fires on it.
+%% The frame count is the bound that does.
+empty_continuation_flood_is_connection_error_enhance_your_calm(_Config) ->
+    Conn0 = server_with_preface_settings(#{}),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, <<"a">>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    ?assertMatch(
+        {refused, _, {connection_error, enhance_your_calm, _}},
+        h2_empty_continuations(Conn1, 1, 500)
+    ),
+    ok.
+
+%% RFC9113-10.5-4: the count bound must not contradict the byte bound of
+%% Section 10.5.1. A peer that is allowed a larger field section is allowed the
+%% CONTINUATION frames that carry it.
+continuation_allowance_scales_with_max_header_list_size(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_header_list_size => 1048576}),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, <<"a">>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(HeadersFrame)),
+    ?assertMatch({ok, _}, h2_empty_continuations(Conn1, 1, 64)),
+    ok.
+
+%%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
+
+-spec h2_empty_continuations(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
+    {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+h2_empty_continuations(Conn, StreamId, Count) ->
+    h2_empty_continuations(Conn, StreamId, Count, 1).
+
+-spec h2_empty_continuations(
+    nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer(), pos_integer()
+) -> {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+h2_empty_continuations(Conn, _StreamId, 0, _Sent) ->
+    {ok, Conn};
+h2_empty_continuations(Conn, StreamId, Count, Sent) ->
+    {ok, ContFrame} = nhttp_h2_frame:continuation(StreamId, nofin, <<>>),
+    case nhttp_h2:recv(Conn, iolist_to_binary(ContFrame)) of
+        {ok, [], Conn1} -> h2_empty_continuations(Conn1, StreamId, Count - 1, Sent + 1);
+        {error, Reason} -> {refused, Sent, Reason}
+    end.
+
+-spec h2_reset_rounds(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
+    {ok, nhttp_h2:conn()} | {refused, pos_integer(), nhttp_h2_frame:decode_error()}.
+h2_reset_rounds(Conn, _BaseId, 0) ->
+    {ok, Conn};
+h2_reset_rounds(Conn, BaseId, N) ->
+    HeaderBlock = encode_headers(minimal_request_headers()),
+    {ok, HeadersFrame} = nhttp_h2_frame:headers(BaseId, fin, fin, HeaderBlock),
+    {ok, RstFrame} = nhttp_h2_frame:rst_stream(BaseId, cancel),
+    Data = iolist_to_binary([HeadersFrame, RstFrame]),
+    case nhttp_h2:recv(Conn, Data) of
+        {ok, _, Conn1} -> h2_reset_rounds(Conn1, BaseId + 2, N - 1);
+        {ok, _, Conn1, _} -> h2_reset_rounds(Conn1, BaseId + 2, N - 1);
+        {error, Reason} -> {refused, (BaseId + 1) div 2, Reason}
+    end.
 
 server_with_preface() ->
     Conn0 = nhttp_h2:new(server),
