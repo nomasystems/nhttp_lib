@@ -7,6 +7,8 @@ Property tests for `nhttp_compress` (gzip/deflate content compression).
 Properties:
 - compress + decompress is identity for both gzip and deflate.
 - decompress respects the `max_output` cap (zip-bomb defence).
+- decompress output never exceeds `Max` on any encoding and any input.
+- decompress refuses any byte that follows a complete stream.
 - decompress on truncated input returns `{error, _}`, never a crash.
 
 These properties are run via `nhttp_props_SUITE`.
@@ -102,3 +104,39 @@ prop_decompress_random_binary_no_crash() ->
             end
         end
     ).
+
+-spec prop_decompress_respects_max() -> triq:property().
+prop_decompress_respects_max() ->
+    ?FORALL(
+        {Data, Encoding, Max, Compressed},
+        {binary(), oneof([gzip, deflate, identity]), int(1, 4096), bool()},
+        begin
+            Input = decompress_input(Data, Encoding, Compressed),
+            case nhttp_compress:decompress(Input, Encoding, Max) of
+                {ok, Out} -> byte_size(Out) =< Max;
+                {error, _} -> true
+            end
+        end
+    ).
+
+-spec prop_decompress_rejects_trailing_bytes() -> triq:property().
+prop_decompress_rejects_trailing_bytes() ->
+    ?FORALL(
+        {Data, Encoding, Extra},
+        {binary(), oneof([gzip, deflate]), non_empty(binary())},
+        begin
+            {ok, Stream} = nhttp_compress:compress(Data, Encoding, 6),
+            Input = <<Stream/binary, Extra/binary>>,
+            nhttp_compress:decompress(Input, Encoding, infinity) =:=
+                {error, trailing_data}
+        end
+    ).
+
+-spec decompress_input(binary(), nhttp_compress:encoding(), boolean()) -> binary().
+decompress_input(Data, _Encoding, false) ->
+    Data;
+decompress_input(Data, identity, true) ->
+    Data;
+decompress_input(Data, Encoding, true) ->
+    {ok, Compressed} = nhttp_compress:compress(Data, Encoding, 6),
+    Compressed.

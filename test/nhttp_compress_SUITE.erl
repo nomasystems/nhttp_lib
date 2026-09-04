@@ -10,7 +10,9 @@
     all/0,
     groups/0,
     init_per_suite/1,
-    end_per_suite/1
+    end_per_suite/1,
+    init_per_group/2,
+    end_per_group/2
 ]).
 
 -export([
@@ -31,6 +33,22 @@
     decompress_deflate_bomb/1,
     decompress_identity_too_large/1,
     decompress_infinity_lifts_cap/1,
+    cap_gzip_at_max/1,
+    cap_gzip_over_max/1,
+    cap_deflate_at_max/1,
+    cap_deflate_over_max/1,
+    cap_identity_at_max/1,
+    cap_identity_over_max/1,
+    trailing_gzip_concatenated_members/1,
+    trailing_gzip_appended_bytes/1,
+    trailing_gzip_single_appended_byte/1,
+    trailing_deflate_concatenated_streams/1,
+    trailing_deflate_appended_bytes/1,
+    trailing_corrupt_stream_is_data_error/1,
+    bomb_gzip_refused_by_default_cap/1,
+    bomb_deflate_refused_by_default_cap/1,
+    bomb_gzip_infinity_decompresses_fully/1,
+    bomb_memory_stays_bounded/1,
     negotiate_gzip/1,
     negotiate_deflate/1,
     negotiate_identity/1,
@@ -67,6 +85,9 @@ all() ->
     [
         {group, compression},
         {group, decompression},
+        {group, cap_boundary},
+        {group, trailing_input},
+        {group, bomb},
         {group, negotiation},
         {group, should_compress},
         {group, helpers}
@@ -94,6 +115,28 @@ groups() ->
             decompress_deflate_bomb,
             decompress_identity_too_large,
             decompress_infinity_lifts_cap
+        ]},
+        {cap_boundary, [parallel], [
+            cap_gzip_at_max,
+            cap_gzip_over_max,
+            cap_deflate_at_max,
+            cap_deflate_over_max,
+            cap_identity_at_max,
+            cap_identity_over_max
+        ]},
+        {trailing_input, [parallel], [
+            trailing_gzip_concatenated_members,
+            trailing_gzip_appended_bytes,
+            trailing_gzip_single_appended_byte,
+            trailing_deflate_concatenated_streams,
+            trailing_deflate_appended_bytes,
+            trailing_corrupt_stream_is_data_error
+        ]},
+        {bomb, [], [
+            bomb_gzip_refused_by_default_cap,
+            bomb_deflate_refused_by_default_cap,
+            bomb_gzip_infinity_decompresses_fully,
+            bomb_memory_stays_bounded
         ]},
         {negotiation, [parallel], [
             negotiate_gzip,
@@ -129,10 +172,25 @@ groups() ->
         ]}
     ].
 
+-define(BOMB_SIZE, (32 * 1024 * 1024)).
+-define(BOMB_MEMORY_HEADROOM, (?BOMB_SIZE div 10)).
+-define(BOMB_TIME_LIMIT_MS, 10000).
+
 init_per_suite(Config) ->
     Config.
 
 end_per_suite(_Config) ->
+    ok.
+
+init_per_group(bomb, Config) ->
+    Payload = binary:copy(<<0>>, ?BOMB_SIZE),
+    {ok, GzipBomb} = nhttp_compress:compress(Payload, gzip, 9),
+    {ok, DeflateBomb} = nhttp_compress:compress(Payload, deflate, 9),
+    [{gzip_bomb, GzipBomb}, {deflate_bomb, DeflateBomb} | Config];
+init_per_group(_Group, Config) ->
+    Config.
+
+end_per_group(_Group, _Config) ->
     ok.
 
 %%%-----------------------------------------------------------------------------
@@ -453,3 +511,147 @@ should_compress_content_type_with_params(_Config) ->
             <<"application/json; charset=utf-8; boundary=something">>, 2000, MimeTypes
         )
     ).
+
+%%%-----------------------------------------------------------------------------
+%%% CAP BOUNDARY TESTS
+%%%-----------------------------------------------------------------------------
+
+cap_gzip_at_max(_Config) ->
+    Data = binary:copy(<<"x">>, 4096),
+    {ok, Compressed} = nhttp_compress:compress(Data, gzip, 9),
+    ?assertEqual({ok, Data}, nhttp_compress:decompress(Compressed, gzip, 4096)).
+
+cap_gzip_over_max(_Config) ->
+    Data = binary:copy(<<"x">>, 4096),
+    {ok, Compressed} = nhttp_compress:compress(Data, gzip, 9),
+    ?assertEqual(
+        {error, max_output_exceeded},
+        nhttp_compress:decompress(Compressed, gzip, 4095)
+    ).
+
+cap_deflate_at_max(_Config) ->
+    Data = binary:copy(<<"x">>, 4096),
+    {ok, Compressed} = nhttp_compress:compress(Data, deflate, 9),
+    ?assertEqual({ok, Data}, nhttp_compress:decompress(Compressed, deflate, 4096)).
+
+cap_deflate_over_max(_Config) ->
+    Data = binary:copy(<<"x">>, 4096),
+    {ok, Compressed} = nhttp_compress:compress(Data, deflate, 9),
+    ?assertEqual(
+        {error, max_output_exceeded},
+        nhttp_compress:decompress(Compressed, deflate, 4095)
+    ).
+
+cap_identity_at_max(_Config) ->
+    Data = binary:copy(<<"x">>, 4096),
+    ?assertEqual({ok, Data}, nhttp_compress:decompress(Data, identity, 4096)).
+
+cap_identity_over_max(_Config) ->
+    Data = binary:copy(<<"x">>, 4096),
+    ?assertEqual(
+        {error, max_output_exceeded},
+        nhttp_compress:decompress(Data, identity, 4095)
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% TRAILING INPUT TESTS
+%%%-----------------------------------------------------------------------------
+
+trailing_gzip_concatenated_members(_Config) ->
+    {ok, First} = nhttp_compress:compress(<<"first">>, gzip, 6),
+    {ok, Second} = nhttp_compress:compress(<<"second">>, gzip, 6),
+    ?assertEqual(
+        {error, trailing_data},
+        nhttp_compress:decompress(<<First/binary, Second/binary>>, gzip)
+    ).
+
+trailing_gzip_appended_bytes(_Config) ->
+    {ok, Compressed} = nhttp_compress:compress(<<"payload">>, gzip, 6),
+    ?assertEqual(
+        {error, trailing_data},
+        nhttp_compress:decompress(<<Compressed/binary, "appended">>, gzip)
+    ).
+
+trailing_gzip_single_appended_byte(_Config) ->
+    {ok, Compressed} = nhttp_compress:compress(<<"payload">>, gzip, 6),
+    ?assertEqual(
+        {error, trailing_data},
+        nhttp_compress:decompress(<<Compressed/binary, 0>>, gzip)
+    ).
+
+trailing_deflate_concatenated_streams(_Config) ->
+    {ok, First} = nhttp_compress:compress(<<"first">>, deflate, 6),
+    {ok, Second} = nhttp_compress:compress(<<"second">>, deflate, 6),
+    ?assertEqual(
+        {error, trailing_data},
+        nhttp_compress:decompress(<<First/binary, Second/binary>>, deflate)
+    ).
+
+trailing_deflate_appended_bytes(_Config) ->
+    {ok, Compressed} = nhttp_compress:compress(<<"payload">>, deflate, 6),
+    ?assertEqual(
+        {error, trailing_data},
+        nhttp_compress:decompress(<<Compressed/binary, "appended">>, deflate)
+    ).
+
+trailing_corrupt_stream_is_data_error(_Config) ->
+    Data = binary:copy(<<"corruption target ">>, 4096),
+    {ok, Compressed} = nhttp_compress:compress(Data, gzip, 6),
+    <<Head:64/binary, Byte:8, Tail/binary>> = Compressed,
+    Corrupt = <<Head/binary, (Byte bxor 16#FF):8, Tail/binary>>,
+    ?assertEqual({error, data_error}, nhttp_compress:decompress(Corrupt, gzip)).
+
+%%%-----------------------------------------------------------------------------
+%%% DECOMPRESSION BOMB TESTS
+%%%-----------------------------------------------------------------------------
+
+bomb_gzip_refused_by_default_cap(Config) ->
+    Bomb = proplists:get_value(gzip_bomb, Config),
+    ?assert(byte_size(Bomb) * 100 < ?BOMB_SIZE),
+    ?assertEqual({error, max_output_exceeded}, nhttp_compress:decompress(Bomb, gzip)).
+
+bomb_deflate_refused_by_default_cap(Config) ->
+    Bomb = proplists:get_value(deflate_bomb, Config),
+    ?assert(byte_size(Bomb) * 100 < ?BOMB_SIZE),
+    ?assertEqual({error, max_output_exceeded}, nhttp_compress:decompress(Bomb, deflate)).
+
+bomb_gzip_infinity_decompresses_fully(Config) ->
+    Bomb = proplists:get_value(gzip_bomb, Config),
+    {ok, Inflated} = nhttp_compress:decompress(Bomb, gzip, infinity),
+    ?assertEqual(?BOMB_SIZE, byte_size(Inflated)),
+    ?assertEqual(binary:copy(<<0>>, ?BOMB_SIZE), Inflated).
+
+bomb_memory_stays_bounded(Config) ->
+    Bomb = proplists:get_value(deflate_bomb, Config),
+    _ = erlang:garbage_collect(),
+    Baseline = erlang:memory(binary),
+    Sampler = start_binary_memory_sampler(Baseline),
+    {Elapsed, Result} = timer:tc(fun() -> nhttp_compress:decompress(Bomb, deflate, 1024) end),
+    Peak = stop_binary_memory_sampler(Sampler),
+    ct:pal("peak binary memory ~p bytes, headroom ~p bytes, uncompressed ~p bytes", [
+        Peak, ?BOMB_MEMORY_HEADROOM, ?BOMB_SIZE
+    ]),
+    ?assertEqual({error, max_output_exceeded}, Result),
+    ?assert(Peak < ?BOMB_MEMORY_HEADROOM),
+    ?assert(Elapsed div 1000 < ?BOMB_TIME_LIMIT_MS).
+
+start_binary_memory_sampler(Baseline) ->
+    Owner = self(),
+    spawn_link(fun() -> sample_binary_memory(Owner, Baseline, 0) end).
+
+stop_binary_memory_sampler(Sampler) ->
+    Sampler ! {stop, self()},
+    receive
+        {peak, Sampler, Peak} -> Peak
+    after 5000 -> error(sampler_timeout)
+    end.
+
+sample_binary_memory(Owner, Baseline, Peak) ->
+    receive
+        {stop, From} ->
+            From ! {peak, self(), Peak}
+    after 0 ->
+        Used = max(0, erlang:memory(binary) - Baseline),
+        timer:sleep(1),
+        sample_binary_memory(Owner, Baseline, max(Peak, Used))
+    end.
