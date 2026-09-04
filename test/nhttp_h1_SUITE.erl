@@ -443,7 +443,7 @@ encode_simple_request(_Config) ->
         path => <<"/">>,
         headers => [{<<"Host">>, <<"localhost">>}]
     },
-    IOList = nhttp_h1:encode_request(Req),
+    {ok, IOList} = nhttp_h1:encode_request(Req),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"GET / HTTP/1.1\r\n", _/binary>>, Bin),
     ?assertMatch({match, _}, re:run(Bin, <<"Host: localhost">>)).
@@ -455,7 +455,7 @@ encode_request_with_body(_Config) ->
         headers => [{<<"Host">>, <<"localhost">>}],
         body => <<"test body">>
     },
-    IOList = nhttp_h1:encode_request(Req),
+    {ok, IOList} = nhttp_h1:encode_request(Req),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"POST /submit HTTP/1.1\r\n", _/binary>>, Bin),
     ?assertMatch({match, _}, re:run(Bin, <<"Content-Length: 9">>, [caseless])),
@@ -467,7 +467,7 @@ encode_request_custom_method(_Config) ->
         path => <<"/">>,
         headers => []
     },
-    IOList = nhttp_h1:encode_request(Req),
+    {ok, IOList} = nhttp_h1:encode_request(Req),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"PROPFIND / HTTP/1.1\r\n", _/binary>>, Bin).
 
@@ -476,7 +476,7 @@ encode_request_all_methods(_Config) ->
     lists:foreach(
         fun(Method) ->
             Req = #{method => Method, path => <<"/">>, headers => []},
-            IOList = nhttp_h1:encode_request(Req),
+            {ok, IOList} = nhttp_h1:encode_request(Req),
             Bin = iolist_to_binary(IOList),
             MethodBin = nhttp_lib:encode_method(Method),
             ?assertMatch({match, _}, re:run(Bin, MethodBin))
@@ -491,7 +491,7 @@ encode_request_http1_0(_Config) ->
         version => http1_0,
         headers => []
     },
-    IOList = nhttp_h1:encode_request(Req),
+    {ok, IOList} = nhttp_h1:encode_request(Req),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"GET / HTTP/1.0\r\n", _/binary>>, Bin).
 
@@ -507,7 +507,7 @@ encode_simple_response(_Config) ->
         headers => [{<<"Content-Type">>, <<"text/plain">>}],
         body => <<"hello">>
     },
-    IOList = nhttp_h1:encode_response(Resp),
+    {ok, IOList} = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"HTTP/1.1 200 OK\r\n", _/binary>>, Bin),
     ?assertMatch({match, _}, re:run(Bin, <<"Content-Length: 5">>, [caseless])),
@@ -521,7 +521,7 @@ encode_response_with_body(_Config) ->
         headers => [],
         body => Body
     },
-    IOList = nhttp_h1:encode_response(Resp),
+    {ok, IOList} = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
     ?assertMatch({match, _}, re:run(Bin, Body)).
 
@@ -531,19 +531,19 @@ encode_response_no_body(_Config) ->
         reason => <<"No Content">>,
         headers => []
     },
-    IOList = nhttp_h1:encode_response(Resp),
+    {ok, IOList} = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"HTTP/1.1 204 No Content\r\n", _/binary>>, Bin),
     ?assertEqual(nomatch, re:run(Bin, <<"content-length">>, [caseless])).
 
 encode_response_head(_Config) ->
-    IOList = nhttp_h1:encode_response_head(
+    {ok, IOList} = nhttp_h1:encode_response_head(
         http1_1, 200, [{<<"Transfer-Encoding">>, <<"chunked">>}]
     ),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"HTTP/1.1 200 OK\r\n", _/binary>>, Bin),
     ?assertMatch({match, _}, re:run(Bin, <<"Transfer-Encoding: chunked">>)),
-    IOList10 = nhttp_h1:encode_response_head(http1_0, 200, []),
+    {ok, IOList10} = nhttp_h1:encode_response_head(http1_0, 200, []),
     ?assertMatch(<<"HTTP/1.0 200 OK\r\n", _/binary>>, iolist_to_binary(IOList10)).
 
 encode_response_existing_content_length(_Config) ->
@@ -553,7 +553,7 @@ encode_response_existing_content_length(_Config) ->
         headers => [{<<"content-length">>, <<"5">>}],
         body => <<"hello">>
     },
-    IOList = nhttp_h1:encode_response(Resp),
+    {ok, IOList} = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
     {match, Matches} = re:run(Bin, <<"content-length">>, [global]),
     ?assertEqual(1, length(Matches)).
@@ -565,7 +565,7 @@ encode_response_transfer_encoding(_Config) ->
         headers => [{<<"transfer-encoding">>, <<"chunked">>}],
         body => <<"hello">>
     },
-    IOList = nhttp_h1:encode_response(Resp),
+    {ok, IOList} = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
     ?assertEqual(nomatch, re:run(Bin, <<"content-length">>)).
 
@@ -782,7 +782,7 @@ reason_phrase_server_error(_Config) ->
     ?assertEqual(505, maps:get(status, Resp3)).
 
 reason_phrase_unknown(_Config) ->
-    IOList = nhttp_h1:encode_response_head(http1_1, 999, []),
+    {ok, IOList} = nhttp_h1:encode_response_head(http1_1, 999, []),
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"HTTP/1.1 999 \r\n", _/binary>>, Bin).
 
@@ -877,7 +877,7 @@ parse_path_with_http_but_wrong_version(_Config) ->
 encode_response_head_all_status(_Config) ->
     lists:foreach(
         fun(Code) ->
-            IOList = nhttp_h1:encode_response_head(http1_1, Code, []),
+            {ok, IOList} = nhttp_h1:encode_response_head(http1_1, Code, []),
             Bin = iolist_to_binary(IOList),
             ?assertMatch(<<"HTTP/1.1 ", _/binary>>, Bin)
         end,

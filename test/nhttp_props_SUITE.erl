@@ -92,7 +92,8 @@ groups() ->
             h1_chunked_roundtrip_with_trailers,
             h1_reject_header_name_injection,
             h1_reject_header_value_bare_controls,
-            h1_no_smuggling
+            h1_no_smuggling,
+            h1_encode_response_single_terminator
         ]},
         {h2_props, [parallel], [
             h2_headers_roundtrip,
@@ -332,6 +333,9 @@ h1_chunked_extensions_and_trailers(Config) ->
 
 h1_chunked_roundtrip_with_trailers(Config) ->
     run_property(nhttp_h1_props, prop_chunked_roundtrip_with_trailers, Config).
+
+h1_encode_response_single_terminator(Config) ->
+    run_property(nhttp_h1_props, prop_encode_response_single_terminator, Config).
 
 h1_reject_header_name_injection(Config) ->
     run_property(nhttp_h1_props, prop_reject_header_name_injection, Config).

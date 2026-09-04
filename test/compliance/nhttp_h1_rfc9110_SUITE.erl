@@ -118,7 +118,7 @@ no_content_length_1xx_204(_Config) ->
     lists:foreach(
         fun({Status, Reason}) ->
             Resp = #{status => Status, reason => Reason, headers => []},
-            Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+            Encoded = encode_resp(Resp),
             ?assertEqual(false, has_content_length(Encoded))
         end,
         [
@@ -133,7 +133,7 @@ no_content_length_1xx_204(_Config) ->
 %% 200 response would have carried, which the encoder cannot compute.
 no_content_length_304(_Config) ->
     Resp = #{status => 304, reason => <<"Not Modified">>, headers => []},
-    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+    Encoded = encode_resp(Resp),
     ?assertEqual(false, has_content_length(Encoded)).
 
 %% RFC 9110 Section 8.6: "in the absence of Transfer-Encoding, an origin
@@ -143,19 +143,19 @@ content_length_zero_on_empty_body(_Config) ->
     NoBodyKey = #{status => 200, reason => <<"OK">>, headers => []},
     ?assertEqual(
         {true, <<"0">>},
-        content_length_value(iolist_to_binary(nhttp_h1:encode_response(NoBodyKey)))
+        content_length_value(encode_resp(NoBodyKey))
     ),
 
     EmptyBody = NoBodyKey#{body => <<>>},
     ?assertEqual(
         {true, <<"0">>},
-        content_length_value(iolist_to_binary(nhttp_h1:encode_response(EmptyBody)))
+        content_length_value(encode_resp(EmptyBody))
     ),
 
     NotFound = #{status => 404, reason => <<"Not Found">>, headers => [], body => <<>>},
     ?assertEqual(
         {true, <<"0">>},
-        content_length_value(iolist_to_binary(nhttp_h1:encode_response(NotFound)))
+        content_length_value(encode_resp(NotFound))
     ).
 
 caller_content_length_survives_on_204(_Config) ->
@@ -164,7 +164,7 @@ caller_content_length_survives_on_204(_Config) ->
         reason => <<"No Content">>,
         headers => [{<<"content-length">>, <<"42">>}]
     },
-    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+    Encoded = encode_resp(Resp),
     ?assertEqual({true, <<"42">>}, content_length_value(Encoded)),
     ?assertEqual(1, count_content_length(Encoded)).
 
@@ -175,23 +175,21 @@ no_content_length_with_transfer_encoding(_Config) ->
         headers => [{<<"transfer-encoding">>, <<"chunked">>}],
         body => <<>>
     },
-    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp)),
+    Encoded = encode_resp(Resp),
     ?assertEqual(false, has_content_length(Encoded)).
 
 %% RFC 9110 Section 8.6: "A server MUST NOT send a Content-Length header
 %% field in any 2xx (Successful) response to a CONNECT request."
 content_length_omit_opt_out(_Config) ->
     Resp = #{status => 200, reason => <<"Connection Established">>, headers => []},
-    Encoded = iolist_to_binary(nhttp_h1:encode_response(Resp, #{content_length => omit})),
+    Encoded = encode_resp(Resp, #{content_length => omit}),
     ?assertEqual(false, has_content_length(Encoded)),
 
     WithBody = Resp#{body => <<"hello">>},
-    EncodedWithBody = iolist_to_binary(
-        nhttp_h1:encode_response(WithBody, #{content_length => omit})
-    ),
+    EncodedWithBody = encode_resp(WithBody, #{content_length => omit}),
     ?assertEqual(false, has_content_length(EncodedWithBody)),
 
-    EncodedAuto = iolist_to_binary(nhttp_h1:encode_response(Resp, #{content_length => auto})),
+    EncodedAuto = encode_resp(Resp, #{content_length => auto}),
     ?assertEqual({true, <<"0">>}, content_length_value(EncodedAuto)).
 
 reject_malformed_content_length(_Config) ->
@@ -235,8 +233,7 @@ no_body_headers_2xx_connect(_Config) ->
         reason => <<"Connection Established">>,
         headers => []
     },
-    Io = nhttp_h1:encode_response(Resp, #{content_length => omit}),
-    Encoded = iolist_to_binary(Io),
+    Encoded = encode_resp(Resp, #{content_length => omit}),
     ?assertEqual(false, has_content_length(Encoded)),
     ?assertEqual(false, lists:keymember(<<"transfer-encoding">>, 1, encoded_headers(Encoded))).
 
@@ -285,6 +282,16 @@ no_body_in_304(_Config) ->
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
+
+-spec encode_resp(nhttp_h1:resp()) -> binary().
+encode_resp(Resp) ->
+    {ok, Io} = nhttp_h1:encode_response(Resp),
+    iolist_to_binary(Io).
+
+-spec encode_resp(nhttp_h1:resp(), nhttp_h1:enc_opts()) -> binary().
+encode_resp(Resp, EncOpts) ->
+    {ok, Io} = nhttp_h1:encode_response(Resp, EncOpts),
+    iolist_to_binary(Io).
 
 -spec encoded_headers(binary()) -> nhttp_lib:headers().
 encoded_headers(Encoded) ->

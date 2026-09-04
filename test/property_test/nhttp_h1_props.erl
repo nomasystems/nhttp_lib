@@ -17,7 +17,7 @@ prop_request_roundtrip() ->
         Req,
         h1_req_gen(),
         begin
-            EncodedList = nhttp_h1:encode_request(Req),
+            {ok, EncodedList} = nhttp_h1:encode_request(Req),
             Encoded = iolist_to_binary(EncodedList),
             case nhttp_h1:parse_request(Encoded) of
                 {ok, ParsedReq, Consumed} when Consumed =:= byte_size(Encoded) ->
@@ -38,7 +38,7 @@ prop_response_roundtrip() ->
         Resp,
         h1_resp_gen(),
         begin
-            EncodedList = nhttp_h1:encode_response(Resp),
+            {ok, EncodedList} = nhttp_h1:encode_response(Resp),
             Encoded = iolist_to_binary(EncodedList),
             case nhttp_h1:parse_response(Encoded) of
                 {ok, ParsedResp, Consumed} when Consumed =:= byte_size(Encoded) ->
@@ -90,7 +90,7 @@ prop_split_at() ->
         {Req, ExtraData},
         {h1_req_gen(), binary()},
         begin
-            EncodedList = nhttp_h1:encode_request(Req),
+            {ok, EncodedList} = nhttp_h1:encode_request(Req),
             Encoded = iolist_to_binary(EncodedList),
             FullData = <<Encoded/binary, ExtraData/binary>>,
             case nhttp_h1:parse_request(FullData) of
@@ -105,6 +105,57 @@ prop_split_at() ->
         end
     ).
 
+
+-spec prop_encode_response_single_terminator() -> triq:property().
+prop_encode_response_single_terminator() ->
+    ?FORALL(
+        Headers,
+        list({any_field_name_gen(), any_field_value_gen()}),
+        begin
+            Resp = #{
+                version => http1_1,
+                status => 200,
+                reason => <<"OK">>,
+                headers => Headers,
+                body => <<>>
+            },
+            case nhttp_h1:encode_response(Resp) of
+                {error, _Reason} ->
+                    true;
+                {ok, Io} ->
+                    count_terminators(iolist_to_binary(Io)) =:= 1
+            end
+        end
+    ).
+
+-spec any_field_name_gen() -> triq_dom:domain().
+any_field_name_gen() ->
+    oneof([header_name_gen(), hostile_binary_gen()]).
+
+-spec any_field_value_gen() -> triq_dom:domain().
+any_field_value_gen() ->
+    oneof([header_value_gen(), hostile_binary_gen()]).
+
+-spec hostile_binary_gen() -> triq_dom:domain().
+hostile_binary_gen() ->
+    ?LET(
+        Chars,
+        list(oneof([int(0, 255), elements([$\r, $\n, 0, 16#7F, $:, $\s])])),
+        list_to_binary(Chars)
+    ).
+
+-spec count_terminators(binary()) -> non_neg_integer().
+count_terminators(Bin) ->
+    count_terminators(Bin, 0).
+
+-spec count_terminators(binary(), non_neg_integer()) -> non_neg_integer().
+count_terminators(<<>>, N) ->
+    N;
+count_terminators(<<"\r\n\r\n", _/binary>> = Bin, N) ->
+    <<_, Rest/binary>> = Bin,
+    count_terminators(Rest, N + 1);
+count_terminators(<<_, Rest/binary>>, N) ->
+    count_terminators(Rest, N).
 
 -spec h1_req_gen() -> triq_dom:domain().
 h1_req_gen() ->
