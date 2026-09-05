@@ -1160,6 +1160,12 @@ is_chunked_framing([<<"chunked">>], Seen) -> Seen =:= 0;
 is_chunked_framing([<<"chunked">> | Rest], Seen) -> is_chunked_framing(Rest, Seen + 1);
 is_chunked_framing([_Coding | Rest], Seen) -> is_chunked_framing(Rest, Seen).
 
+-spec is_chunked_framing([binary()], non_neg_integer()) -> boolean().
+is_chunked_framing([], _Seen) -> false;
+is_chunked_framing([<<"chunked">>], Seen) -> Seen =:= 0;
+is_chunked_framing([<<"chunked">> | Rest], Seen) -> is_chunked_framing(Rest, Seen + 1);
+is_chunked_framing([_Coding | Rest], Seen) -> is_chunked_framing(Rest, Seen).
+
 -spec is_valid_chunk_ext_tail(binary()) -> boolean().
 is_valid_chunk_ext_tail(<<>>) -> true;
 is_valid_chunk_ext_tail(Bin) -> skip_bws_to_semi(Bin).
@@ -2041,7 +2047,7 @@ parse_request_line(<<C, _/binary>>) when C >= $a, C =< $z ->
 parse_request_line(<<"\r\n", _/binary>>) ->
     {error, bad_request_line};
 parse_request_line(<<C, _/binary>> = Bin) ->
-    case nhttp_headers:is_tchar(C) of
+    case is_tchar(C) of
         true -> parse_request_line_token(Bin);
         false -> parse_request_line_cold(Bin)
     end;
