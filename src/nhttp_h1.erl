@@ -84,7 +84,6 @@ pattern applies to chunked requests.
 -compile(
     {inline, [
         trim_ows/1,
-        is_tchar/1,
         encode_version/1
     ]}
 ).
@@ -1103,7 +1102,7 @@ validate_headers_out([{Name, Value} | Rest]) ->
 
 -spec validate_field_name(binary()) -> ok | {error, encode_error()}.
 validate_field_name(Name) ->
-    case is_token(Name) of
+    case nhttp_headers:is_token(Name) of
         true -> ok;
         false -> {error, {invalid_field_name, Name}}
     end.
@@ -1160,40 +1159,6 @@ is_chunked_framing([], _Seen) -> false;
 is_chunked_framing([<<"chunked">>], Seen) -> Seen =:= 0;
 is_chunked_framing([<<"chunked">> | Rest], Seen) -> is_chunked_framing(Rest, Seen + 1);
 is_chunked_framing([_Coding | Rest], Seen) -> is_chunked_framing(Rest, Seen).
-
--spec is_tchar(byte()) -> boolean().
-is_tchar(C) when C >= $a, C =< $z -> true;
-is_tchar(C) when C >= $A, C =< $Z -> true;
-is_tchar(C) when C >= $0, C =< $9 -> true;
-is_tchar($!) -> true;
-is_tchar($#) -> true;
-is_tchar($$) -> true;
-is_tchar($%) -> true;
-is_tchar($&) -> true;
-is_tchar($') -> true;
-is_tchar($*) -> true;
-is_tchar($+) -> true;
-is_tchar($-) -> true;
-is_tchar($.) -> true;
-is_tchar($^) -> true;
-is_tchar($_) -> true;
-is_tchar($`) -> true;
-is_tchar($|) -> true;
-is_tchar($~) -> true;
-is_tchar(_) -> false.
-
--spec is_token(binary()) -> boolean().
-is_token(<<>>) -> false;
-is_token(Bin) -> is_token_chars(Bin).
-
--spec is_token_chars(binary()) -> boolean().
-is_token_chars(<<>>) ->
-    true;
-is_token_chars(<<C, Rest/binary>>) ->
-    case is_tchar(C) of
-        true -> is_token_chars(Rest);
-        false -> false
-    end.
 
 -spec is_valid_chunk_ext_tail(binary()) -> boolean().
 is_valid_chunk_ext_tail(<<>>) -> true;
@@ -1984,7 +1949,7 @@ parse_headers_acc_generic(Bin, Acc, Count, Size, MaxSize, MaxCount) ->
         [Line, Rest] ->
             case binary:split(Line, persistent_term:get(?PT_COLON)) of
                 [Name, Value] ->
-                    case is_token(Name) of
+                    case nhttp_headers:is_token(Name) of
                         false ->
                             {error, bad_header};
                         true ->
@@ -2076,7 +2041,7 @@ parse_request_line(<<C, _/binary>>) when C >= $a, C =< $z ->
 parse_request_line(<<"\r\n", _/binary>>) ->
     {error, bad_request_line};
 parse_request_line(<<C, _/binary>> = Bin) ->
-    case is_tchar(C) of
+    case nhttp_headers:is_tchar(C) of
         true -> parse_request_line_token(Bin);
         false -> parse_request_line_cold(Bin)
     end;
@@ -2090,7 +2055,7 @@ parse_request_line(<<>>) ->
 parse_request_line_token(Bin) ->
     case binary:split(Bin, <<" ">>) of
         [Method, Rest] when byte_size(Method) =< 16 ->
-            case is_token(Method) of
+            case nhttp_headers:is_token(Method) of
                 true -> find_path_version(Rest, Method);
                 false -> {error, invalid_method}
             end;

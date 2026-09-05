@@ -50,13 +50,26 @@ The Set-Cookie header contains a single cookie with optional attributes.
 
 ## Roundtrip Support
 
-The decode output can be fed directly to encode:
+The decode output can be fed back to encode when it conforms to the
+RFC 6265 Section 4.1.1 grammar:
 
 ```erlang
 {ok, SetCookie} = nhttp_cookie:decode_set_cookie(Header),
 %% Modify and re-encode
 {ok, NewHeader} = nhttp_cookie:encode_set_cookie(SetCookie#{max_age => 7200}).
 ```
+
+The roundtrip is not total, and it must not be. The Section 5.2 parsing
+algorithm is more permissive than the Section 4.1.1 grammar on purpose,
+so `decode_set_cookie/1` accepts a value that carries internal
+whitespace, a comma, or a CR and LF pair. The encoders enforce the
+grammar and refuse such a value with `{error, Reason}`. Re-emitting it
+is the header injection that the validation exists to stop.
+
+A forwarder must therefore pass the original field value through rather
+than decode it and encode it again. The decoded map is lossy in the same
+direction: `decode_set_cookie/1` drops every attribute it does not name,
+so a re-encode also discards the rest.
 """.
 
 %%%-----------------------------------------------------------------------------
@@ -78,7 +91,16 @@ The decode output can be fed directly to encode:
 %%%-----------------------------------------------------------------------------
 %% TYPE EXPORTS
 %%%-----------------------------------------------------------------------------
--export_type([t/0, cookie_error/0, set_cookie/0, set_cookie_error/0]).
+-export_type([
+    t/0,
+    cookie_error/0,
+    domain_violation/0,
+    name_violation/0,
+    path_violation/0,
+    set_cookie/0,
+    set_cookie_error/0,
+    value_violation/0
+]).
 
 %%%-----------------------------------------------------------------------------
 %% TYPES
@@ -100,8 +122,24 @@ The decode output can be fed directly to encode:
     same_site => strict | lax | none
 }.
 
--type cookie_error() :: empty_name | invalid_format.
--type set_cookie_error() :: empty_name | invalid_format.
+-type name_violation() :: empty | non_token_octet.
+-type value_violation() :: control_char | separator | non_ascii | unbalanced_quote.
+-type path_violation() :: empty | no_leading_slash | control_char | semicolon | non_ascii.
+-type domain_violation() :: empty | empty_label | invalid_label.
+
+-type cookie_error() ::
+    empty_name
+    | invalid_format
+    | {invalid_cookie_name, name_violation()}
+    | {invalid_cookie_value, value_violation()}.
+
+-type set_cookie_error() ::
+    empty_name
+    | invalid_format
+    | {invalid_cookie_name, name_violation()}
+    | {invalid_cookie_value, value_violation()}
+    | {invalid_path, path_violation()}
+    | {invalid_domain, domain_violation()}.
 
 %%%-----------------------------------------------------------------------------
 %% MACROS
@@ -133,8 +171,10 @@ decode_cookie(CookieHeader) ->
 
 -doc """
 Encode a list of cookies into a Cookie header value.
+
 Takes a list of cookie maps and produces a semicolon-separated string
 suitable for the Cookie header.
+
 ```erlang
 {ok, Header} = nhttp_cookie:encode_cookie([
     #{name => <<"session">>, value => <<"abc">>},
@@ -142,13 +182,29 @@ suitable for the Cookie header.
 ]).
 %% Header = <<"session=abc; user=john">>
 ```
+
+Every pair is validated against RFC 6265 Section 4.1.1, the grammar that
+Section 4.2.1 reuses for `cookie-string`. A name must be a `token`. A
+value must be `*cookie-octet`, or `*cookie-octet` inside a matched pair
+of double quotes, which admits `%x21`, `%x23-2B`, `%x2D-3A`, `%x3C-5B`,
+and `%x5D-7E`. That excludes CTLs, space, double quote, comma,
+semicolon, backslash, and every octet above `%x7E`.
+
+A value that leaves the set is refused with
+`{error, {invalid_cookie_value, t:value_violation/0}}`. No value is
+stripped, quoted, escaped, or truncated, and the error carries a class
+rather than the offending bytes, which are often a session token.
+Encode arbitrary data with Base64 before you put it in a cookie.
 """.
--spec encode_cookie([t()]) -> {ok, binary()}.
+-spec encode_cookie([t()]) -> {ok, binary()} | {error, cookie_error()}.
 encode_cookie([]) ->
     {ok, <<>>};
-encode_cookie([#{name := Name, value := Value} | Rest]) ->
-    Pairs = [encode_cookie_pair(C) || C <- Rest],
-    {ok, iolist_to_binary([Name, $=, Value | Pairs])}.
+encode_cookie([#{name := Name, value := Value} | Rest] = Cookies) ->
+    maybe
+        ok ?= validate_cookies(Cookies),
+        Pairs = [encode_cookie_pair(C) || C <- Rest],
+        {ok, iolist_to_binary([Name, $=, Value | Pairs])}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% SET-COOKIE HEADER ENCODING/DECODING
@@ -198,11 +254,36 @@ and produces a Set-Cookie header string.
 ```
 Supported attributes: `path`, `domain`, `expires`, `max_age`, `secure`,
 `http_only`, `same_site`.
+
+The cookie pair is validated against the RFC 6265 Section 4.1.1 grammar.
+A name must be a `token`. A value must be `*cookie-octet`, or
+`*cookie-octet` inside a matched pair of double quotes, which admits
+`%x21`, `%x23-2B`, `%x2D-3A`, `%x3C-5B`, and `%x5D-7E`. That excludes
+CTLs, space, double quote, comma, semicolon, backslash, and every octet
+above `%x7E`. Encode arbitrary data with Base64 before you put it in a
+cookie.
+
+The two attributes that carry caller data are validated too. `path` must
+be `<any CHAR except CTLs or ";">` and must start with `/`, because
+Section 5.2.4 makes a user agent discard any other value. `domain` must
+be a `<subdomain>` per RFC 1034 Section 3.5 and RFC 1123 Section 2.1:
+dot-separated labels of letters, digits, and hyphens, with an optional
+leading dot that Section 5.2.3 strips.
+
+A field that leaves its grammar is refused with
+`{error, t:set_cookie_error/0}`. Nothing is stripped, quoted, escaped,
+or truncated, and an error carries a class rather than the offending
+bytes, which are often a session token.
 """.
--spec encode_set_cookie(set_cookie()) -> {ok, binary()}.
+-spec encode_set_cookie(set_cookie()) -> {ok, binary()} | {error, set_cookie_error()}.
 encode_set_cookie(#{name := Name, value := Value} = SetCookie) ->
-    Base = <<Name/binary, "=", Value/binary>>,
-    {ok, encode_set_cookie_attrs(Base, SetCookie)}.
+    maybe
+        ok ?= validate_cookie_name(Name),
+        ok ?= validate_cookie_value(Value),
+        ok ?= validate_set_cookie_attrs(SetCookie),
+        Base = <<Name/binary, "=", Value/binary>>,
+        {ok, encode_set_cookie_attrs(Base, SetCookie)}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - COOKIE ENCODING
@@ -210,6 +291,154 @@ encode_set_cookie(#{name := Name, value := Value} = SetCookie) ->
 -spec encode_cookie_pair(t()) -> iolist().
 encode_cookie_pair(#{name := Name, value := Value}) ->
     [<<"; ">>, Name, $=, Value].
+
+%%%-----------------------------------------------------------------------------
+%% INTERNAL - ENCODE VALIDATION (RFC 6265 SECTION 4.1.1)
+%%%-----------------------------------------------------------------------------
+-spec validate_cookies([t()]) -> ok | {error, cookie_error()}.
+validate_cookies([]) ->
+    ok;
+validate_cookies([#{name := Name, value := Value} | Rest]) ->
+    maybe
+        ok ?= validate_cookie_name(Name),
+        ok ?= validate_cookie_value(Value),
+        validate_cookies(Rest)
+    end.
+
+-spec validate_cookie_name(binary()) -> ok | {error, {invalid_cookie_name, name_violation()}}.
+validate_cookie_name(<<>>) ->
+    {error, {invalid_cookie_name, empty}};
+validate_cookie_name(Name) ->
+    case nhttp_headers:is_token(Name) of
+        true -> ok;
+        false -> {error, {invalid_cookie_name, non_token_octet}}
+    end.
+
+-spec validate_cookie_value(binary()) -> ok | {error, {invalid_cookie_value, value_violation()}}.
+validate_cookie_value(<<$", Rest/binary>>) ->
+    validate_quoted_cookie_value(Rest);
+validate_cookie_value(Value) ->
+    check_cookie_octets(Value).
+
+-spec validate_quoted_cookie_value(binary()) ->
+    ok | {error, {invalid_cookie_value, value_violation()}}.
+validate_quoted_cookie_value(<<>>) ->
+    {error, {invalid_cookie_value, unbalanced_quote}};
+validate_quoted_cookie_value(Rest) ->
+    Last = byte_size(Rest) - 1,
+    case binary:at(Rest, Last) of
+        $" -> check_cookie_octets(binary:part(Rest, 0, Last));
+        _ -> {error, {invalid_cookie_value, unbalanced_quote}}
+    end.
+
+-spec check_cookie_octets(binary()) -> ok | {error, {invalid_cookie_value, value_violation()}}.
+check_cookie_octets(<<>>) ->
+    ok;
+check_cookie_octets(<<C, _/binary>>) when C =< 16#1F; C =:= 16#7F ->
+    {error, {invalid_cookie_value, control_char}};
+check_cookie_octets(<<C, _/binary>>) when
+    C =:= $\s; C =:= $"; C =:= $,; C =:= $;; C =:= $\\
+->
+    {error, {invalid_cookie_value, separator}};
+check_cookie_octets(<<C, _/binary>>) when C >= 16#80 ->
+    {error, {invalid_cookie_value, non_ascii}};
+check_cookie_octets(<<_, Rest/binary>>) ->
+    %% What survives the clauses above is exactly cookie-octet:
+    %% %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E.
+    check_cookie_octets(Rest).
+
+-spec validate_set_cookie_attrs(set_cookie()) -> ok | {error, set_cookie_error()}.
+validate_set_cookie_attrs(SetCookie) ->
+    maybe
+        ok ?= validate_optional_path(SetCookie),
+        validate_optional_domain(SetCookie)
+    end.
+
+-spec validate_optional_path(set_cookie()) -> ok | {error, {invalid_path, path_violation()}}.
+validate_optional_path(#{path := Path}) when is_binary(Path) ->
+    validate_path(Path);
+validate_optional_path(_) ->
+    ok.
+
+-spec validate_optional_domain(set_cookie()) -> ok | {error, {invalid_domain, domain_violation()}}.
+validate_optional_domain(#{domain := Domain}) when is_binary(Domain) ->
+    validate_domain(Domain);
+validate_optional_domain(_) ->
+    ok.
+
+-spec validate_path(binary()) -> ok | {error, {invalid_path, path_violation()}}.
+validate_path(<<>>) ->
+    {error, {invalid_path, empty}};
+validate_path(<<$/, Rest/binary>>) ->
+    check_path_octets(Rest);
+validate_path(_) ->
+    %% RFC 6265 Section 5.2.4: a user agent replaces any other value with
+    %% the default-path, so emitting one is a silent no-op.
+    {error, {invalid_path, no_leading_slash}}.
+
+-spec check_path_octets(binary()) -> ok | {error, {invalid_path, path_violation()}}.
+check_path_octets(<<>>) ->
+    ok;
+check_path_octets(<<C, _/binary>>) when C =< 16#1F; C =:= 16#7F ->
+    {error, {invalid_path, control_char}};
+check_path_octets(<<$;, _/binary>>) ->
+    {error, {invalid_path, semicolon}};
+check_path_octets(<<C, _/binary>>) when C >= 16#80 ->
+    {error, {invalid_path, non_ascii}};
+check_path_octets(<<_, Rest/binary>>) ->
+    check_path_octets(Rest).
+
+-spec validate_domain(binary()) -> ok | {error, {invalid_domain, domain_violation()}}.
+validate_domain(<<>>) ->
+    {error, {invalid_domain, empty}};
+validate_domain(<<$., Rest/binary>>) ->
+    %% RFC 6265 Section 5.2.3: a user agent strips one leading dot.
+    validate_domain_labels(Rest);
+validate_domain(Domain) ->
+    validate_domain_labels(Domain).
+
+-spec validate_domain_labels(binary()) -> ok | {error, {invalid_domain, domain_violation()}}.
+validate_domain_labels(<<>>) ->
+    {error, {invalid_domain, empty}};
+validate_domain_labels(Domain) ->
+    check_domain_labels(binary:split(Domain, <<".">>, [global])).
+
+-spec check_domain_labels([binary()]) -> ok | {error, {invalid_domain, domain_violation()}}.
+check_domain_labels([]) ->
+    ok;
+check_domain_labels([<<>> | _]) ->
+    {error, {invalid_domain, empty_label}};
+check_domain_labels([Label | Rest]) ->
+    case is_domain_label(Label) of
+        true -> check_domain_labels(Rest);
+        false -> {error, {invalid_domain, invalid_label}}
+    end.
+
+-spec is_domain_label(binary()) -> boolean().
+is_domain_label(Label) ->
+    Last = byte_size(Label) - 1,
+    is_let_dig(binary:first(Label)) andalso
+        is_let_dig(binary:at(Label, Last)) andalso
+        is_ldh(Label).
+
+-spec is_ldh(binary()) -> boolean().
+is_ldh(<<>>) ->
+    true;
+is_ldh(<<C, Rest/binary>>) ->
+    case is_ldh_char(C) of
+        true -> is_ldh(Rest);
+        false -> false
+    end.
+
+-spec is_ldh_char(byte()) -> boolean().
+is_ldh_char($-) -> true;
+is_ldh_char(C) -> is_let_dig(C).
+
+-spec is_let_dig(byte()) -> boolean().
+is_let_dig(C) when C >= $a, C =< $z -> true;
+is_let_dig(C) when C >= $A, C =< $Z -> true;
+is_let_dig(C) when C >= $0, C =< $9 -> true;
+is_let_dig(_) -> false.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - COOKIE DECODING

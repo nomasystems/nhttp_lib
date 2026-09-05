@@ -18,7 +18,8 @@ all() ->
         {group, has},
         {group, mutation},
         {group, filter},
-        {group, to_lower}
+        {group, to_lower},
+        {group, token}
     ].
 
 groups() ->
@@ -63,6 +64,13 @@ groups() ->
             to_lower_empty,
             to_lower_idempotent,
             to_lower_preserves_non_ascii_upper_bytes
+        ]},
+        {token, [parallel], [
+            is_tchar_accepts_every_tchar,
+            is_tchar_rejects_separators_and_controls,
+            is_token_rejects_empty,
+            is_token_accepts_field_names,
+            is_token_rejects_non_tchar_octets
         ]}
     ].
 
@@ -324,3 +332,48 @@ to_lower_preserves_non_ascii_upper_bytes(_Config) ->
     Bin = <<"X-Foo-", 16#80, "-Bar">>,
     Expected = <<"x-foo-", 16#80, "-bar">>,
     ?assertEqual(Expected, nhttp_headers:to_lower(Bin)).
+
+%%%-----------------------------------------------------------------------------
+%%% TOKEN
+%%%
+%%% RFC 9110 Section 5.6.2: token = 1*tchar.
+%%%-----------------------------------------------------------------------------
+
+is_tchar_accepts_every_tchar(_Config) ->
+    lists:foreach(
+        fun(C) -> ?assert(nhttp_headers:is_tchar(C), {octet, C}) end,
+        tchars()
+    ).
+
+is_tchar_rejects_separators_and_controls(_Config) ->
+    Rejected = lists:seq(16#00, 16#20) ++ [16#7F] ++ separators() ++ lists:seq(16#80, 16#FF),
+    lists:foreach(
+        fun(C) -> ?assertNot(nhttp_headers:is_tchar(C), {octet, C}) end,
+        Rejected
+    ).
+
+is_token_rejects_empty(_Config) ->
+    ?assertNot(nhttp_headers:is_token(<<>>)).
+
+is_token_accepts_field_names(_Config) ->
+    lists:foreach(
+        fun(Bin) -> ?assert(nhttp_headers:is_token(Bin), {token, Bin}) end,
+        [<<"content-length">>, <<"X-Custom">>, <<"!#$%&'*+-.^_`|~">>, <<"a">>, <<"200">>]
+    ).
+
+is_token_rejects_non_tchar_octets(_Config) ->
+    lists:foreach(
+        fun(Bin) -> ?assertNot(nhttp_headers:is_token(Bin), {token, Bin}) end,
+        [<<"a b">>, <<"a:b">>, <<"a\r\nb">>, <<"a\tb">>, <<"a", 0, "b">>, <<"a", 16#FF, "b">>]
+    ).
+
+-spec tchars() -> [byte()].
+tchars() ->
+    lists:seq($a, $z) ++
+        lists:seq($A, $Z) ++
+        lists:seq($0, $9) ++
+        [$!, $#, $$, $%, $&, $', $*, $+, $-, $., $^, $_, $`, $|, $~].
+
+-spec separators() -> [byte()].
+separators() ->
+    [$(, $), $<, $>, $@, $,, $;, $:, $\\, $", $/, $[, $], $?, $=, ${, $}].

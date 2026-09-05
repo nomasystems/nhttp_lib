@@ -69,7 +69,15 @@ Tests cookie encoding and decoding according to RFC 6265.
     encode_set_cookie_all_attributes/1,
     encode_set_cookie_false_flags/1,
     set_cookie_roundtrip/1,
-    set_cookie_roundtrip_all_attrs/1
+    set_cookie_roundtrip_all_attrs/1,
+    encode_set_cookie_rejects_crlf_value/1,
+    encode_set_cookie_rejects_semicolon_value/1,
+    encode_set_cookie_rejects_non_token_name/1,
+    encode_set_cookie_accepts_quoted_value/1,
+    encode_set_cookie_rejects_invalid_path/1,
+    encode_set_cookie_rejects_invalid_domain/1,
+    encode_cookie_rejects_crlf_value/1,
+    encode_cookie_rejects_non_token_name/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -82,6 +90,7 @@ all() ->
         {group, encode_cookie},
         {group, decode_set_cookie},
         {group, encode_set_cookie},
+        {group, encode_validation},
         {group, roundtrip}
     ].
 
@@ -139,6 +148,16 @@ groups() ->
             encode_set_cookie_with_same_site,
             encode_set_cookie_all_attributes,
             encode_set_cookie_false_flags
+        ]},
+        {encode_validation, [parallel], [
+            encode_set_cookie_rejects_crlf_value,
+            encode_set_cookie_rejects_semicolon_value,
+            encode_set_cookie_rejects_non_token_name,
+            encode_set_cookie_accepts_quoted_value,
+            encode_set_cookie_rejects_invalid_path,
+            encode_set_cookie_rejects_invalid_domain,
+            encode_cookie_rejects_crlf_value,
+            encode_cookie_rejects_non_token_name
         ]},
         {roundtrip, [parallel], [
             cookie_roundtrip,
@@ -461,6 +480,74 @@ encode_set_cookie_false_flags(_Config) ->
         http_only => false
     }),
     ?assertEqual(<<"session=abc">>, Result).
+
+%%%-----------------------------------------------------------------------------
+%%% ENCODE VALIDATION TESTS (RFC 6265 SECTION 4.1.1)
+%%%-----------------------------------------------------------------------------
+
+encode_set_cookie_rejects_crlf_value(_Config) ->
+    ?assertEqual(
+        {error, {invalid_cookie_value, control_char}},
+        nhttp_cookie:encode_set_cookie(#{name => <<"s">>, value => <<"v\r\nX: 1">>})
+    ).
+
+encode_set_cookie_rejects_semicolon_value(_Config) ->
+    ?assertEqual(
+        {error, {invalid_cookie_value, separator}},
+        nhttp_cookie:encode_set_cookie(#{name => <<"s">>, value => <<"v; HttpOnly">>})
+    ).
+
+encode_set_cookie_rejects_non_token_name(_Config) ->
+    ?assertEqual(
+        {error, {invalid_cookie_name, non_token_octet}},
+        nhttp_cookie:encode_set_cookie(#{name => <<"se ssion">>, value => <<"v">>})
+    ),
+    ?assertEqual(
+        {error, {invalid_cookie_name, empty}},
+        nhttp_cookie:encode_set_cookie(#{name => <<>>, value => <<"v">>})
+    ).
+
+encode_set_cookie_accepts_quoted_value(_Config) ->
+    ?assertEqual(
+        {ok, <<"session=\"abc123\"; Secure">>},
+        nhttp_cookie:encode_set_cookie(#{
+            name => <<"session">>,
+            value => <<"\"abc123\"">>,
+            secure => true
+        })
+    ).
+
+encode_set_cookie_rejects_invalid_path(_Config) ->
+    ?assertEqual(
+        {error, {invalid_path, semicolon}},
+        nhttp_cookie:encode_set_cookie(#{
+            name => <<"s">>, value => <<"v">>, path => <<"/a;HttpOnly">>
+        })
+    ),
+    ?assertEqual(
+        {error, {invalid_path, no_leading_slash}},
+        nhttp_cookie:encode_set_cookie(#{name => <<"s">>, value => <<"v">>, path => <<"app">>})
+    ).
+
+encode_set_cookie_rejects_invalid_domain(_Config) ->
+    ?assertEqual(
+        {error, {invalid_domain, invalid_label}},
+        nhttp_cookie:encode_set_cookie(#{
+            name => <<"s">>, value => <<"v">>, domain => <<"https://example.com">>
+        })
+    ).
+
+encode_cookie_rejects_crlf_value(_Config) ->
+    ?assertEqual(
+        {error, {invalid_cookie_value, control_char}},
+        nhttp_cookie:encode_cookie([#{name => <<"s">>, value => <<"v\r\nX: 1">>}])
+    ).
+
+encode_cookie_rejects_non_token_name(_Config) ->
+    ?assertEqual(
+        {error, {invalid_cookie_name, non_token_octet}},
+        nhttp_cookie:encode_cookie([#{name => <<"se ssion">>, value => <<"v">>}])
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% ROUNDTRIP TESTS
