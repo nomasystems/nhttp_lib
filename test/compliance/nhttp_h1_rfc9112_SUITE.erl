@@ -22,9 +22,11 @@ Run with: rebar3 ct --suite=test/compliance/nhttp_h1_rfc9112_SUITE
 all() ->
     [
         {group, section_2_message},
+        {group, section_3_request_line},
         {group, section_4_status_line},
         {group, section_5_field_syntax},
         {group, section_6_message_body},
+        {group, section_6_1_transfer_encoding},
         {group, section_7_transfer_codings},
         {group, section_11_response_splitting}
     ].
@@ -35,6 +37,16 @@ groups() ->
             parse_as_ascii_superset,
             reject_or_replace_bare_cr,
             reject_whitespace_before_headers
+        ]},
+        {section_3_request_line, [parallel], [
+            reject_method_with_crlf,
+            reject_method_with_non_token_octets,
+            reject_method_with_whitespace,
+            reject_lowercase_method,
+            reject_overlong_method,
+            accept_token_method_outside_alpha,
+            known_methods_return_atom,
+            truncated_request_line_returns_more
         ]},
         {section_4_status_line, [parallel], [
             status_line_space_before_reason
@@ -49,11 +61,24 @@ groups() ->
             reject_invalid_content_length,
             transfer_encoding_overrides_content_length
         ]},
+        {section_6_1_transfer_encoding, [parallel], [
+            join_transfer_encoding_field_lines,
+            reject_chunked_before_other_coding,
+            accept_other_coding_before_chunked,
+            reject_repeated_chunked,
+            transfer_coding_case_and_ows,
+            reject_empty_transfer_encoding,
+            reject_content_length_with_transfer_encoding,
+            response_transfer_encoding_field_lines
+        ]},
         {section_7_transfer_codings, [parallel], [
             parse_chunked,
             handle_large_chunk_size,
             ignore_chunk_extensions,
-            handle_trailer_fields
+            handle_trailer_fields,
+            reject_chunk_data_without_crlf_request,
+            reject_chunk_data_without_crlf_response,
+            short_chunk_data_returns_more
         ]},
         {section_11_response_splitting, [parallel], [
             reject_field_value_injection,
@@ -101,6 +126,124 @@ reject_or_replace_bare_cr(_Config) ->
 reject_whitespace_before_headers(_Config) ->
     Req = <<"GET / HTTP/1.1\r\n Host: x\r\n\r\n">>,
     ?assertMatch({error, _}, nhttp_h1:parse_request(Req)).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 3 - Request Line
+%%%
+%%% RFC 9112 Section 3.1: method = token.
+%%% RFC 9110 Section 5.6.2: token = 1*tchar.
+%%%-----------------------------------------------------------------------------
+
+reject_method_with_crlf(_Config) ->
+    Req = <<"XX\r\nY /p HTTP/1.1\r\nHost: a\r\n\r\n">>,
+    ?assertEqual({error, invalid_method}, nhttp_h1:parse_request(Req)),
+    ?assertEqual({error, invalid_method}, nhttp_h1:parse_request_headers(Req, #{})).
+
+reject_method_with_non_token_octets(_Config) ->
+    lists:foreach(
+        fun(Octet) ->
+            Req = request_with_method(<<"GE", Octet:8, "T">>),
+            ?assertEqual(
+                {error, invalid_method},
+                nhttp_h1:parse_request(Req),
+                {octet, Octet}
+            )
+        end,
+        non_tchar_octets()
+    ).
+
+reject_method_with_whitespace(_Config) ->
+    ?assertMatch(
+        {error, _}, nhttp_h1:parse_request(<<"GE T /p HTTP/1.1\r\nHost: a\r\n\r\n">>)
+    ),
+    ?assertEqual(
+        {error, invalid_method}, nhttp_h1:parse_request(request_with_method(<<"GE\tT">>))
+    ).
+
+reject_lowercase_method(_Config) ->
+    ?assertEqual(
+        {error, invalid_method}, nhttp_h1:parse_request(request_with_method(<<"get">>))
+    ),
+    ?assertEqual(
+        {error, invalid_method}, nhttp_h1:parse_request(request_with_method(<<"gEt">>))
+    ).
+
+reject_overlong_method(_Config) ->
+    ?assertMatch(
+        {ok, #{method := <<"ABCDEFGHIJKLMNOP">>}, _},
+        nhttp_h1:parse_request(request_with_method(<<"ABCDEFGHIJKLMNOP">>))
+    ),
+    ?assertMatch(
+        {error, _}, nhttp_h1:parse_request(request_with_method(<<"ABCDEFGHIJKLMNOPQ">>))
+    ).
+
+accept_token_method_outside_alpha(_Config) ->
+    lists:foreach(
+        fun(Method) ->
+            ?assertMatch(
+                {ok, #{method := Method}, _},
+                nhttp_h1:parse_request(request_with_method(Method)),
+                {method, Method}
+            )
+        end,
+        [
+            <<"PROPFIND">>,
+            <<"M-SEARCH">>,
+            <<"!#$%&*">>,
+            <<"7ZIP">>,
+            <<"X'A">>,
+            <<"A+B.C">>,
+            <<"^_`|~">>
+        ]
+    ).
+
+known_methods_return_atom(_Config) ->
+    Known = [
+        {<<"GET">>, get},
+        {<<"POST">>, post},
+        {<<"PUT">>, put},
+        {<<"HEAD">>, head},
+        {<<"DELETE">>, delete},
+        {<<"PATCH">>, patch},
+        {<<"OPTIONS">>, options},
+        {<<"CONNECT">>, connect},
+        {<<"TRACE">>, trace}
+    ],
+    lists:foreach(
+        fun({Bin, Atom}) ->
+            ?assertMatch(
+                {ok, #{method := Atom}, _},
+                nhttp_h1:parse_request(request_with_method(Bin)),
+                {method, Bin}
+            )
+        end,
+        Known
+    ).
+
+truncated_request_line_returns_more(_Config) ->
+    Fulls = [
+        request_with_method(<<"GET">>),
+        request_with_method(<<"PROPFIND">>),
+        request_with_method(<<"M-SEARCH">>),
+        request_with_method(<<"!#$%&*">>),
+        request_with_method(<<"7ZIP">>)
+    ],
+    lists:foreach(
+        fun(Full) ->
+            lists:foreach(
+                fun(N) ->
+                    Prefix = binary:part(Full, 0, N),
+                    ?assertMatch(
+                        {more, More} when More >= 1,
+                        nhttp_h1:parse_request(Prefix),
+                        {prefix, Prefix}
+                    )
+                end,
+                lists:seq(0, byte_size(Full) - 1)
+            )
+        end,
+        Fulls
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 4 - Status Line
@@ -187,6 +330,142 @@ transfer_encoding_overrides_content_length(_Config) ->
     ?assertEqual({error, conflicting_framing}, nhttp_h1:parse_request(Req)).
 
 %%%-----------------------------------------------------------------------------
+%%% Section 6.1 - Transfer-Encoding
+%%%-----------------------------------------------------------------------------
+
+%% RFC 9110 Section 5.3: a recipient combines multiple field lines with the
+%% same name into one comma-separated list, in order of receipt. Framing that
+%% reads only the first field line desynchronizes against a recipient that
+%% performs the join.
+join_transfer_encoding_field_lines(_Config) ->
+    ?assertEqual(te_framing([<<"gzip, chunked">>]), te_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual(te_framing([<<"chunked, gzip">>]), te_framing([<<"chunked">>, <<"gzip">>])),
+    ?assertEqual(
+        te_framing([<<"deflate, gzip, chunked">>]),
+        te_framing([<<"deflate">>, <<"gzip, chunked">>])
+    ).
+
+%% RFC 9112 Section 6.3 item 4: a request whose final transfer coding is not
+%% chunked has no reliable body length, and the server answers 400.
+reject_chunked_before_other_coding(_Config) ->
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"chunked">>, <<"gzip">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"chunked, gzip">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"gzip">>])).
+
+%% RFC 9112 Section 6.1: chunked is the final transfer coding of a request.
+accept_other_coding_before_chunked(_Config) ->
+    ?assertEqual(chunked, te_framing([<<"gzip, chunked">>])),
+    ?assertEqual(chunked, te_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual(chunked, te_framing([<<"deflate">>, <<"gzip">>, <<"chunked">>])).
+
+%% RFC 9112 Section 6.1: "A sender MUST NOT apply the chunked transfer coding
+%% more than once to a message body". Two recipients that disagree on the
+%% number of chunked layers disagree on every byte after the first chunk.
+reject_repeated_chunked(_Config) ->
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"chunked, chunked">>])),
+    ?assertEqual(
+        {error, unsupported_transfer_encoding}, te_framing([<<"chunked">>, <<"chunked">>])
+    ),
+    ?assertEqual(
+        {error, unsupported_transfer_encoding}, te_framing([<<"chunked">>, <<"gzip, chunked">>])
+    ).
+
+%% RFC 9110 Section 10.1.4: transfer-coding is a token, and tokens are
+%% case-insensitive. RFC 9110 Section 5.6.1.2: a recipient ignores empty list
+%% elements and the OWS around each element.
+transfer_coding_case_and_ows(_Config) ->
+    ?assertEqual(chunked, te_framing([<<"Chunked">>])),
+    ?assertEqual(chunked, te_framing([<<"CHUNKED">>])),
+    ?assertEqual(chunked, te_framing([<<"  chunked  ">>])),
+    ?assertEqual(chunked, te_framing([<<"gzip ,\tchunked">>])),
+    ?assertEqual(chunked, te_framing([<<"chunked,">>])),
+    ?assertEqual(chunked, te_framing([<<"gzip, , chunked">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<"Chunked, chunked">>])).
+
+%% RFC 9110 Section 5.6.1.2: an empty list has no elements, so the message
+%% declares no transfer coding and cannot be framed by one.
+reject_empty_transfer_encoding(_Config) ->
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<>>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<",">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<" ,\t,">>])),
+    ?assertEqual({error, unsupported_transfer_encoding}, te_framing([<<>>, <<>>])).
+
+%% RFC 9112 Section 6.3 item 3: a message carrying both fields is handled as
+%% an error. The field line count does not change that.
+reject_content_length_with_transfer_encoding(_Config) ->
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"chunked">>])),
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"chunked">>, <<"chunked">>])),
+    ?assertEqual({error, conflicting_framing}, cl_te_framing([<<"gzip">>])).
+
+%% RFC 9112 Section 6.3 item 4: a response whose final transfer coding is not
+%% chunked is delimited by the connection close, not by an error.
+response_transfer_encoding_field_lines(_Config) ->
+    ?assertEqual(chunked, response_framing([<<"gzip">>, <<"chunked">>])),
+    ?assertEqual(chunked, response_framing([<<"gzip, chunked">>])),
+    ?assertEqual(until_close, response_framing([<<"chunked">>, <<"gzip">>])),
+    ?assertEqual(until_close, response_framing([<<"chunked">>, <<"chunked">>])),
+    ?assertEqual(until_close, response_framing([<<>>])),
+    ?assertEqual(
+        {error, unsupported_transfer_encoding}, one_shot_response_framing([<<"chunked">>, <<"gzip">>])
+    ),
+    ?assertEqual(chunked, one_shot_response_framing([<<"gzip">>, <<"chunked">>])).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 6.1 helpers
+%%%-----------------------------------------------------------------------------
+
+%% The one-shot parser and the streaming parser must reach the same framing
+%% decision, so every case runs through both.
+te_framing(Lines) ->
+    Streaming = streaming_framing(te_request(Lines)),
+    ?assertEqual(Streaming, one_shot_framing(te_request(Lines))),
+    Streaming.
+
+cl_te_framing(Lines) ->
+    Head = <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n">>,
+    Streaming = streaming_framing(te_message(Head, Lines)),
+    ?assertEqual(Streaming, one_shot_framing(te_message(Head, Lines))),
+    Streaming.
+
+te_request(Lines) ->
+    te_message(<<"POST / HTTP/1.1\r\nHost: x\r\n">>, Lines).
+
+te_message(Head, Lines) ->
+    Field = [[<<"Transfer-Encoding: ">>, Line, <<"\r\n">>] || Line <- Lines],
+    iolist_to_binary([Head, Field, <<"\r\n5\r\nhello\r\n0\r\n\r\n">>]).
+
+streaming_framing(Bin) ->
+    case nhttp_h1:parse_request_headers(Bin, #{}) of
+        {ok, _Req, {chunked, _St}, _Consumed} -> chunked;
+        {ok, _Req, Stream, _Consumed} -> Stream;
+        Other -> Other
+    end.
+
+one_shot_framing(Bin) ->
+    case nhttp_h1:parse_request(Bin) of
+        {ok, #{body := <<"hello">>}, _Consumed} -> chunked;
+        {ok, #{body := Body}, _Consumed} -> {body, Body};
+        Other -> Other
+    end.
+
+response_framing(Lines) ->
+    Head = <<"HTTP/1.1 200 OK\r\n">>,
+    {ok, 200, Headers, _Rest} = nhttp_h1:parse_response_headers(te_message(Head, Lines)),
+    case nhttp_h1:body_stream_from_response(get, 200, Headers) of
+        {chunked, _St} -> chunked;
+        Stream -> Stream
+    end.
+
+one_shot_response_framing(Lines) ->
+    Head = <<"HTTP/1.1 200 OK\r\n">>,
+    case nhttp_h1:parse_response(te_message(Head, Lines)) of
+        {ok, #{body := <<"hello">>}, _Consumed} -> chunked;
+        {ok, #{body := Body}, _Consumed} -> {body, Body};
+        Other -> Other
+    end.
+
+%%%-----------------------------------------------------------------------------
 %%% Section 7 - Transfer Codings
 %%%-----------------------------------------------------------------------------
 
@@ -233,6 +512,43 @@ handle_trailer_fields(_Config) ->
              "\r\n">>,
     {ok, #{body := Body}, _} = nhttp_h1:parse_response(Resp),
     ?assertEqual(<<"hello">>, iolist_to_binary(Body)).
+
+%% RFC 9112 Section 7.1: chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF.
+%% The CRLF behind chunk-data is mandatory. Data long enough to satisfy the
+%% chunk-size, with any other pair of octets behind it, is a refusal and not a
+%% crash.
+reject_chunk_data_without_crlf_request(_Config) ->
+    Req = <<"POST / HTTP/1.1\r\n",
+            "Host: x\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "1\r\nABC">>,
+    ?assertEqual({error, incomplete_chunk}, nhttp_h1:parse_request(Req)).
+
+reject_chunk_data_without_crlf_response(_Config) ->
+    Resp = <<"HTTP/1.1 200 OK\r\n",
+             "Transfer-Encoding: chunked\r\n",
+             "\r\n",
+             "1\r\nABC">>,
+    ?assertEqual({error, incomplete_chunk}, nhttp_h1:parse_response(Resp)).
+
+%% RFC 9112 Section 7.1: the octet count and the terminator are two rules. A
+%% body that holds fewer octets than the chunk-size names is incomplete, not
+%% malformed, so the parser asks for more.
+short_chunk_data_returns_more(_Config) ->
+    Req = <<"POST / HTTP/1.1\r\n",
+            "Host: x\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "5\r\nAB">>,
+    ?assertEqual({more, 5}, nhttp_h1:parse_request(Req)),
+    Valid = <<"POST / HTTP/1.1\r\n",
+              "Host: x\r\n",
+              "Transfer-Encoding: chunked\r\n",
+              "\r\n",
+              "1\r\nA\r\n0\r\n\r\n">>,
+    ?assertMatch({ok, #{body := <<"A">>}, 67}, nhttp_h1:parse_request(Valid)),
+    ?assertEqual(byte_size(Valid), 67).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 11.1 - Response Splitting
@@ -393,6 +709,15 @@ single_header_terminator(_Config) ->
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
+
+-spec request_with_method(binary()) -> binary().
+request_with_method(Method) ->
+    <<Method/binary, " /p HTTP/1.1\r\nHost: a\r\n\r\n">>.
+
+-spec non_tchar_octets() -> [byte()].
+non_tchar_octets() ->
+    [0, 16#09, 16#0A, 16#0B, 16#0C, 16#0D, 16#7F, 16#80, 16#FF] ++
+        [$", $(, $), $,, $/, $:, $;, $<, $=, $>, $?, $@, $[, $\\, $], ${, $}].
 
 -spec injection_values() -> [binary()].
 injection_values() ->

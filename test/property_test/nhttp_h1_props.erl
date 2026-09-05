@@ -363,6 +363,167 @@ prop_reject_header_value_bare_controls() ->
         end
     ).
 
+-spec prop_request_method_is_token() -> triq:property().
+prop_request_method_is_token() ->
+    ?FORALL(
+        {MethodBin, Path},
+        {method_fuzz_gen(), elements([<<"/">>, <<"/p">>, <<"/a/b?q=1">>])},
+        begin
+            Req = <<MethodBin/binary, " ", Path/binary, " HTTP/1.1\r\nHost: x\r\n\r\n">>,
+            case nhttp_h1:parse_request(Req) of
+                {ok, #{method := Method}, _} -> method_is_rfc9110_token(Method);
+                _ -> true
+            end
+        end
+    ).
+
+%% RFC 9110 Section 8.6: Content-Length = 1*DIGIT. RFC 9110 Section 5.5 strips
+%% leading and trailing OWS before the field value is read.
+-spec prop_content_length_is_digits() -> triq:property().
+prop_content_length_is_digits() ->
+    ?FORALL(
+        Value,
+        content_length_fuzz_gen(),
+        begin
+            Req =
+                <<"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ", Value/binary, "\r\n\r\n">>,
+            Valid = is_content_length_abnf(trim_ows(Value)),
+            case nhttp_h1:parse_request(Req) of
+                {ok, _, _} -> Valid;
+                {more, _} -> Valid;
+                {error, invalid_content_length} -> not Valid;
+                {error, _} -> false
+            end
+        end
+    ).
+
+-spec content_length_fuzz_gen() -> triq_dom:domain().
+content_length_fuzz_gen() ->
+    oneof([
+        signed_content_length_gen(),
+        affixed_content_length_gen(),
+        free_content_length_gen()
+    ]).
+
+%% A bare fuzz generator almost never lands on "+5", the one shape that a
+%% binary_to_integer/1 based parser accepts and the ABNF does not.
+-spec signed_content_length_gen() -> triq_dom:domain().
+signed_content_length_gen() ->
+    ?LET(
+        {Sign, Digits},
+        {elements([<<"+">>, <<"-">>]), elements([<<"0">>, <<"5">>, <<"42">>, <<"007">>])},
+        <<Sign/binary, Digits/binary>>
+    ).
+
+-spec affixed_content_length_gen() -> triq_dom:domain().
+affixed_content_length_gen() ->
+    ?LET(
+        {Prefix, Digits, Suffix},
+        {
+            elements([<<>>, <<"+">>, <<"-">>, <<" ">>, <<"\t">>, <<"0x">>, <<"00">>]),
+            elements([<<>>, <<"0">>, <<"5">>, <<"42">>]),
+            elements([<<>>, <<" ">>, <<"\t">>, <<".0">>, <<",5">>, <<239, 188, 149>>])
+        },
+        <<Prefix/binary, Digits/binary, Suffix/binary>>
+    ).
+
+%% RFC 9110 Section 5.3: a recipient combines multiple field lines with the
+%% same name into one comma-separated list, in order of receipt. The framing
+%% decision must therefore not depend on how the sender split the field.
+-spec prop_transfer_encoding_field_lines_join() -> triq:property().
+prop_transfer_encoding_field_lines_join() ->
+    ?FORALL(
+        Lines,
+        non_empty(list(transfer_coding_line_gen())),
+        te_framing(Lines) =:= te_framing([join_field_lines(Lines)])
+    ).
+
+-spec transfer_coding_line_gen() -> triq_dom:domain().
+transfer_coding_line_gen() ->
+    elements([
+        <<"chunked">>,
+        <<"Chunked">>,
+        <<" chunked\t">>,
+        <<"gzip">>,
+        <<"deflate">>,
+        <<"identity">>,
+        <<"gzip, chunked">>,
+        <<"chunked, gzip">>,
+        <<"chunked, chunked">>,
+        <<>>,
+        <<",">>
+    ]).
+
+-spec join_field_lines([binary()]) -> binary().
+join_field_lines(Lines) ->
+    iolist_to_binary(lists:join(<<", ">>, Lines)).
+
+-spec te_framing([binary()]) -> term().
+te_framing(Lines) ->
+    Field = [[<<"Transfer-Encoding: ">>, Line, <<"\r\n">>] || Line <- Lines],
+    Bin = iolist_to_binary([<<"POST / HTTP/1.1\r\nHost: x\r\n">>, Field, <<"\r\n0\r\n\r\n">>]),
+    case nhttp_h1:parse_request_headers(Bin, #{}) of
+        {ok, _Req, {chunked, _St}, _Consumed} -> chunked;
+        {ok, _Req, Stream, _Consumed} -> Stream;
+        Other -> Other
+    end.
+
+-spec free_content_length_gen() -> triq_dom:domain().
+free_content_length_gen() ->
+    ?LET(
+        Chars,
+        list(content_length_byte_gen()),
+        list_to_binary(lists:sublist(Chars, 6))
+    ).
+
+-spec content_length_byte_gen() -> triq_dom:domain().
+content_length_byte_gen() ->
+    oneof([
+        int($0, $9),
+        elements([$+, $-, $\s, $\t, $., $,, $x, $a, $O, 16#EF])
+    ]).
+
+-spec is_content_length_abnf(binary()) -> boolean().
+is_content_length_abnf(<<>>) ->
+    false;
+is_content_length_abnf(Bin) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, binary_to_list(Bin)).
+
+-spec trim_ows(binary()) -> binary().
+trim_ows(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t ->
+    trim_ows(Rest);
+trim_ows(<<>>) ->
+    <<>>;
+trim_ows(Bin) ->
+    case binary:last(Bin) of
+        C when C =:= $\s; C =:= $\t ->
+            trim_ows(binary:part(Bin, 0, byte_size(Bin) - 1));
+        _ ->
+            Bin
+    end.
+
+-spec method_fuzz_gen() -> triq_dom:domain().
+method_fuzz_gen() ->
+    ?LET(
+        Chars,
+        non_empty(list(oneof([tchar_byte_gen(), non_tchar_byte_gen(), int(0, 255)]))),
+        list_to_binary(lists:sublist(Chars, 16))
+    ).
+
+-spec method_is_rfc9110_token(nhttp_lib:method()) -> boolean().
+method_is_rfc9110_token(Method) when is_atom(Method) ->
+    lists:member(Method, [get, head, post, put, delete, connect, options, trace, patch]);
+method_is_rfc9110_token(<<>>) ->
+    false;
+method_is_rfc9110_token(Method) when is_binary(Method) ->
+    lists:all(fun is_tchar_byte/1, binary_to_list(Method)).
+
+-spec is_tchar_byte(byte()) -> boolean().
+is_tchar_byte(C) when C >= $a, C =< $z -> true;
+is_tchar_byte(C) when C >= $A, C =< $Z -> true;
+is_tchar_byte(C) when C >= $0, C =< $9 -> true;
+is_tchar_byte(C) -> lists:member(C, [$!, $#, $$, $%, $&, $', $*, $+, $-, $., $^, $_, $`, $|, $~]).
+
 -spec valid_token_gen() -> triq_dom:domain().
 valid_token_gen() ->
     ?LET(Chars, non_empty(list(tchar_byte_gen())), list_to_binary(Chars)).
