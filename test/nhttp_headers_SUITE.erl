@@ -29,6 +29,7 @@ groups() ->
             get_default_when_absent,
             get_undefined_when_absent,
             get_case_insensitive_lookup,
+            get_matches_stored_mixed_case,
             get_returns_first_when_duplicate,
             get_handles_empty_headers
         ]},
@@ -36,16 +37,19 @@ groups() ->
             has_present,
             has_absent,
             has_case_insensitive,
+            has_matches_stored_mixed_case,
             has_empty_headers
         ]},
         {mutation, [parallel], [
             set_replaces_all_occurrences,
             set_appends_when_missing,
             set_normalises_name,
+            set_replaces_stored_mixed_case,
             append_preserves_existing,
             append_normalises_name,
             delete_removes_every_occurrence,
             delete_case_insensitive,
+            delete_removes_stored_mixed_case,
             delete_no_op_when_absent
         ]},
         {filter, [parallel], [
@@ -100,6 +104,15 @@ get_case_insensitive_lookup(_Config) ->
     ?assertEqual(<<"text/html">>, nhttp_headers:get(<<"CONTENT-TYPE">>, Headers)),
     ?assertEqual(<<"text/html">>, nhttp_headers:get(<<"content-type">>, Headers)).
 
+%% RFC 9110 Section 5.1: a field name is case-insensitive, so a lookup with a
+%% lowercase name finds a name that the caller stored in any case.
+get_matches_stored_mixed_case(_Config) ->
+    Headers = [{<<"Content-Length">>, <<"5">>}, {<<"CoNtEnT-TyPe">>, <<"text/html">>}],
+    ?assertEqual(<<"5">>, nhttp_headers:get(<<"content-length">>, Headers)),
+    ?assertEqual(<<"text/html">>, nhttp_headers:get(<<"content-type">>, Headers)),
+    ?assertEqual(undefined, nhttp_headers:get(<<"content-lengti">>, Headers)),
+    ?assertEqual(undefined, nhttp_headers:get(<<"content_length">>, Headers)).
+
 get_returns_first_when_duplicate(_Config) ->
     Headers = [
         {<<"set-cookie">>, <<"a=1">>},
@@ -129,6 +142,13 @@ has_case_insensitive(_Config) ->
     ?assert(nhttp_headers:has(<<"Content-Type">>, Headers)),
     ?assert(nhttp_headers:has(<<"CONTENT-TYPE">>, Headers)).
 
+has_matches_stored_mixed_case(_Config) ->
+    Headers = [{<<"Content-Length">>, <<"5">>}],
+    ?assert(nhttp_headers:has(<<"content-length">>, Headers)),
+    ?assert(nhttp_headers:has(<<"CONTENT-LENGTH">>, Headers)),
+    ?assertNot(nhttp_headers:has(<<"content-lengti">>, Headers)),
+    ?assertNot(nhttp_headers:has(<<"content-lengt">>, Headers)).
+
 has_empty_headers(_Config) ->
     ?assertNot(nhttp_headers:has(<<"any">>, [])).
 
@@ -153,6 +173,15 @@ set_appends_when_missing(_Config) ->
 set_normalises_name(_Config) ->
     Updated = nhttp_headers:set(<<"X-Custom">>, <<"v">>, []),
     ?assertEqual([{<<"x-custom">>, <<"v">>}], Updated).
+
+%% A `set` over a stored mixed-case name replaces it. Without the
+%% case-insensitive match the entry survives and `set` appends a second one.
+set_replaces_stored_mixed_case(_Config) ->
+    Headers = [{<<"Content-Length">>, <<"0">>}, {<<"Host">>, <<"localhost">>}],
+    ?assertEqual(
+        [{<<"Host">>, <<"localhost">>}, {<<"content-length">>, <<"5">>}],
+        nhttp_headers:set(<<"content-length">>, <<"5">>, Headers)
+    ).
 
 append_preserves_existing(_Config) ->
     Headers = [{<<"set-cookie">>, <<"a=1">>}],
@@ -183,6 +212,12 @@ delete_case_insensitive(_Config) ->
         [{<<"host">>, <<"x">>}],
         nhttp_headers:delete(<<"Content-Type">>, Headers)
     ).
+
+delete_removes_stored_mixed_case(_Config) ->
+    Headers = [
+        {<<"Content-Length">>, <<"0">>}, {<<"CONTENT-LENGTH">>, <<"1">>}, {<<"x">>, <<"y">>}
+    ],
+    ?assertEqual([{<<"x">>, <<"y">>}], nhttp_headers:delete(<<"content-length">>, Headers)).
 
 delete_no_op_when_absent(_Config) ->
     Headers = [{<<"host">>, <<"x">>}],

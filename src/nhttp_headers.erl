@@ -4,19 +4,19 @@
 Protocol-agnostic header utilities.
 
 Headers carried by `t:nhttp_lib:headers/0` are an ordered list of
-`{Name, Value}` binary pairs. The codec layers normalise names to
-lowercase at parse time. Application code should construct headers
-with lowercase names; the lookup functions in this module accept any
-casing and normalise internally so mixed-case calls are still safe.
+`{Name, Value}` binary pairs. The codec layers write names in lowercase
+at parse time. This module stores the name that the caller gives and
+never rewrites it. `append/3` and `set/3` store the lowercase form of
+the name that they add, and leave every other entry alone.
 
 Key invariants:
 
-- Header names compare case-insensitively (RFC 9110 §5.1). All
-  lookup functions in this module call `to_lower/1` on the input
-  name before matching.
-- Multi-valued headers retain insertion order. `get/2,3` returns the
-  first match; `delete/2` removes every occurrence; `append/3`
-  appends without removing existing entries.
+- Header names compare case-insensitively (RFC 9110 §5.1). A lookup
+  matches a stored name in any case, so `get/2` with
+  `<<"content-length">>` finds a stored `Content-Length`.
+- Multi-valued headers keep insertion order. `get/2,3` returns the
+  first match. `delete/2` removes every occurrence. `append/3`
+  appends and keeps existing entries.
 """.
 
 -compile(
@@ -233,22 +233,58 @@ to_lower(<<>>) -> <<>>;
 to_lower(Bin) -> <<<<(to_lower_byte(C))>> || <<C>> <= Bin>>.
 
 %%%-----------------------------------------------------------------------------
+%%%-----------------------------------------------------------------------------
 %% INTERNAL
 %%%-----------------------------------------------------------------------------
 -spec do_delete(binary(), nhttp_lib:headers(), nhttp_lib:headers()) -> nhttp_lib:headers().
-do_delete(Name, [{Name, _} | Rest], Acc) -> do_delete(Name, Rest, Acc);
-do_delete(Name, [Pair | Rest], Acc) -> do_delete(Name, Rest, [Pair | Acc]);
-do_delete(_, [], Acc) -> lists:reverse(Acc).
+do_delete(Name, [{Name, _} | Rest], Acc) ->
+    do_delete(Name, Rest, Acc);
+do_delete(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
+    case lower_eq(Stored, Name, byte_size(Name) - 1) of
+        true -> do_delete(Name, Rest, Acc);
+        false -> do_delete(Name, Rest, [Pair | Acc])
+    end;
+do_delete(Name, [Pair | Rest], Acc) ->
+    do_delete(Name, Rest, [Pair | Acc]);
+do_delete(_, [], Acc) ->
+    lists:reverse(Acc).
 
 -spec do_get(binary(), nhttp_lib:headers(), Default) -> binary() | Default.
-do_get(Name, [{Name, Value} | _], _Default) -> Value;
-do_get(Name, [_ | Rest], Default) -> do_get(Name, Rest, Default);
-do_get(_, [], Default) -> Default.
+do_get(Name, [{Name, Value} | _], _Default) ->
+    Value;
+do_get(Name, [{Stored, Value} | Rest], Default) when byte_size(Stored) =:= byte_size(Name) ->
+    case lower_eq(Stored, Name, byte_size(Name) - 1) of
+        true -> Value;
+        false -> do_get(Name, Rest, Default)
+    end;
+do_get(Name, [_ | Rest], Default) ->
+    do_get(Name, Rest, Default);
+do_get(_, [], Default) ->
+    Default.
 
 -spec do_has(binary(), nhttp_lib:headers()) -> boolean().
-do_has(Name, [{Name, _} | _]) -> true;
-do_has(Name, [_ | Rest]) -> do_has(Name, Rest);
-do_has(_, []) -> false.
+do_has(Name, [{Name, _} | _]) ->
+    true;
+do_has(Name, [{Stored, _} | Rest]) when byte_size(Stored) =:= byte_size(Name) ->
+    lower_eq(Stored, Name, byte_size(Name) - 1) orelse do_has(Name, Rest);
+do_has(Name, [_ | Rest]) ->
+    do_has(Name, Rest);
+do_has(_, []) ->
+    false.
+
+-compile({inline, [lower_eq/3]}).
+-spec lower_eq(binary(), binary(), integer()) -> boolean().
+lower_eq(_Stored, _Lower, -1) ->
+    true;
+lower_eq(Stored, Lower, I) ->
+    byte_lower_eq(binary:at(Stored, I), binary:at(Lower, I)) andalso
+        lower_eq(Stored, Lower, I - 1).
+
+-compile({inline, [byte_lower_eq/2]}).
+-spec byte_lower_eq(byte(), byte()) -> boolean().
+byte_lower_eq(C, C) -> true;
+byte_lower_eq(C, L) when C >= $A, C =< $Z -> C + 32 =:= L;
+byte_lower_eq(_, _) -> false.
 
 -compile({inline, [to_lower_byte/1]}).
 -spec to_lower_byte(byte()) -> byte().

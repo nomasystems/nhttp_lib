@@ -27,6 +27,7 @@ all() ->
         {group, section_5_field_syntax},
         {group, section_6_message_body},
         {group, section_6_1_transfer_encoding},
+        {group, section_6_3_single_framing_field},
         {group, section_7_transfer_codings},
         {group, section_11_response_splitting}
     ].
@@ -79,6 +80,12 @@ groups() ->
             reject_chunk_data_without_crlf_request,
             reject_chunk_data_without_crlf_response,
             short_chunk_data_returns_more
+        ]},
+        {section_6_3_single_framing_field, [parallel], [
+            encode_response_mixed_case_content_length,
+            encode_response_mixed_case_transfer_encoding,
+            encode_request_mixed_case_content_length,
+            encode_request_mixed_case_transfer_encoding
         ]},
         {section_11_response_splitting, [parallel], [
             reject_field_value_injection,
@@ -551,6 +558,80 @@ short_chunk_data_returns_more(_Config) ->
     ?assertEqual(byte_size(Valid), 67).
 
 %%%-----------------------------------------------------------------------------
+%%% Section 6.3 - One framing field, whatever the case of the name
+%%%
+%%% RFC 9110 Section 5.1: a field name is case-insensitive. RFC 9110
+%%% Section 5.6.2 admits A-Z in a token, so a caller can supply
+%%% `Content-Length' or `Transfer-Encoding' and the encoder writes the name
+%%% unchanged. The encoder must still see the field it was given.
+%%%-----------------------------------------------------------------------------
+
+%% RFC 9110 Section 8.6: "a sender MUST NOT forward a message with a
+%% Content-Length header field value that is known to be incorrect". A
+%% generated second Content-Length puts two lengths on the wire for one body,
+%% so one of the two is incorrect.
+encode_response_mixed_case_content_length(_Config) ->
+    {ok, Io} = nhttp_h1:encode_response(#{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [{<<"Content-Length">>, <<"5">>}],
+        body => <<"hello">>
+    }),
+    Bin = iolist_to_binary(Io),
+    ?assertEqual(1, count_field(<<"content-length">>, Bin)),
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, nhttp_h1:parse_response(Bin)),
+    {ok, _, Consumed} = nhttp_h1:parse_response(Bin),
+    ?assertEqual(byte_size(Bin), Consumed).
+
+%% RFC 9112 Section 6.1: "A sender MUST NOT send a Content-Length header field
+%% in any message that contains a Transfer-Encoding header field". RFC 9112
+%% Section 6.3 item 3 names the risk in the message that breaks the rule: it
+%% "might indicate an attempt to perform request smuggling (Section 11.2) or
+%% response splitting (Section 11.1) and ought to be handled as an error".
+encode_response_mixed_case_transfer_encoding(_Config) ->
+    {ok, Io} = nhttp_h1:encode_response(#{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [{<<"Transfer-Encoding">>, <<"chunked">>}],
+        body => <<"5\r\nhello\r\n0\r\n\r\n">>
+    }),
+    Bin = iolist_to_binary(Io),
+    ?assertEqual(0, count_field(<<"content-length">>, Bin)),
+    ?assertEqual(1, count_field(<<"transfer-encoding">>, Bin)),
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, nhttp_h1:parse_response(Bin)),
+    {ok, _, Consumed} = nhttp_h1:parse_response(Bin),
+    ?assertEqual(byte_size(Bin), Consumed).
+
+%% RFC 9110 Section 8.6, as above, on the request side.
+encode_request_mixed_case_content_length(_Config) ->
+    {ok, Io} = nhttp_h1:encode_request(#{
+        method => post,
+        path => <<"/p">>,
+        headers => [{<<"Host">>, <<"example.com">>}, {<<"Content-Length">>, <<"5">>}],
+        body => <<"hello">>
+    }),
+    Bin = iolist_to_binary(Io),
+    ?assertEqual(1, count_field(<<"content-length">>, Bin)),
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, nhttp_h1:parse_request(Bin)),
+    {ok, _, Consumed} = nhttp_h1:parse_request(Bin),
+    ?assertEqual(byte_size(Bin), Consumed).
+
+%% RFC 9112 Section 6.1 and Section 6.3 item 3, as above, on the request side.
+encode_request_mixed_case_transfer_encoding(_Config) ->
+    {ok, Io} = nhttp_h1:encode_request(#{
+        method => post,
+        path => <<"/p">>,
+        headers => [{<<"Host">>, <<"example.com">>}, {<<"Transfer-Encoding">>, <<"chunked">>}],
+        body => <<"5\r\nhello\r\n0\r\n\r\n">>
+    }),
+    Bin = iolist_to_binary(Io),
+    ?assertEqual(0, count_field(<<"content-length">>, Bin)),
+    ?assertEqual(1, count_field(<<"transfer-encoding">>, Bin)),
+    ?assertMatch({ok, #{body := <<"hello">>}, _}, nhttp_h1:parse_request(Bin)),
+    {ok, _, Consumed} = nhttp_h1:parse_request(Bin),
+    ?assertEqual(byte_size(Bin), Consumed).
+
+%%%-----------------------------------------------------------------------------
 %%% Section 11.1 - Response Splitting
 %%%-----------------------------------------------------------------------------
 
@@ -742,4 +823,17 @@ find_header(Name, Headers) ->
     case lists:keyfind(LowerName, 1, [{string:lowercase(N), V} || {N, V} <- Headers]) of
         {_, Value} -> {ok, Value};
         false -> error
+    end.
+
+-spec count_field(binary(), binary()) -> non_neg_integer().
+count_field(LowerName, Bin) ->
+    Lines = binary:split(Bin, <<"\r\n">>, [global]),
+    length([Line || Line <- Lines, is_field_line(LowerName, Line)]).
+
+-spec is_field_line(binary(), binary()) -> boolean().
+is_field_line(LowerName, Line) ->
+    Size = byte_size(LowerName),
+    case Line of
+        <<Candidate:Size/binary, $:, _/binary>> -> string:lowercase(Candidate) =:= LowerName;
+        _ -> false
     end.
