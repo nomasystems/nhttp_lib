@@ -250,6 +250,9 @@ encoder never repairs the value and never strips a byte from it.
 -define(PT_CRLF, {?MODULE, crlf_pattern}).
 -define(PT_COLON, {?MODULE, colon_pattern}).
 -define(PT_URI_DELIMS, {?MODULE, uri_delims_pattern}).
+-define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
+-define(PT_FIELD_VALUE_BAD, {?MODULE, field_value_bad_pattern}).
+-define(PT_TARGET_BAD, {?MODULE, target_bad_pattern}).
 
 -on_load(init_patterns/0).
 
@@ -260,7 +263,30 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_URI_DELIMS, binary:compile_pattern([<<"/">>, <<"?">>, <<"#">>])
     ),
+    ok = persistent_term:put(?PT_NON_TCHAR, binary:compile_pattern(non_tchar_bytes())),
+    ok = persistent_term:put(
+        ?PT_FIELD_VALUE_BAD, binary:compile_pattern(field_value_bad_bytes())
+    ),
+    ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
     ok.
+
+%% RFC 9110 Section 5.6.2: a token is 1*tchar. The pattern is the complement
+%% of the tchar set, so `nhttp_headers:is_tchar/1` stays the one definition.
+-spec non_tchar_bytes() -> [binary(), ...].
+non_tchar_bytes() ->
+    [<<C>> || C <- lists:seq(0, 255), not nhttp_headers:is_tchar(C)].
+
+%% RFC 9110 Section 5.5: a field value is *( field-vchar [ 1*( SP / HTAB )
+%% field-vchar ] ), so every control byte other than HTAB, and DEL, is out.
+-spec field_value_bad_bytes() -> [binary(), ...].
+field_value_bad_bytes() ->
+    [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
+
+%% RFC 9112 Section 3.2: a request target carries no whitespace and no
+%% control byte.
+-spec target_bad_bytes() -> [binary(), ...].
+target_bad_bytes() ->
+    [<<C>> || C <- lists:seq(16#00, 16#20)] ++ [<<16#7F>>].
 
 %%%-----------------------------------------------------------------------------
 %% PARSING
@@ -644,11 +670,11 @@ encode_request(#{method := Method, path := Path} = Req) ->
     Headers = maps:get(headers, Req, []),
     maybe
         ok ?= validate_request_target(Path),
-        ok ?= validate_headers_out(Headers),
         Version = maps:get(version, Req, http1_1),
         Body = maps:get(body, Req, <<>>),
         Len = iolist_size(Body),
         FinalHeaders = maybe_add_content_length(Headers, Len, Len > 0),
+        {ok, EncHeaders} ?= encode_headers(FinalHeaders),
         {ok, [
             nhttp_lib:encode_method(Method),
             <<" ">>,
@@ -656,7 +682,7 @@ encode_request(#{method := Method, path := Path} = Req) ->
             <<" ">>,
             encode_version(Version),
             <<"\r\n">>,
-            encode_headers(FinalHeaders),
+            EncHeaders,
             <<"\r\n">>,
             Body
         ]}
@@ -709,12 +735,12 @@ encode_response(#{status := Status} = Resp, EncOpts) ->
     Headers = maps:get(headers, Resp, []),
     maybe
         ok ?= validate_reason_phrase(Reason),
-        ok ?= validate_headers_out(Headers),
         Version = maps:get(version, Resp, http1_1),
         Body = maps:get(body, Resp, <<>>),
         FinalHeaders = maybe_add_content_length(
             Headers, iolist_size(Body), allows_content_length(Status, EncOpts)
         ),
+        {ok, EncHeaders} ?= encode_headers(FinalHeaders),
         {ok, [
             encode_version(Version),
             <<" ">>,
@@ -722,7 +748,7 @@ encode_response(#{status := Status} = Resp, EncOpts) ->
             <<" ">>,
             Reason,
             <<"\r\n">>,
-            encode_headers(FinalHeaders),
+            EncHeaders,
             <<"\r\n">>,
             Body
         ]}
@@ -739,7 +765,7 @@ to validation. See `encode_response/1` for the rejected byte classes.
     {ok, iolist()} | {error, encode_error()}.
 encode_response_head(Version, Status, Headers) ->
     maybe
-        ok ?= validate_headers_out(Headers),
+        {ok, EncHeaders} ?= encode_headers(Headers),
         {ok, [
             encode_version(Version),
             <<" ">>,
@@ -747,7 +773,7 @@ encode_response_head(Version, Status, Headers) ->
             <<" ">>,
             reason_phrase(Status),
             <<"\r\n">>,
-            encode_headers(Headers),
+            EncHeaders,
             <<"\r\n">>
         ]}
     end.
@@ -925,9 +951,37 @@ detect_body_mode(Headers) ->
             end
     end.
 
--spec encode_headers(nhttp_lib:headers()) -> iolist().
+%% One walk validates and builds. The iolist reaches the caller only when the
+%% whole list passes, so the encoder never emits the prefix of a message it
+%% goes on to refuse.
+-spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
 encode_headers(Headers) ->
-    [[Name, <<": ">>, Value, <<"\r\n">>] || {Name, Value} <- Headers].
+    Lines = encode_lines(
+        Headers,
+        persistent_term:get(?PT_NON_TCHAR),
+        persistent_term:get(?PT_FIELD_VALUE_BAD)
+    ),
+    case Lines of
+        {error, _} = Err -> Err;
+        _ -> {ok, Lines}
+    end.
+
+%% The success value is a list and the failure value is a tagged tuple, so the
+%% recursion carries no per-element wrapper. Ten field lines cost ten cons
+%% cells, not ten cons cells and ten tuples.
+-spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
+    iolist() | {error, encode_error()}.
+encode_lines([], _NamePat, _ValuePat) ->
+    [];
+encode_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
+    maybe
+        ok ?= validate_field_name(Name, NamePat),
+        ok ?= validate_field_value(Value, ValuePat),
+        case encode_lines(Rest, NamePat, ValuePat) of
+            {error, _} = Err -> Err;
+            Tail -> [Name, <<": ">>, Value, <<"\r\n">> | Tail]
+        end
+    end.
 
 -spec encode_version(version()) -> binary().
 encode_version(http1_1) -> <<"HTTP/1.1">>;
@@ -1113,28 +1167,25 @@ finish_response(Resp, BodyRest, Headers, HeadersConsumed, Opts) ->
 get_all_content_lengths(Headers) ->
     [V || {<<"content-length">>, V} <- Headers].
 
--spec validate_headers_out(nhttp_lib:headers()) -> ok | {error, encode_error()}.
-validate_headers_out([]) ->
-    ok;
-validate_headers_out([{Name, Value} | Rest]) ->
-    maybe
-        ok ?= validate_field_name(Name),
-        ok ?= validate_field_value(Value),
-        validate_headers_out(Rest)
+%% RFC 9110 Section 5.6.2: field-name is a token, and a token is 1*tchar, so
+%% an empty name is not one. `binary:match/2` calls the empty binary a match
+%% for nothing, which makes the empty case a separate clause.
+-compile({inline, [validate_field_name/2, validate_field_value/2]}).
+
+-spec validate_field_name(binary(), binary:cp()) -> ok | {error, encode_error()}.
+validate_field_name(<<>>, _NamePat) ->
+    {error, {invalid_field_name, <<>>}};
+validate_field_name(Name, NamePat) ->
+    case binary:match(Name, NamePat) of
+        nomatch -> ok;
+        _ -> {error, {invalid_field_name, Name}}
     end.
 
--spec validate_field_name(binary()) -> ok | {error, encode_error()}.
-validate_field_name(Name) ->
-    case nhttp_headers:is_token(Name) of
-        true -> ok;
-        false -> {error, {invalid_field_name, Name}}
-    end.
-
--spec validate_field_value(binary()) -> ok | {error, encode_error()}.
-validate_field_value(Value) ->
-    case has_invalid_char(Value) of
-        false -> ok;
-        true -> {error, {invalid_field_value, Value}}
+-spec validate_field_value(binary(), binary:cp()) -> ok | {error, encode_error()}.
+validate_field_value(Value, ValuePat) ->
+    case binary:match(Value, ValuePat) of
+        nomatch -> ok;
+        _ -> {error, {invalid_field_value, Value}}
     end.
 
 -spec validate_reason_phrase(binary()) -> ok | {error, encode_error()}.
@@ -1147,28 +1198,17 @@ validate_reason_phrase(Reason) ->
     end.
 
 -spec validate_request_target(binary()) -> ok | {error, encode_error()}.
+validate_request_target(<<>>) ->
+    {error, {invalid_request_target, <<>>}};
 validate_request_target(Target) ->
-    case valid_request_target(Target) of
-        true -> ok;
-        false -> {error, {invalid_request_target, Target}}
+    case binary:match(Target, persistent_term:get(?PT_TARGET_BAD)) of
+        nomatch -> ok;
+        _ -> {error, {invalid_request_target, Target}}
     end.
 
 -spec has_invalid_char(binary()) -> boolean().
-has_invalid_char(<<>>) -> false;
-has_invalid_char(<<$\t, Rest/binary>>) -> has_invalid_char(Rest);
-has_invalid_char(<<C, _/binary>>) when C =< 16#1F -> true;
-has_invalid_char(<<16#7F, _/binary>>) -> true;
-has_invalid_char(<<_, Rest/binary>>) -> has_invalid_char(Rest).
-
--spec valid_request_target(binary()) -> boolean().
-valid_request_target(<<>>) -> false;
-valid_request_target(Target) -> not target_has_invalid_char(Target).
-
--spec target_has_invalid_char(binary()) -> boolean().
-target_has_invalid_char(<<>>) -> false;
-target_has_invalid_char(<<C, _/binary>>) when C =< 16#20 -> true;
-target_has_invalid_char(<<16#7F, _/binary>>) -> true;
-target_has_invalid_char(<<_, Rest/binary>>) -> target_has_invalid_char(Rest).
+has_invalid_char(Bin) ->
+    binary:match(Bin, persistent_term:get(?PT_FIELD_VALUE_BAD)) =/= nomatch.
 
 %% RFC 9112 Section 6.1: chunked is the final transfer coding, and a sender
 %% applies it at most once. Two recipients that disagree on the number of
