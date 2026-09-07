@@ -1,4 +1,4 @@
-.PHONY: all compile clean check test compliance cover doc binopt
+.PHONY: all compile clean check test compliance cover doc binopt fuzz
 
 # Tools
 REBAR3 := rebar3
@@ -38,6 +38,20 @@ doc:
 	$(REBAR3) ex_doc
 
 #==============================================================================
+# Fuzzing
+#==============================================================================
+
+# Long seeded campaign over the four wire-facing parsers. Override with
+# make fuzz ITERATIONS=200000 SEED=42
+ITERATIONS ?= 50000
+SEED ?= $(shell date +%s)
+
+fuzz:
+	@echo "fuzz campaign: seed=$(SEED) iterations=$(ITERATIONS) per target"
+	NHTTP_FUZZ_SEED=$(SEED) NHTTP_FUZZ_ITERATIONS=$(ITERATIONS) \
+		$(REBAR3) ct --dir test/fuzz --suite nhttp_fuzz_SUITE --group campaign
+
+#==============================================================================
 # Binary optimization analysis
 #==============================================================================
 
@@ -70,4 +84,7 @@ help:
 	@echo ""
 	@echo "  Analysis:"
 	@echo "    make binopt       - Analyze binary optimization opportunities"
+	@echo ""
+	@echo "  Fuzzing:"
+	@echo "    make fuzz         - Long seeded campaign (ITERATIONS=, SEED=)"
 	@echo ""

@@ -1,0 +1,2 @@
+# The empty input. The exact class of CVE-2026-46527: a degenerate input on a path that assumes a non-empty structure.
+

@@ -1,0 +1,2 @@
+# Defect L2: a DATA header that declares the full 24 bit length with no payload behind it.
+ffffff000000000001

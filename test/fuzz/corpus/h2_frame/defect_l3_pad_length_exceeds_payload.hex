@@ -1,0 +1,2 @@
+# Defect L3: DATA with PADDED set and a pad length that swallows the whole payload (RFC 9113 6.1).
+00000100080000000101
