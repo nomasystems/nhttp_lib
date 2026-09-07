@@ -248,9 +248,9 @@ encoder never repairs the value and never strips a byte from it.
 %% COMPILED PATTERNS
 %%%-----------------------------------------------------------------------------
 -define(PT_CRLF, {?MODULE, crlf_pattern}).
+-define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
 -define(PT_COLON, {?MODULE, colon_pattern}).
 -define(PT_URI_DELIMS, {?MODULE, uri_delims_pattern}).
--define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
 -define(PT_FIELD_VALUE_BAD, {?MODULE, field_value_bad_pattern}).
 -define(PT_TARGET_BAD, {?MODULE, target_bad_pattern}).
 
@@ -263,18 +263,15 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_URI_DELIMS, binary:compile_pattern([<<"/">>, <<"?">>, <<"#">>])
     ),
-    ok = persistent_term:put(?PT_NON_TCHAR, binary:compile_pattern(non_tchar_bytes())),
     ok = persistent_term:put(
         ?PT_FIELD_VALUE_BAD, binary:compile_pattern(field_value_bad_bytes())
     ),
     ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
+    %% `nhttp_headers` compiles the complement of the tchar set from its own
+    %% `is_tchar/1`. The encoder holds that same pattern under a local key, so
+    %% one definition governs both modules and the walk pays no remote call.
+    ok = persistent_term:put(?PT_NON_TCHAR, nhttp_headers:non_tchar_pattern()),
     ok.
-
-%% RFC 9110 Section 5.6.2: a token is 1*tchar. The pattern is the complement
-%% of the tchar set, so `nhttp_headers:is_tchar/1` stays the one definition.
--spec non_tchar_bytes() -> [binary(), ...].
-non_tchar_bytes() ->
-    [<<C>> || C <- lists:seq(0, 255), not nhttp_headers:is_tchar(C)].
 
 %% RFC 9110 Section 5.5: a field value is *( field-vchar [ 1*( SP / HTAB )
 %% field-vchar ] ), so every control byte other than HTAB, and DEL, is out.

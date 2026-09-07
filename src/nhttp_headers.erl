@@ -35,9 +35,29 @@ Key invariants:
     has/2,
     is_tchar/1,
     is_token/1,
+    non_tchar_pattern/0,
     set/3,
     to_lower/1
 ]).
+
+%%%-----------------------------------------------------------------------------
+%% COMPILED PATTERNS
+%%%-----------------------------------------------------------------------------
+-define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
+
+-on_load(init_patterns/0).
+
+-spec init_patterns() -> ok.
+init_patterns() ->
+    ok = persistent_term:put(?PT_NON_TCHAR, binary:compile_pattern(non_tchar_bytes())),
+    ok.
+
+%% RFC 9110 Section 5.6.2: a token is 1*tchar. The pattern is the complement
+%% of the tchar set, derived from `is_tchar/1` so that one definition governs
+%% every module that scans for a token.
+-spec non_tchar_bytes() -> [binary(), ...].
+non_tchar_bytes() ->
+    [<<C>> || C <- lists:seq(0, 255), not is_tchar(C)].
 
 %%%-----------------------------------------------------------------------------
 %% PUBLIC API
@@ -117,8 +137,21 @@ True iff `Bin` is a `token` per RFC 9110 §5.6.2: `token = 1*tchar`. An
 empty binary is not a token.
 """.
 -spec is_token(binary()) -> boolean().
-is_token(<<>>) -> false;
-is_token(Bin) -> is_token_chars(Bin).
+is_token(<<>>) ->
+    false;
+is_token(Bin) ->
+    binary:match(Bin, persistent_term:get(?PT_NON_TCHAR)) =:= nomatch.
+
+-doc """
+The compiled pattern that matches every octet that is not a `tchar`.
+
+A caller that scans many tokens in one pass reads the pattern once and
+passes it to `binary:match/2` for each one, which keeps the
+`persistent_term` lookup off the per-token path.
+""".
+-spec non_tchar_pattern() -> binary:cp().
+non_tchar_pattern() ->
+    persistent_term:get(?PT_NON_TCHAR).
 
 -doc """
 Replace every occurrence of `Name` with a single `{Name, Value}` entry.
@@ -219,15 +252,6 @@ do_get(_, [], Default) -> Default.
 do_has(Name, [{Name, _} | _]) -> true;
 do_has(Name, [_ | Rest]) -> do_has(Name, Rest);
 do_has(_, []) -> false.
-
--spec is_token_chars(binary()) -> boolean().
-is_token_chars(<<>>) ->
-    true;
-is_token_chars(<<C, Rest/binary>>) ->
-    case is_tchar(C) of
-        true -> is_token_chars(Rest);
-        false -> false
-    end.
 
 -compile({inline, [to_lower_byte/1]}).
 -spec to_lower_byte(byte()) -> byte().
