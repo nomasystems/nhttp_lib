@@ -205,6 +205,40 @@ prop_ws_max_message_size_cumulative() ->
         end
     ).
 
+-spec prop_ws_frame_cap_bounds_more() -> triq:property().
+prop_ws_frame_cap_bounds_more() ->
+    ?FORALL(
+        {Len, Cap},
+        {declared_length_gen(), int(1, 4096)},
+        begin
+            Header = masked_header(Len),
+            EffCap = max(Cap, 125),
+            case nhttp_ws_frame:decode_raw(Header, server, #{max_frame_size => Cap}) of
+                {more, N} -> N =< EffCap + byte_size(Header);
+                {error, {frame_too_large, Declared}} -> Declared =:= Len andalso Len > EffCap;
+                {error, _} -> false;
+                {ok, _Fin, _Opcode, _Payload, _Rest} -> Len =:= 0
+            end
+        end
+    ).
+
+-spec declared_length_gen() -> triq_dom:domain().
+declared_length_gen() ->
+    oneof([
+        int(0, 125),
+        int(126, 65535),
+        ?LET(N, int(16, 62), 1 bsl N),
+        ?LET(N, int(16, 62), (1 bsl N) - 1)
+    ]).
+
+-spec masked_header(non_neg_integer()) -> binary().
+masked_header(Len) when Len < 126 ->
+    <<1:1, 0:3, 2:4, 1:1, Len:7, 0:32>>;
+masked_header(Len) when Len < 65536 ->
+    <<1:1, 0:3, 2:4, 1:1, 126:7, Len:16, 0:32>>;
+masked_header(Len) ->
+    <<1:1, 0:3, 2:4, 1:1, 127:7, 0:1, Len:63, 0:32>>.
+
 -spec prop_ws_incremental_utf8_matches_whole() -> triq:property().
 prop_ws_incremental_utf8_matches_whole() ->
     ?FORALL(
