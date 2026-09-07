@@ -164,15 +164,9 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_NON_PATH_OCTET, binary:compile_pattern(non_path_octet_bytes())
     ),
-    %% RFC 6265 Section 4.1.1 defines cookie-name as a token, so the name scan
-    %% reuses the pattern that `nhttp_headers` compiles from its own
-    %% `is_tchar/1`. One definition governs every module that scans a token.
     ok = persistent_term:put(?PT_NON_TCHAR, nhttp_headers:non_tchar_pattern()),
     ok.
 
-%% RFC 6265 Section 4.1.1: cookie-octet is %x21 / %x23-2B / %x2D-3A / %x3C-5B /
-%% %x5D-7E. The pattern is the complement of that set, derived from the grammar
-%% so that one definition governs what the encoder accepts.
 -spec non_cookie_octet_bytes() -> [binary(), ...].
 non_cookie_octet_bytes() ->
     [<<C>> || C <- lists:seq(0, 255), not is_cookie_octet(C)].
@@ -185,8 +179,6 @@ is_cookie_octet(C) when C >= 16#3C, C =< 16#5B -> true;
 is_cookie_octet(C) when C >= 16#5D, C =< 16#7E -> true;
 is_cookie_octet(_C) -> false.
 
-%% RFC 6265 Section 4.1.1: path-value is <any CHAR except CTLs or ";">, and
-%% CHAR is US-ASCII, so every octet above %x7E is out too.
 -spec non_path_octet_bytes() -> [binary(), ...].
 non_path_octet_bytes() ->
     [<<C>> || C <- lists:seq(16#00, 16#1F)] ++
@@ -339,10 +331,6 @@ encode_set_cookie(#{name := Name, value := Value} = SetCookie) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - COOKIE ENCODING
 %%%-----------------------------------------------------------------------------
-%% One walk validates and builds, as in `nhttp_h1:encode_headers/1`. The
-%% success value is a list and the failure value is a tagged tuple, so the
-%% recursion carries no per-cookie wrapper, and the header reaches the caller
-%% only when every pair passes.
 -spec encode_cookie_pairs([t()], binary:cp(), binary:cp()) ->
     iolist() | {error, cookie_error()}.
 encode_cookie_pairs([], _NamePat, _OctetPat) ->
@@ -360,15 +348,11 @@ encode_cookie_pairs([#{name := Name, value := Value} | Rest], NamePat, OctetPat)
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - ENCODE VALIDATION (RFC 6265 SECTION 4.1.1)
 %%%-----------------------------------------------------------------------------
-%% The two scanners run for every cookie the caller encodes, so they are
-%% inlined into the walk in `encode_cookie_pairs/3`.
 -compile({inline, [validate_cookie_name/2, validate_cookie_value/2]}).
 
 -spec validate_cookie_name(binary(), binary:cp()) ->
     ok | {error, {invalid_cookie_name, name_violation()}}.
 validate_cookie_name(<<>>, _NamePat) ->
-    %% RFC 9110 Section 5.6.2: a token is 1*tchar, and `binary:match/2` calls
-    %% the empty binary a match for nothing, so the empty name is its own case.
     {error, {invalid_cookie_name, empty}};
 validate_cookie_name(Name, NamePat) ->
     case binary:match(Name, NamePat) of
@@ -376,9 +360,6 @@ validate_cookie_name(Name, NamePat) ->
         _ -> {error, {invalid_cookie_name, non_token_octet}}
     end.
 
-%% RFC 6265 Section 4.1.1: cookie-value is *cookie-octet, or the same inside a
-%% matched pair of DQUOTE. DQUOTE is not a cookie-octet, so one unscoped scan
-%% settles the plain value, and only a match at offset 0 can open a quoted one.
 -spec validate_cookie_value(binary(), binary:cp()) ->
     ok | {error, {invalid_cookie_value, value_violation()}}.
 validate_cookie_value(Value, OctetPat) ->
@@ -403,8 +384,6 @@ validate_quoted_cookie_value(Value, _Size, _OctetPat) ->
 quoted_or_bad_octet($") -> {error, {invalid_cookie_value, unbalanced_quote}};
 quoted_or_bad_octet(C) -> {error, {invalid_cookie_value, classify_cookie_octet(C)}}.
 
-%% The scan carries the offsets of the quotes rather than a stripped copy of
-%% the value, so a quoted value costs no sub-binary either.
 -spec scan_quoted_cookie_octets(binary(), non_neg_integer(), binary:cp()) ->
     ok | {error, {invalid_cookie_value, value_violation()}}.
 scan_quoted_cookie_octets(_Value, 2, _OctetPat) ->
@@ -417,9 +396,6 @@ scan_quoted_cookie_octets(Value, Size, OctetPat) ->
             {error, {invalid_cookie_value, classify_cookie_octet(binary:at(Value, Pos))}}
     end.
 
-%% The pattern is the complement of cookie-octet, so the octet it finds is one
-%% of %x00-20, %x22, %x2C, %x3B, %x5C, %x7F or %x80-FF. Those are exactly the
-%% three classes that `t:value_violation/0` names.
 -spec classify_cookie_octet(byte()) -> control_char | separator | non_ascii.
 classify_cookie_octet(C) when C =< 16#1F; C =:= 16#7F -> control_char;
 classify_cookie_octet(C) when C >= 16#80 -> non_ascii;
@@ -455,13 +431,9 @@ validate_path(_Path, 0) ->
 validate_path(Path, _Size) ->
     case binary:at(Path, 0) of
         $/ -> scan_path_octets(Path);
-        %% RFC 6265 Section 5.2.4: a user agent replaces any other value with
-        %% the default-path, so emitting one is a silent no-op.
         _ -> {error, {invalid_path, no_leading_slash}}
     end.
 
-%% The leading slash is itself a legal path octet, so the whole value goes
-%% through one scan.
 -spec scan_path_octets(binary()) -> ok | {error, {invalid_path, path_violation()}}.
 scan_path_octets(Path) ->
     case binary:match(Path, persistent_term:get(?PT_NON_PATH_OCTET)) of
@@ -482,15 +454,10 @@ validate_domain(Domain) ->
         _ -> {error, {invalid_domain, empty}}
     end.
 
-%% RFC 6265 Section 5.2.3: a user agent strips one leading dot.
 -spec leading_dot_offset(binary()) -> 0..1.
 leading_dot_offset(<<$., _/binary>>) -> 1;
 leading_dot_offset(_) -> 0.
 
-%% RFC 1034 Section 3.5 with RFC 1123 Section 2.1: a label is letters, digits
-%% and hyphens, and it begins and ends with a letter or a digit. The walk
-%% carries offsets into the original binary, so a domain of any length and any
-%% label count costs no allocation.
 -spec scan_domain(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, {invalid_domain, domain_violation()}}.
 scan_domain(Domain, LabelStart, Size, Size) ->

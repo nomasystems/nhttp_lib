@@ -44,7 +44,9 @@ groups() ->
             declared_length_at_the_limit_accepted,
             declared_length_above_the_limit_refused,
             truncated_header_still_requests_header_bytes,
-            no_limit_leaves_the_declared_length_untouched
+            no_limit_leaves_the_declared_length_untouched,
+            complete_16_bit_frame_above_the_limit_refused,
+            complete_63_bit_frame_above_the_limit_refused
         ]},
         {section_5_5_control_frames, [parallel], [
             control_frame_of_125_bytes_accepted_under_a_smaller_limit,
@@ -53,7 +55,8 @@ groups() ->
         {section_5_2_reserved_bits, [parallel], [
             reserved_bit_fails_the_raw_masked_path,
             reserved_bit_fails_the_raw_unmasked_path,
-            reserved_bit_fails_the_message_path
+            reserved_bit_fails_the_message_path,
+            reserved_bit_fails_a_control_frame_on_the_raw_paths
         ]}
     ].
 
@@ -136,6 +139,33 @@ no_limit_leaves_the_declared_length_untouched(_Config) ->
     ),
     ?assertEqual({more, 1 bsl 60}, nhttp_ws_frame:decode_raw(Header, server)).
 
+complete_16_bit_frame_above_the_limit_refused(_Config) ->
+    Frame = masked_frame(126, 4097),
+    ?assertEqual(
+        {error, {frame_too_large, 4097}},
+        nhttp_ws_frame:decode_raw(Frame, server, #{max_frame_size => 4096})
+    ),
+    ?assertEqual(
+        {error, {frame_too_large, 4097}},
+        nhttp_ws_frame:decode(Frame, #{max_frame_size => 4096})
+    ).
+
+complete_63_bit_frame_above_the_limit_refused(_Config) ->
+    Frame = masked_frame(127, 4097),
+    ?assertEqual(
+        {error, {frame_too_large, 4097}},
+        nhttp_ws_frame:decode_raw(Frame, server, #{max_frame_size => 4096})
+    ),
+    ?assertEqual(
+        {error, {frame_too_large, 4097}},
+        nhttp_ws_frame:decode(Frame, #{max_frame_size => 4096})
+    ).
+
+masked_frame(126, Len) ->
+    <<1:1, 0:3, 2:4, 1:1, 126:7, Len:16, 0:32, 0:(Len * 8)>>;
+masked_frame(127, Len) ->
+    <<1:1, 0:3, 2:4, 1:1, 127:7, 0:1, Len:63, 0:32, 0:(Len * 8)>>.
+
 %%%-----------------------------------------------------------------------------
 %%% SECTION 5.5: CONTROL FRAMES
 %%%
@@ -179,3 +209,17 @@ reserved_bit_fails_the_raw_unmasked_path(_Config) ->
 reserved_bit_fails_the_message_path(_Config) ->
     Frame = <<1:1, 2:3, 1:4, 0:1, 0:7>>,
     ?assertEqual({error, reserved_bits_set}, nhttp_ws_frame:decode_unmasked(Frame)).
+
+reserved_bit_fails_a_control_frame_on_the_raw_paths(_Config) ->
+    Masked = <<1:1, 4:3, 9:4, 1:1, 0:7, 0:32>>,
+    ?assertEqual({error, reserved_bits_set}, nhttp_ws_frame:decode_raw(Masked, server)),
+    ?assertEqual(
+        {error, reserved_bits_set},
+        nhttp_ws_frame:decode_raw(Masked, server, #{max_frame_size => 4096})
+    ),
+    Unmasked = <<1:1, 1:3, 9:4, 0:1, 0:7>>,
+    ?assertEqual({error, reserved_bits_set}, nhttp_ws_frame:decode_raw(Unmasked, client)),
+    ?assertEqual(
+        {error, reserved_bits_set},
+        nhttp_ws_frame:decode_raw(Unmasked, client, #{max_frame_size => 4096})
+    ).

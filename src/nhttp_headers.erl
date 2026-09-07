@@ -52,9 +52,6 @@ init_patterns() ->
     ok = persistent_term:put(?PT_NON_TCHAR, binary:compile_pattern(non_tchar_bytes())),
     ok.
 
-%% RFC 9110 Section 5.6.2: a token is 1*tchar. The pattern is the complement
-%% of the tchar set, derived from `is_tchar/1` so that one definition governs
-%% every module that scans for a token.
 -spec non_tchar_bytes() -> [binary(), ...].
 non_tchar_bytes() ->
     [<<C>> || C <- lists:seq(0, 255), not is_tchar(C)].

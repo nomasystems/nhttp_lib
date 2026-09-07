@@ -267,20 +267,13 @@ init_patterns() ->
         ?PT_FIELD_VALUE_BAD, binary:compile_pattern(field_value_bad_bytes())
     ),
     ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
-    %% `nhttp_headers` compiles the complement of the tchar set from its own
-    %% `is_tchar/1`. The encoder holds that same pattern under a local key, so
-    %% one definition governs both modules and the walk pays no remote call.
     ok = persistent_term:put(?PT_NON_TCHAR, nhttp_headers:non_tchar_pattern()),
     ok.
 
-%% RFC 9110 Section 5.5: a field value is *( field-vchar [ 1*( SP / HTAB )
-%% field-vchar ] ), so every control byte other than HTAB, and DEL, is out.
 -spec field_value_bad_bytes() -> [binary(), ...].
 field_value_bad_bytes() ->
     [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
 
-%% RFC 9112 Section 3.2: a request target carries no whitespace and no
-%% control byte.
 -spec target_bad_bytes() -> [binary(), ...].
 target_bad_bytes() ->
     [<<C>> || C <- lists:seq(16#00, 16#20)] ++ [<<16#7F>>].
@@ -858,8 +851,6 @@ chunked_body_mode(Codings) ->
         false -> {error, unsupported_transfer_encoding}
     end.
 
-%% RFC 9112 Section 6.3 item 4: a response whose final transfer coding is not
-%% chunked is delimited by the connection close, so this path has no error.
 -spec chunked_body_stream([binary()]) -> body_stream().
 chunked_body_stream(Codings) ->
     case is_chunked_framing(Codings) of
@@ -948,9 +939,6 @@ detect_body_mode(Headers) ->
             end
     end.
 
-%% One walk validates and builds. The iolist reaches the caller only when the
-%% whole list passes, so the encoder never emits the prefix of a message it
-%% goes on to refuse.
 -spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
 encode_headers(Headers) ->
     Lines = encode_lines(
@@ -963,9 +951,6 @@ encode_headers(Headers) ->
         _ -> {ok, Lines}
     end.
 
-%% The success value is a list and the failure value is a tagged tuple, so the
-%% recursion carries no per-element wrapper. Ten field lines cost ten cons
-%% cells, not ten cons cells and ten tuples.
 -spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
     iolist() | {error, encode_error()}.
 encode_lines([], _NamePat, _ValuePat) ->
@@ -1164,9 +1149,6 @@ finish_response(Resp, BodyRest, Headers, HeadersConsumed, Opts) ->
 get_all_content_lengths(Headers) ->
     [V || {<<"content-length">>, V} <- Headers].
 
-%% RFC 9110 Section 5.6.2: field-name is a token, and a token is 1*tchar, so
-%% an empty name is not one. `binary:match/2` calls the empty binary a match
-%% for nothing, which makes the empty case a separate clause.
 -compile({inline, [validate_field_name/2, validate_field_value/2]}).
 
 -spec validate_field_name(binary(), binary:cp()) -> ok | {error, encode_error()}.
@@ -1187,8 +1169,6 @@ validate_field_value(Value, ValuePat) ->
 
 -spec validate_reason_phrase(binary()) -> ok | {error, encode_error()}.
 validate_reason_phrase(Reason) ->
-    %% RFC 9112 Section 4.1: 1*( HTAB / SP / VCHAR / obs-text ), and the
-    %% status-line grammar makes the whole element optional.
     case has_invalid_char(Reason) of
         false -> ok;
         true -> {error, {invalid_reason_phrase, Reason}}
@@ -1207,9 +1187,6 @@ validate_request_target(Target) ->
 has_invalid_char(Bin) ->
     binary:match(Bin, persistent_term:get(?PT_FIELD_VALUE_BAD)) =/= nomatch.
 
-%% RFC 9112 Section 6.1: chunked is the final transfer coding, and a sender
-%% applies it at most once. Two recipients that disagree on the number of
-%% chunked layers disagree on every byte after the first chunk.
 -spec is_chunked_framing([binary()]) -> boolean().
 is_chunked_framing(Codings) ->
     is_chunked_framing(Codings, 0).
@@ -2294,7 +2271,6 @@ skip_trailer_fields(Original, Pos, Consumed) ->
             {more, 2 - Available}
     end.
 
-%% RFC 9110 Section 5.6.1.2: a recipient ignores empty list elements.
 -spec split_transfer_codings([binary()], [binary()]) -> [binary()].
 split_transfer_codings([], Acc) ->
     Acc;
@@ -2304,9 +2280,6 @@ split_transfer_codings([Raw | Rest], Acc) ->
         Coding -> split_transfer_codings(Rest, [nhttp_headers:to_lower(Coding) | Acc])
     end.
 
-%% RFC 9110 Section 5.3: multiple field lines with the same name combine into
-%% one comma-separated list, in order of receipt. `absent` and `[]` differ:
-%% an empty list is a declared framing that names no transfer coding.
 -spec transfer_codings(nhttp_lib:headers()) -> absent | [binary()].
 transfer_codings(Headers) ->
     case [Value || {<<"transfer-encoding">>, Value} <- Headers] of

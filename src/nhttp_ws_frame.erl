@@ -47,7 +47,7 @@ code and reason.
     scan_utf8/2,
     validate_control_frame/3
 ]).
--compile({inline, [{decode_complete, 6}, {decode_unmasked_complete, 5}]}).
+-compile({inline, [{decode_complete, 6}, {decode_unmasked_complete, 5}, {effective_cap, 1}]}).
 
 -export_type([
     close_code/0,
@@ -138,7 +138,7 @@ declared payload length. Equivalent to `decode(Data, #{})`.
 """.
 -spec decode(binary()) -> decode_result().
 decode(Data) ->
-    decode(Data, #{}).
+    decode_message_masked(Data, infinity).
 
 -doc """
 Decode a masked WebSocket frame (client-to-server).
@@ -159,7 +159,7 @@ Equivalent to `decode_raw(Data, Role, #{})`.
 """.
 -spec decode_raw(binary(), client | server) -> raw_decode_result().
 decode_raw(Data, Role) ->
-    decode_raw(Data, Role, #{}).
+    decode_raw_role(Data, Role, infinity).
 
 -doc """
 Decode a raw frame, returning Fin, Opcode, Payload, Rest separately.
@@ -180,7 +180,7 @@ declared payload length. Equivalent to `decode_unmasked(Data, #{})`.
 """.
 -spec decode_unmasked(binary()) -> decode_result().
 decode_unmasked(Data) ->
-    decode_unmasked(Data, #{}).
+    decode_message_unmasked(Data, infinity).
 
 -doc """
 Decode an unmasked WebSocket frame (server-to-client).
