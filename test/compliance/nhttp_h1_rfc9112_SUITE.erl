@@ -94,7 +94,9 @@ groups() ->
             reject_reason_phrase_injection,
             reject_request_target_injection,
             valid_message_still_encodes,
-            single_header_terminator
+            single_header_terminator,
+            reject_field_injection_at_every_position,
+            first_offending_field_names_the_error
         ]}
     ].
 
@@ -828,6 +830,66 @@ single_header_terminator(_Config) ->
     }),
     ?assertEqual(1, count_terminators(iolist_to_binary(ReqIo))).
 
+
+%% RFC 9112 Section 11.1 and RFC 9110 Section 5.5 hold whatever the field count and
+%% whatever the position of the offending field. A message of two or more field lines
+%% is scanned as one subject, so this covers the joined subject at every boundary.
+reject_field_injection_at_every_position(_Config) ->
+    Clean = [
+        {<<"a">>, <<"1">>},
+        {<<"b">>, <<"2">>},
+        {<<"c">>, <<"3">>},
+        {<<"d">>, <<"4">>},
+        {<<"e">>, <<"5">>},
+        {<<"f">>, <<"6">>}
+    ],
+    Positions = lists:seq(1, length(Clean) + 1),
+    lists:foreach(
+        fun(Bad) ->
+            lists:foreach(
+                fun(Pos) ->
+                    Value = insert_field(Clean, Pos, {<<"x">>, Bad}),
+                    ?assertEqual(
+                        {error, {invalid_field_value, Bad}}, encode_both(Value)
+                    ),
+                    Name = insert_field(Clean, Pos, {Bad, <<"v">>}),
+                    ?assertEqual(
+                        {error, {invalid_field_name, Bad}}, encode_both(Name)
+                    ),
+                    Empty = insert_field(Clean, Pos, {<<>>, <<"v">>}),
+                    ?assertEqual(
+                        {error, {invalid_field_name, <<>>}}, encode_both(Empty)
+                    )
+                end,
+                Positions
+            )
+        end,
+        injection_values()
+    ).
+
+%% The encoder reports the first field line that breaks the grammar, reading each
+%% field line left to right and the name before the value. RFC 9110 Section 5.5 and
+%% Section 5.6.2 make both refusals mandatory, so only the order is at stake here.
+first_offending_field_names_the_error(_Config) ->
+    BadValue = <<"a\r\nSet-Cookie: evil=1">>,
+    BadName = <<"bad name">>,
+    Filler = [{<<"p">>, <<"1">>}, {<<"q">>, <<"2">>}, {<<"r">>, <<"3">>}, {<<"s">>, <<"4">>}],
+    ?assertEqual(
+        {error, {invalid_field_value, BadValue}},
+        encode_both([{<<"x">>, BadValue}, {BadName, <<"v">>} | Filler])
+    ),
+    ?assertEqual(
+        {error, {invalid_field_name, BadName}},
+        encode_both([{BadName, <<"v">>}, {<<"x">>, BadValue} | Filler])
+    ),
+    ?assertEqual(
+        {error, {invalid_field_value, BadValue}},
+        encode_both([{<<"x">>, BadValue}, {<<>>, <<"v">>} | Filler])
+    ),
+    ?assertEqual(
+        {error, {invalid_field_name, <<>>}},
+        encode_both([{<<>>, <<"v">>}, {<<"x">>, BadValue} | Filler])
+    ).
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
@@ -840,6 +902,24 @@ request_with_method(Method) ->
 non_tchar_octets() ->
     [0, 16#09, 16#0A, 16#0B, 16#0C, 16#0D, 16#7F, 16#80, 16#FF] ++
         [$", $(, $), $,, $/, $:, $;, $<, $=, $>, $?, $@, $[, $\\, $], ${, $}].
+
+
+-spec insert_field(nhttp_lib:headers(), pos_integer(), {binary(), binary()}) ->
+    nhttp_lib:headers().
+insert_field(Headers, Pos, Field) ->
+    lists:sublist(Headers, Pos - 1) ++ [Field | lists:nthtail(Pos - 1, Headers)].
+
+-spec encode_both(nhttp_lib:headers()) -> {error, term()}.
+encode_both(Headers) ->
+    Resp = #{status => 200, reason => <<"OK">>, headers => Headers},
+    Req = #{method => get, path => <<"/">>, headers => Headers},
+    Results = [
+        nhttp_h1:encode_response(Resp),
+        nhttp_h1:encode_response_head(http1_1, 200, Headers),
+        nhttp_h1:encode_request(Req)
+    ],
+    [Single] = lists:usort(Results),
+    Single.
 
 -spec injection_values() -> [binary()].
 injection_values() ->
