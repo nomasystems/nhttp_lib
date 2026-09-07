@@ -248,7 +248,7 @@ encoder never repairs the value and never strips a byte from it.
 %% COMPILED PATTERNS
 %%%-----------------------------------------------------------------------------
 -define(PT_CRLF, {?MODULE, crlf_pattern}).
--define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
+-define(PT_ENCODE_PATTERNS, {?MODULE, encode_patterns}).
 -define(PT_COLON, {?MODULE, colon_pattern}).
 -define(PT_URI_DELIMS, {?MODULE, uri_delims_pattern}).
 -define(PT_FIELD_VALUE_BAD, {?MODULE, field_value_bad_pattern}).
@@ -263,11 +263,12 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_URI_DELIMS, binary:compile_pattern([<<"/">>, <<"?">>, <<"#">>])
     ),
-    ok = persistent_term:put(
-        ?PT_FIELD_VALUE_BAD, binary:compile_pattern(field_value_bad_bytes())
-    ),
+    ValueBad = binary:compile_pattern(field_value_bad_bytes()),
+    ok = persistent_term:put(?PT_FIELD_VALUE_BAD, ValueBad),
     ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
-    ok = persistent_term:put(?PT_NON_TCHAR, nhttp_headers:non_tchar_pattern()),
+    ok = persistent_term:put(
+        ?PT_ENCODE_PATTERNS, {nhttp_headers:non_tchar_pattern(), ValueBad}
+    ),
     ok.
 
 -spec field_value_bad_bytes() -> [binary(), ...].
@@ -939,14 +940,10 @@ detect_body_mode(Headers) ->
 
 -spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
 encode_headers(Headers) ->
-    Lines = encode_lines(
-        Headers,
-        persistent_term:get(?PT_NON_TCHAR),
-        persistent_term:get(?PT_FIELD_VALUE_BAD)
-    ),
-    case Lines of
+    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+    case encode_lines(Headers, NamePat, ValuePat) of
         {error, _} = Err -> Err;
-        _ -> {ok, Lines}
+        Lines -> {ok, Lines}
     end.
 
 -spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
@@ -1216,15 +1213,22 @@ is_valid_chunk_ext_tail(Bin) -> skip_bws_to_semi(Bin).
 maybe_add_content_length(Headers, _Len, false) ->
     Headers;
 maybe_add_content_length(Headers, Len, true) ->
-    case
-        nhttp_headers:has(<<"content-length">>, Headers) orelse
-            nhttp_headers:has(<<"transfer-encoding">>, Headers)
-    of
+    case has_framing_field(Headers) of
         true ->
             Headers;
         false ->
             [{<<"content-length">>, integer_to_binary(Len)} | Headers]
     end.
+
+-spec has_framing_field(nhttp_lib:headers()) -> boolean().
+has_framing_field([{Name, _} | Rest]) when byte_size(Name) =:= byte_size(<<"content-length">>) ->
+    nhttp_headers:name_eq(Name, <<"content-length">>) orelse has_framing_field(Rest);
+has_framing_field([{Name, _} | Rest]) when byte_size(Name) =:= byte_size(<<"transfer-encoding">>) ->
+    nhttp_headers:name_eq(Name, <<"transfer-encoding">>) orelse has_framing_field(Rest);
+has_framing_field([_Pair | Rest]) ->
+    has_framing_field(Rest);
+has_framing_field([]) ->
+    false.
 
 -spec allows_content_length(nhttp_lib:status(), enc_opts()) -> boolean().
 allows_content_length(Status, EncOpts) ->

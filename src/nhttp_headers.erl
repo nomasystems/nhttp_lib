@@ -35,6 +35,7 @@ Key invariants:
     has/2,
     is_tchar/1,
     is_token/1,
+    name_eq/2,
     non_tchar_pattern/0,
     set/3,
     to_lower/1
@@ -140,6 +141,23 @@ is_token(Bin) ->
     binary:match(Bin, persistent_term:get(?PT_NON_TCHAR)) =:= nomatch.
 
 -doc """
+True iff two field names name the same field. Field names compare
+case-insensitively (RFC 9110 §5.1), so `<<"Content-Length">>` and
+`<<"content-length">>` name the same field.
+
+A caller that asks about a fixed set of names walks the list once and
+compares each stored name with this function, which keeps `to_lower/1`
+off the path.
+""".
+-spec name_eq(binary(), binary()) -> boolean().
+name_eq(Name, Name) ->
+    true;
+name_eq(Name, Other) when byte_size(Name) =:= byte_size(Other) ->
+    name_eq(Name, Other, byte_size(Name) - 1);
+name_eq(_Name, _Other) ->
+    false.
+
+-doc """
 The compiled pattern that matches every octet that is not a `tchar`.
 
 A caller that scans many tokens in one pass reads the pattern once and
@@ -240,7 +258,7 @@ to_lower(Bin) -> <<<<(to_lower_byte(C))>> || <<C>> <= Bin>>.
 do_delete(Name, [{Name, _} | Rest], Acc) ->
     do_delete(Name, Rest, Acc);
 do_delete(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
-    case lower_eq(Stored, Name, byte_size(Name) - 1) of
+    case name_eq(Stored, Name, byte_size(Name) - 1) of
         true -> do_delete(Name, Rest, Acc);
         false -> do_delete(Name, Rest, [Pair | Acc])
     end;
@@ -253,7 +271,7 @@ do_delete(_, [], Acc) ->
 do_get(Name, [{Name, Value} | _], _Default) ->
     Value;
 do_get(Name, [{Stored, Value} | Rest], Default) when byte_size(Stored) =:= byte_size(Name) ->
-    case lower_eq(Stored, Name, byte_size(Name) - 1) of
+    case name_eq(Stored, Name, byte_size(Name) - 1) of
         true -> Value;
         false -> do_get(Name, Rest, Default)
     end;
@@ -266,25 +284,24 @@ do_get(_, [], Default) ->
 do_has(Name, [{Name, _} | _]) ->
     true;
 do_has(Name, [{Stored, _} | Rest]) when byte_size(Stored) =:= byte_size(Name) ->
-    lower_eq(Stored, Name, byte_size(Name) - 1) orelse do_has(Name, Rest);
+    name_eq(Stored, Name, byte_size(Name) - 1) orelse do_has(Name, Rest);
 do_has(Name, [_ | Rest]) ->
     do_has(Name, Rest);
 do_has(_, []) ->
     false.
 
--compile({inline, [lower_eq/3]}).
--spec lower_eq(binary(), binary(), integer()) -> boolean().
-lower_eq(_Stored, _Lower, -1) ->
+-compile({inline, [name_eq/3]}).
+-spec name_eq(binary(), binary(), integer()) -> boolean().
+name_eq(_Stored, _Other, -1) ->
     true;
-lower_eq(Stored, Lower, I) ->
-    byte_lower_eq(binary:at(Stored, I), binary:at(Lower, I)) andalso
-        lower_eq(Stored, Lower, I - 1).
+name_eq(Stored, Other, I) ->
+    byte_name_eq(binary:at(Stored, I), binary:at(Other, I)) andalso
+        name_eq(Stored, Other, I - 1).
 
--compile({inline, [byte_lower_eq/2]}).
--spec byte_lower_eq(byte(), byte()) -> boolean().
-byte_lower_eq(C, C) -> true;
-byte_lower_eq(C, L) when C >= $A, C =< $Z -> C + 32 =:= L;
-byte_lower_eq(_, _) -> false.
+-compile({inline, [byte_name_eq/2]}).
+-spec byte_name_eq(byte(), byte()) -> boolean().
+byte_name_eq(C, C) -> true;
+byte_name_eq(C, D) -> to_lower_byte(C) =:= to_lower_byte(D).
 
 -compile({inline, [to_lower_byte/1]}).
 -spec to_lower_byte(byte()) -> byte().
