@@ -319,8 +319,9 @@ body_stream_from_response(_Method, _Status, Headers) ->
 
 -spec detect_response_body_stream(nhttp_lib:headers()) -> body_stream().
 detect_response_body_stream(Headers) ->
-    case transfer_codings(Headers) of
-        absent -> content_length_body_stream(Headers);
+    {TeValues, Lengths} = framing_field_values(Headers, [], []),
+    case transfer_coding_list(TeValues) of
+        absent -> content_length_body_stream(Lengths);
         Codings -> chunked_body_stream(Codings)
     end.
 
@@ -870,16 +871,13 @@ content_length_body_mode([First | Rest]) ->
         false -> {error, duplicate_content_length}
     end.
 
--spec content_length_body_stream(nhttp_lib:headers()) -> body_stream().
-content_length_body_stream(Headers) ->
-    case nhttp_headers:get(<<"content-length">>, Headers) of
-        undefined ->
-            until_close;
-        LenBin ->
-            case parse_content_length(LenBin) of
-                {ok, Len} -> {length, Len};
-                {error, _} -> until_close
-            end
+-spec content_length_body_stream([binary()]) -> body_stream().
+content_length_body_stream([]) ->
+    until_close;
+content_length_body_stream([LenBin | _]) ->
+    case parse_content_length(LenBin) of
+        {ok, Len} -> {length, Len};
+        {error, _} -> until_close
     end.
 
 -spec content_length_mode(binary()) -> body_mode() | {error, invalid_content_length}.
@@ -929,14 +927,14 @@ derive_authority(_Path, Headers) ->
         | invalid_content_length
         | unsupported_transfer_encoding}.
 detect_body_mode(Headers) ->
-    case transfer_codings(Headers) of
+    {TeValues, Lengths} = framing_field_values(Headers, [], []),
+    case transfer_coding_list(TeValues) of
         absent ->
-            content_length_body_mode(get_all_content_lengths(Headers));
+            content_length_body_mode(Lengths);
+        _Codings when Lengths =/= [] ->
+            {error, conflicting_framing};
         Codings ->
-            case nhttp_headers:has(<<"content-length">>, Headers) of
-                true -> {error, conflicting_framing};
-                false -> chunked_body_mode(Codings)
-            end
+            chunked_body_mode(Codings)
     end.
 
 -spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
@@ -1145,9 +1143,21 @@ finish_response(Resp, BodyRest, Headers, HeadersConsumed, Opts) ->
             Err
     end.
 
--spec get_all_content_lengths(nhttp_lib:headers()) -> [binary()].
-get_all_content_lengths(Headers) ->
-    [V || {<<"content-length">>, V} <- Headers].
+-spec framing_field_values(nhttp_lib:headers(), [binary()], [binary()]) ->
+    {[binary()], [binary()]}.
+framing_field_values([], TeValues, Lengths) ->
+    {lists:reverse(TeValues), lists:reverse(Lengths)};
+framing_field_values([{Name, Value} | Rest], TeValues, Lengths) when
+    Name =:= <<"transfer-encoding">>
+->
+    %% Guard equality, not a literal pattern: a pattern allocates a match context per field.
+    framing_field_values(Rest, [Value | TeValues], Lengths);
+framing_field_values([{Name, Value} | Rest], TeValues, Lengths) when
+    Name =:= <<"content-length">>
+->
+    framing_field_values(Rest, TeValues, [Value | Lengths]);
+framing_field_values([_Field | Rest], TeValues, Lengths) ->
+    framing_field_values(Rest, TeValues, Lengths).
 
 -compile({inline, [validate_field_name/2, validate_field_value/2]}).
 
@@ -2280,12 +2290,11 @@ split_transfer_codings([Raw | Rest], Acc) ->
         Coding -> split_transfer_codings(Rest, [nhttp_headers:to_lower(Coding) | Acc])
     end.
 
--spec transfer_codings(nhttp_lib:headers()) -> absent | [binary()].
-transfer_codings(Headers) ->
-    case [Value || {<<"transfer-encoding">>, Value} <- Headers] of
-        [] -> absent;
-        Values -> lists:reverse(transfer_codings(Values, []))
-    end.
+-spec transfer_coding_list([binary()]) -> absent | [binary()].
+transfer_coding_list([]) ->
+    absent;
+transfer_coding_list(Values) ->
+    lists:reverse(transfer_codings(Values, [])).
 
 -spec transfer_codings([binary()], [binary()]) -> [binary()].
 transfer_codings([], Acc) ->
