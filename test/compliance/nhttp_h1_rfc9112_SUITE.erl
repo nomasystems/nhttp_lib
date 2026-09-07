@@ -89,6 +89,7 @@ groups() ->
         ]},
         {section_11_response_splitting, [parallel], [
             reject_field_value_injection,
+            reject_caller_framing_field_injection,
             reject_field_name_injection,
             reject_reason_phrase_injection,
             reject_request_target_injection,
@@ -671,6 +672,46 @@ reject_field_value_injection(_Config) ->
             )
         end,
         injection_values()
+    ).
+
+%% RFC 9110 Section 5.5 and RFC 9112 Section 11.1, as above, on the two fields
+%% that frame the message. The encoder derives its own `Content-Length` from
+%% `integer_to_binary/1` and does not scan those octets. A `content-length` or
+%% a `transfer-encoding` that a caller supplies suppresses that derivation and
+%% carries caller octets, so it is scanned like any other field.
+reject_caller_framing_field_injection(_Config) ->
+    lists:foreach(
+        fun({Name, Value}) ->
+            Resp = #{
+                status => 200,
+                reason => <<"OK">>,
+                headers => [{Name, Value}],
+                body => <<"hello">>
+            },
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_response(Resp)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_response_head(http1_1, 200, [{Name, Value}])
+            ),
+            Req = #{
+                method => post,
+                path => <<"/">>,
+                headers => [{Name, Value}],
+                body => <<"hello">>
+            },
+            ?assertEqual(
+                {error, {invalid_field_value, Value}},
+                nhttp_h1:encode_request(Req)
+            )
+        end,
+        [
+            {N, V}
+         || N <- [<<"content-length">>, <<"Content-Length">>, <<"Transfer-Encoding">>],
+            V <- injection_values()
+        ]
     ).
 
 %% RFC 9110 Section 5.1: "field-name = token". RFC 9110 Section 5.6.2 defines
