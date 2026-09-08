@@ -87,7 +87,8 @@ groups() ->
             encode_response_mixed_case_content_length,
             encode_response_mixed_case_transfer_encoding,
             encode_request_mixed_case_content_length,
-            encode_request_mixed_case_transfer_encoding
+            encode_request_mixed_case_transfer_encoding,
+            encode_response_framing_field_after_other_fields
         ]},
         {section_11_response_splitting, [parallel], [
             reject_field_value_injection,
@@ -730,6 +731,37 @@ encode_request_mixed_case_transfer_encoding(_Config) ->
     ?assertMatch({ok, #{body := <<"hello">>}, _}, nhttp_h1:parse_request(Bin)),
     {ok, _, Consumed} = nhttp_h1:parse_request(Bin),
     ?assertEqual(byte_size(Bin), Consumed).
+
+%% RFC 9110 Section 8.6 and RFC 9112 Section 6.1, at a field position that is
+%% not the first. The encoder reads the framing question in the same walk that
+%% builds the field lines, so a framing field that other field lines precede
+%% must reach the same answer as one that stands alone.
+encode_response_framing_field_after_other_fields(_Config) ->
+    lists:foreach(
+        fun({Name, Value, Body, ClCount}) ->
+            {ok, Io} = nhttp_h1:encode_response(#{
+                status => 200,
+                reason => <<"OK">>,
+                headers => [
+                    {<<"Server">>, <<"nhttp">>},
+                    {<<"Cache-Control">>, <<"no-store">>},
+                    {Name, Value}
+                ],
+                body => Body
+            }),
+            Bin = iolist_to_binary(Io),
+            ?assertEqual(ClCount, count_field(<<"content-length">>, Bin)),
+            ?assertEqual(1, count_field(string:lowercase(Name), Bin)),
+            ?assertMatch({ok, #{body := <<"hello">>}, _}, nhttp_h1:parse_response(Bin)),
+            {ok, _, Consumed} = nhttp_h1:parse_response(Bin),
+            ?assertEqual(byte_size(Bin), Consumed)
+        end,
+        [
+            {<<"Content-Length">>, <<"5">>, <<"hello">>, 1},
+            {<<"content-length">>, <<"5">>, <<"hello">>, 1},
+            {<<"Transfer-Encoding">>, <<"chunked">>, <<"5\r\nhello\r\n0\r\n\r\n">>, 0}
+        ]
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 11.1 - Response Splitting

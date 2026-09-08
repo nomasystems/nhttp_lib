@@ -669,7 +669,7 @@ encode_request(#{method := Method, path := Path} = Req) ->
         Version = maps:get(version, Req, http1_1),
         Body = maps:get(body, Req, <<>>),
         Len = iolist_size(Body),
-        {ok, EncHeaders} ?= encode_headers(Headers),
+        {ok, EncHeaders} ?= encode_header_block(Headers, Len, Len > 0),
         {ok, [
             nhttp_lib:encode_method(Method),
             <<" ">>,
@@ -677,7 +677,7 @@ encode_request(#{method := Method, path := Path} = Req) ->
             <<" ">>,
             encode_version(Version),
             <<"\r\n">>,
-            prepend_content_length(Headers, Len, Len > 0, EncHeaders),
+            EncHeaders,
             <<"\r\n">>,
             Body
         ]}
@@ -770,7 +770,10 @@ encode_response(#{status := Status} = Resp, EncOpts) ->
         ok ?= validate_reason_phrase(Reason),
         Version = maps:get(version, Resp, http1_1),
         Body = maps:get(body, Resp, <<>>),
-        {ok, EncHeaders} ?= encode_headers(Headers),
+        {ok, EncHeaders} ?=
+            encode_header_block(
+                Headers, iolist_size(Body), allows_content_length(Status, EncOpts)
+            ),
         {ok, [
             encode_version(Version),
             <<" ">>,
@@ -778,12 +781,7 @@ encode_response(#{status := Status} = Resp, EncOpts) ->
             <<" ">>,
             Reason,
             <<"\r\n">>,
-            prepend_content_length(
-                Headers,
-                iolist_size(Body),
-                allows_content_length(Status, EncOpts),
-                EncHeaders
-            ),
+            EncHeaders,
             <<"\r\n">>,
             Body
         ]}
@@ -1058,12 +1056,50 @@ encode_body_chunk(Body) ->
         _ -> encode_chunk(Body)
     end.
 
+-spec encode_header_block(nhttp_lib:headers(), non_neg_integer(), boolean()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_header_block(Headers, _Len, false) ->
+    encode_headers(Headers);
+encode_header_block(Headers, Len, true) ->
+    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+    case encode_framed_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err ->
+            Err;
+        {framed, Lines} ->
+            {ok, Lines};
+        Lines ->
+            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
+            {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">> | Lines]}
+    end.
+
 -spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
 encode_headers(Headers) ->
     {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
     case encode_lines(Headers, NamePat, ValuePat) of
         {error, _} = Err -> Err;
         Lines -> {ok, Lines}
+    end.
+
+-spec encode_framed_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
+    iolist() | {framed, iolist()} | {error, encode_error()}.
+encode_framed_lines([], _NamePat, _ValuePat) ->
+    [];
+encode_framed_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
+    maybe
+        ok ?= validate_field_name(Name, NamePat),
+        ok ?= validate_field_value(Value, ValuePat),
+        case encode_framed_lines(Rest, NamePat, ValuePat) of
+            {error, _} = Err ->
+                Err;
+            {framed, Tail} ->
+                {framed, [Name, <<": ">>, Value, <<"\r\n">> | Tail]};
+            Tail ->
+                Line = [Name, <<": ">>, Value, <<"\r\n">> | Tail],
+                case is_framing_name(Name) of
+                    true -> {framed, Line};
+                    false -> Line
+                end
+        end
     end.
 
 -spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
@@ -1360,33 +1396,19 @@ is_forbidden_trailer_name(Name) when byte_size(Name) =:= byte_size(<<"host">>) -
 is_forbidden_trailer_name(_Name) ->
     false.
 
+-compile({inline, [is_framing_name/1]}).
+
+-spec is_framing_name(binary()) -> boolean().
+is_framing_name(Name) when byte_size(Name) =:= byte_size(<<"content-length">>) ->
+    nhttp_headers:name_eq(Name, <<"content-length">>);
+is_framing_name(Name) when byte_size(Name) =:= byte_size(<<"transfer-encoding">>) ->
+    nhttp_headers:name_eq(Name, <<"transfer-encoding">>);
+is_framing_name(_Name) ->
+    false.
+
 -spec is_valid_chunk_ext_tail(binary()) -> boolean().
 is_valid_chunk_ext_tail(<<>>) -> true;
 is_valid_chunk_ext_tail(Bin) -> skip_bws_to_semi(Bin).
-
--spec prepend_content_length(
-    nhttp_lib:headers(), non_neg_integer(), boolean(), iolist()
-) -> iolist().
-prepend_content_length(_Headers, _Len, false, EncHeaders) ->
-    EncHeaders;
-prepend_content_length(Headers, Len, true, EncHeaders) ->
-    case has_framing_field(Headers) of
-        true ->
-            EncHeaders;
-        false ->
-            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
-            [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">> | EncHeaders]
-    end.
-
--spec has_framing_field(nhttp_lib:headers()) -> boolean().
-has_framing_field([{Name, _} | Rest]) when byte_size(Name) =:= byte_size(<<"content-length">>) ->
-    nhttp_headers:name_eq(Name, <<"content-length">>) orelse has_framing_field(Rest);
-has_framing_field([{Name, _} | Rest]) when byte_size(Name) =:= byte_size(<<"transfer-encoding">>) ->
-    nhttp_headers:name_eq(Name, <<"transfer-encoding">>) orelse has_framing_field(Rest);
-has_framing_field([_Pair | Rest]) ->
-    has_framing_field(Rest);
-has_framing_field([]) ->
-    false.
 
 -spec allows_content_length(nhttp_lib:status(), enc_opts()) -> boolean().
 allows_content_length(Status, EncOpts) ->
