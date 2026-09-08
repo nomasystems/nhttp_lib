@@ -832,8 +832,8 @@ single_header_terminator(_Config) ->
 
 
 %% RFC 9112 Section 11.1 and RFC 9110 Section 5.5 hold whatever the field count and
-%% whatever the position of the offending field. A message of two or more field lines
-%% is scanned as one subject, so this covers the joined subject at every boundary.
+%% whatever the position of the offending field. The refusal must not depend on where
+%% the offending field sits in the list.
 reject_field_injection_at_every_position(_Config) ->
     Clean = [
         {<<"a">>, <<"1">>},

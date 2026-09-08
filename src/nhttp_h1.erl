@@ -98,25 +98,11 @@ The single octet path costs 0.013 reductions and 0.006 nanoseconds per
 octet, which makes the step from one alternative to two a factor of 8 in
 reductions.
 
-One call costs about 0.015 microseconds before it reads an octet. A message
-of six or more field lines costs two calls. One walk joins every field name
-into one subject and every field value into another, and one scan answers
-each subject. The test is per octet, so a join carries no boundary artifact,
-and the two scans answer what a scan of each field answers.
-
-A message of five or fewer field lines costs two calls per field line. The
-join allocates two accumulators, at 16 heap words, and it copies every octet
-once. A ten field request allocates 904 binary octets off the heap, where the
-per field form allocates none. Below six field lines that copy costs more
-wall clock than the calls it removes.
-
-A scan that matches does not report which field holds the octet. The encoder
-then walks the field lines one at a time and reports the first field that
-breaks the grammar. That walk is the refusal path.
-
-For a message of ordinary field values the call count sets the wall clock.
-Only a long value makes the octet count dominate. A ten field request costs
-about 78 reductions against 89 for the per field form.
+One call costs about 0.015 microseconds before it reads an octet, and the
+encoder makes two calls per field line. For a message of ordinary field
+values the call count sets the wall clock. Only a long value makes the
+octet count dominate. A ten field request costs about 90 reductions, of
+which about 60 belong to the scan.
 
 The `Content-Length` that the encoder derives skips both scans, because
 `integer_to_binary/1` wrote those octets and no caller supplied them. Every
@@ -983,40 +969,11 @@ detect_body_mode(Headers) ->
     end.
 
 -spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
-encode_headers([_, _, _, _, _, _ | _] = Headers) ->
-    case batched_lines(Headers, <<>>, <<>>) of
-        rescan -> per_field_headers(Headers);
-        Lines -> {ok, Lines}
-    end;
 encode_headers(Headers) ->
-    per_field_headers(Headers).
-
--spec per_field_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
-per_field_headers(Headers) ->
     {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
     case encode_lines(Headers, NamePat, ValuePat) of
         {error, _} = Err -> Err;
         Lines -> {ok, Lines}
-    end.
-
--spec batched_lines(nhttp_lib:headers(), binary(), binary()) -> iolist() | rescan.
-batched_lines([], Names, Values) ->
-    %% Sound only while every pattern member is one octet: a per octet test carries no
-    %% boundary artifact across a join, so these two scans answer what 2N per field ones do.
-    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
-    maybe
-        nomatch ?= binary:match(Names, NamePat),
-        nomatch ?= binary:match(Values, ValuePat),
-        []
-    else
-        {_Pos, _Len} -> rescan
-    end;
-batched_lines([{<<>>, _Value} | _Rest], _Names, _Values) ->
-    rescan;
-batched_lines([{Name, Value} | Rest], Names, Values) ->
-    case batched_lines(Rest, <<Names/binary, Name/binary>>, <<Values/binary, Value/binary>>) of
-        rescan -> rescan;
-        Lines -> [Name, <<": ">>, Value, <<"\r\n">> | Lines]
     end.
 
 -spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
