@@ -108,9 +108,9 @@ output.
 when
     Max :: pos_integer() | infinity.
 decompress(Data, gzip, Max) ->
-    decompress_gzip(Data, Max);
+    inflate_exact(Data, Max, ?ZLIB_GZIP_WINDOW_BITS);
 decompress(Data, deflate, Max) ->
-    decompress_deflate(Data, Max);
+    inflate_exact(Data, Max, ?ZLIB_DEFLATE_WINDOW_BITS);
 decompress(Data, identity, Max) ->
     case check_inflate_size(0, Data, Max) of
         ok -> {ok, Data};
@@ -201,20 +201,10 @@ compress_deflate(Data, Level) ->
 compress_gzip(Data, Level) ->
     with_zlib_stream(fun(Z) -> do_compress_gzip(Z, Data, Level) end).
 
--spec decompress_deflate(binary(), pos_integer() | infinity) ->
-    {ok, binary()} | {error, zlib_error()}.
-decompress_deflate(Data, Max) ->
-    inflate_exact(Data, Max, ?ZLIB_DEFLATE_WINDOW_BITS).
-
--spec decompress_gzip(binary(), pos_integer() | infinity) ->
-    {ok, binary()} | {error, zlib_error()}.
-decompress_gzip(Data, Max) ->
-    inflate_exact(Data, Max, ?ZLIB_GZIP_WINDOW_BITS).
-
 -spec inflate_exact(binary(), pos_integer() | infinity, pos_integer()) ->
     {ok, binary()} | {error, zlib_error()}.
 inflate_exact(Data, Max, WindowBits) ->
-    case inflate(Data, Max, WindowBits, error) of
+    case with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, error) end) of
         {error, data_error} -> inflate_failure(Data, Max, WindowBits);
         Result -> Result
     end.
@@ -222,15 +212,10 @@ inflate_exact(Data, Max, WindowBits) ->
 -spec inflate_failure(binary(), pos_integer() | infinity, pos_integer()) ->
     {error, zlib_error()}.
 inflate_failure(Data, Max, WindowBits) ->
-    case inflate(Data, Max, WindowBits, cut) of
+    case with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, cut) end) of
         {ok, _Prefix} -> {error, trailing_data};
         {error, _} = Error -> Error
     end.
-
--spec inflate(binary(), pos_integer() | infinity, pos_integer(), error | cut) ->
-    {ok, binary()} | {error, zlib_error()}.
-inflate(Data, Max, WindowBits, EndOfStream) ->
-    with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, EndOfStream) end).
 
 -spec do_inflate(
     zlib:zstream(), binary(), pos_integer() | infinity, pos_integer(), error | cut

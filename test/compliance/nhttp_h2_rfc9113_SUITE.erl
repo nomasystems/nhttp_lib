@@ -38,6 +38,8 @@ groups() ->
         {section_3_starting, [parallel], [
             server_accepts_valid_preface,
             server_rejects_invalid_preface,
+            server_accepts_preface_delivered_in_two_reads,
+            server_rejects_a_preface_prefix_that_cannot_complete,
             client_preface_contains_magic_and_settings,
             server_preface_is_settings_only
         ]},
@@ -125,6 +127,20 @@ server_rejects_invalid_preface(_Config) ->
     Conn0 = nhttp_h2:new(server),
     Bogus = <<"PRI * HTTP/1.1\r\n\r\nSM\r\n\r\n">>,
     {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn0, Bogus),
+    ok.
+
+server_accepts_preface_delivered_in_two_reads(_Config) ->
+    Conn0 = nhttp_h2:new(server),
+    {ok, Preface} = nhttp_h2_frame:preface(),
+    <<Head:10/binary, Tail/binary>> = iolist_to_binary(Preface),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, Head),
+    {ok, [], _Conn2} = nhttp_h2:recv(Conn1, Tail),
+    ok.
+
+server_rejects_a_preface_prefix_that_cannot_complete(_Config) ->
+    Conn0 = nhttp_h2:new(server),
+    Head = <<"PRI * HTTP/1.1">>,
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn0, Head),
     ok.
 
 client_preface_contains_magic_and_settings(_Config) ->

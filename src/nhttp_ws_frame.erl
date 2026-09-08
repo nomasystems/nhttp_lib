@@ -158,8 +158,10 @@ Decode a raw frame with no cap on the declared payload length.
 Equivalent to `decode_raw(Data, Role, #{})`.
 """.
 -spec decode_raw(binary(), client | server) -> raw_decode_result().
-decode_raw(Data, Role) ->
-    decode_raw_role(Data, Role, infinity).
+decode_raw(Data, client) ->
+    decode_raw_unmasked(Data, infinity);
+decode_raw(Data, server) ->
+    decode_raw_masked(Data, infinity).
 
 -doc """
 Decode a raw frame, returning Fin, Opcode, Payload, Rest separately.
@@ -171,8 +173,10 @@ A declared payload length above `max_frame_size` returns
 buffered (RFC 6455 §10.4).
 """.
 -spec decode_raw(binary(), client | server, frame_limits()) -> raw_decode_result().
-decode_raw(Data, Role, Limits) ->
-    decode_raw_role(Data, Role, effective_cap(Limits)).
+decode_raw(Data, client, Limits) ->
+    decode_raw_unmasked(Data, effective_cap(Limits));
+decode_raw(Data, server, Limits) ->
+    decode_raw_masked(Data, effective_cap(Limits)).
 
 -doc """
 Decode an unmasked WebSocket frame (server-to-client) with no cap on the
@@ -512,12 +516,6 @@ decode_raw_masked(<<_:8, 1:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
     end;
 decode_raw_masked(_, _Cap) ->
     {error, invalid_frame}.
-
--spec decode_raw_role(binary(), client | server, frame_cap()) -> raw_decode_result().
-decode_raw_role(Data, client, Cap) ->
-    decode_raw_unmasked(Data, Cap);
-decode_raw_role(Data, server, Cap) ->
-    decode_raw_masked(Data, Cap).
 
 -spec decode_raw_unmasked(binary(), frame_cap()) -> raw_decode_result().
 decode_raw_unmasked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
