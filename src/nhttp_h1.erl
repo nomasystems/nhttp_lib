@@ -218,6 +218,8 @@ question: whether one of those lines is `Content-Length` or
 """.
 -opaque prepared() :: #prepared{}.
 
+-type enc_pats() :: {NameBad :: binary:cp(), ValueBad :: binary:cp()}.
+
 -doc """
 Reason an encoder refuses to serialise a message.
 
@@ -784,12 +786,13 @@ encode_response(#{status := Status, trailers := Trailers} = Resp, EncOpts) when
 ->
     Reason = maps:get(reason, Resp, <<>>),
     Headers = maps:get(headers, Resp, []),
+    {_NameBad, ValueBad} = Pats = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        ok ?= validate_reason_phrase(Reason),
+        ok ?= validate_reason_phrase(Reason, ValueBad),
         ok ?= require_chunked_framing(Headers, Trailers),
         Version = maps:get(version, Resp, http1_1),
         Body = maps:get(body, Resp, <<>>),
-        {ok, EncHeaders} ?= encode_static_headers(Headers, EncOpts),
+        {ok, EncHeaders} ?= encode_static_headers(Headers, EncOpts, Pats),
         {ok, Terminator} ?= encode_trailers(Trailers),
         {ok, [
             encode_version(Version),
@@ -819,8 +822,9 @@ to validation. See `encode_response/1` for the rejected byte classes.
 -spec encode_response_head(version(), nhttp_lib:status(), nhttp_lib:headers()) ->
     {ok, iolist()} | {error, encode_error()}.
 encode_response_head(Version, Status, Headers) ->
+    Pats = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        {ok, EncHeaders} ?= encode_headers(Headers),
+        {ok, EncHeaders} ?= encode_headers(Headers, Pats),
         {ok, [
             encode_version(Version),
             <<" ">>,
@@ -844,8 +848,9 @@ here. The prepared block travels ahead of the field lines of this message.
 -spec encode_response_head(version(), nhttp_lib:status(), nhttp_lib:headers(), enc_opts()) ->
     {ok, iolist()} | {error, encode_error()}.
 encode_response_head(Version, Status, Headers, EncOpts) ->
+    Pats = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        {ok, EncHeaders} ?= encode_static_headers(Headers, EncOpts),
+        {ok, EncHeaders} ?= encode_static_headers(Headers, EncOpts, Pats),
         {ok, [
             encode_version(Version),
             <<" ">>,
@@ -1150,17 +1155,38 @@ encode_body_chunk(Body) ->
         _ -> encode_chunk(Body)
     end.
 
--compile({inline, [encode_request_1/2, encode_response_1/3, header_block/4]}).
+-compile({inline, [encode_request_1/2, encode_response_1/3, header_block/5]}).
 
 -spec encode_request_1(req(), prepared() | none) -> {ok, iolist()} | {error, encode_error()}.
-encode_request_1(#{method := Method, path := Path} = Req, Prepared) ->
+encode_request_1(#{method := Method, path := Path} = Req, Prepared) when
+    not is_map_key(body, Req)
+->
     Headers = maps:get(headers, Req, []),
+    Pats = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
         ok ?= validate_request_target(Path),
         Version = maps:get(version, Req, http1_1),
-        Body = maps:get(body, Req, <<>>),
+        {ok, EncHeaders} ?= header_block(Headers, 0, false, Prepared, Pats),
+        {ok, [
+            nhttp_lib:encode_method(Method),
+            <<" ">>,
+            Path,
+            <<" ">>,
+            encode_version(Version),
+            <<"\r\n">>,
+            EncHeaders,
+            <<"\r\n">>,
+            <<>>
+        ]}
+    end;
+encode_request_1(#{method := Method, path := Path, body := Body} = Req, Prepared) ->
+    Headers = maps:get(headers, Req, []),
+    Pats = persistent_term:get(?PT_ENCODE_PATTERNS),
+    maybe
+        ok ?= validate_request_target(Path),
+        Version = maps:get(version, Req, http1_1),
         Len = iolist_size(Body),
-        {ok, EncHeaders} ?= header_block(Headers, Len, Len > 0, Prepared),
+        {ok, EncHeaders} ?= header_block(Headers, Len, Len > 0, Prepared, Pats),
         {ok, [
             nhttp_lib:encode_method(Method),
             <<" ">>,
@@ -1179,8 +1205,9 @@ encode_request_1(#{method := Method, path := Path} = Req, Prepared) ->
 encode_response_1(#{status := Status} = Resp, EncOpts, Prepared) ->
     Reason = maps:get(reason, Resp, <<>>),
     Headers = maps:get(headers, Resp, []),
+    {_NameBad, ValueBad} = Pats = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        ok ?= validate_reason_phrase(Reason),
+        ok ?= validate_reason_phrase(Reason, ValueBad),
         Version = maps:get(version, Resp, http1_1),
         Body = maps:get(body, Resp, <<>>),
         {ok, EncHeaders} ?=
@@ -1188,7 +1215,8 @@ encode_response_1(#{status := Status} = Resp, EncOpts, Prepared) ->
                 Headers,
                 iolist_size(Body),
                 allows_content_length(Status, EncOpts),
-                Prepared
+                Prepared,
+                Pats
             ),
         {ok, [
             encode_version(Version),
@@ -1203,21 +1231,26 @@ encode_response_1(#{status := Status} = Resp, EncOpts, Prepared) ->
         ]}
     end.
 
--spec header_block(nhttp_lib:headers(), non_neg_integer(), boolean(), prepared() | none) ->
+-spec header_block(
+    nhttp_lib:headers(), non_neg_integer(), boolean(), prepared() | none, enc_pats()
+) ->
     {ok, iolist()} | {error, encode_error()}.
-header_block(Headers, Len, Allows, none) ->
-    encode_header_block(Headers, Len, Allows);
-header_block(Headers, Len, Allows, Prepared) ->
-    encode_prepared_block(Headers, Len, Allows, Prepared).
+header_block(Headers, Len, Allows, none, Pats) ->
+    encode_header_block(Headers, Len, Allows, Pats);
+header_block(Headers, Len, Allows, Prepared, Pats) ->
+    encode_prepared_block(Headers, Len, Allows, Prepared, Pats).
 
--spec encode_prepared_block(nhttp_lib:headers(), non_neg_integer(), boolean(), prepared()) ->
+-spec encode_prepared_block(
+    nhttp_lib:headers(), non_neg_integer(), boolean(), prepared(), enc_pats()
+) ->
     {ok, iolist()} | {error, encode_error()}.
-encode_prepared_block(Headers, _Len, false, #prepared{block = Block}) ->
-    prepend_block(Block, encode_headers(Headers));
-encode_prepared_block(Headers, _Len, true, #prepared{block = Block, framed = true}) ->
-    prepend_block(Block, encode_headers(Headers));
-encode_prepared_block(Headers, Len, true, #prepared{block = Block, framed = false}) ->
-    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+encode_prepared_block(Headers, _Len, false, #prepared{block = Block}, Pats) ->
+    prepend_block(Block, encode_headers(Headers, Pats));
+encode_prepared_block(Headers, _Len, true, #prepared{block = Block, framed = true}, Pats) ->
+    prepend_block(Block, encode_headers(Headers, Pats));
+encode_prepared_block(
+    Headers, Len, true, #prepared{block = Block, framed = false}, {NamePat, ValuePat}
+) ->
     case encode_framed_lines(Headers, NamePat, ValuePat) of
         {error, _} = Err ->
             Err;
@@ -1228,24 +1261,23 @@ encode_prepared_block(Headers, Len, true, #prepared{block = Block, framed = fals
             {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">>, Block | Lines]}
     end.
 
--spec encode_static_headers(nhttp_lib:headers(), enc_opts()) ->
+-spec encode_static_headers(nhttp_lib:headers(), enc_opts(), enc_pats()) ->
     {ok, iolist()} | {error, encode_error()}.
-encode_static_headers(Headers, #{prepared := #prepared{block = Block}}) ->
-    prepend_block(Block, encode_headers(Headers));
-encode_static_headers(Headers, _EncOpts) ->
-    encode_headers(Headers).
+encode_static_headers(Headers, #{prepared := #prepared{block = Block}}, Pats) ->
+    prepend_block(Block, encode_headers(Headers, Pats));
+encode_static_headers(Headers, _EncOpts, Pats) ->
+    encode_headers(Headers, Pats).
 
 -spec prepend_block(binary(), {ok, iolist()} | {error, encode_error()}) ->
     {ok, iolist()} | {error, encode_error()}.
 prepend_block(Block, {ok, Lines}) -> {ok, [Block | Lines]};
 prepend_block(_Block, {error, _} = Err) -> Err.
 
--spec encode_header_block(nhttp_lib:headers(), non_neg_integer(), boolean()) ->
+-spec encode_header_block(nhttp_lib:headers(), non_neg_integer(), boolean(), enc_pats()) ->
     {ok, iolist()} | {error, encode_error()}.
-encode_header_block(Headers, _Len, false) ->
-    encode_headers(Headers);
-encode_header_block(Headers, Len, true) ->
-    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+encode_header_block(Headers, _Len, false, Pats) ->
+    encode_headers(Headers, Pats);
+encode_header_block(Headers, Len, true, {NamePat, ValuePat}) ->
     case encode_framed_lines(Headers, NamePat, ValuePat) of
         {error, _} = Err ->
             Err;
@@ -1256,9 +1288,9 @@ encode_header_block(Headers, Len, true) ->
             {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">> | Lines]}
     end.
 
--spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
-encode_headers(Headers) ->
-    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+-spec encode_headers(nhttp_lib:headers(), enc_pats()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_headers(Headers, {NamePat, ValuePat}) ->
     case encode_lines(Headers, NamePat, ValuePat) of
         {error, _} = Err -> Err;
         Lines -> {ok, Lines}
@@ -1530,9 +1562,9 @@ validate_field_value(Value, ValuePat) ->
         _ -> {error, {invalid_field_value, Value}}
     end.
 
--spec validate_reason_phrase(binary()) -> ok | {error, encode_error()}.
-validate_reason_phrase(Reason) ->
-    case has_invalid_char(Reason) of
+-spec validate_reason_phrase(binary(), binary:cp()) -> ok | {error, encode_error()}.
+validate_reason_phrase(Reason, ValuePat) ->
+    case has_invalid_char(Reason, ValuePat) of
         false -> ok;
         true -> {error, {invalid_reason_phrase, Reason}}
     end.
@@ -1553,9 +1585,17 @@ validate_trailer_name(Name) ->
         true -> {error, {forbidden_trailer_field, Name}}
     end.
 
+-compile({inline, [has_invalid_char/1, has_invalid_char/2]}).
+
+%% Spelled out rather than delegated to the arity two form: the inliner folds
+%% one level, and the parse path calls this once per field line.
 -spec has_invalid_char(binary()) -> boolean().
 has_invalid_char(Bin) ->
     binary:match(Bin, persistent_term:get(?PT_FIELD_VALUE_BAD)) =/= nomatch.
+
+-spec has_invalid_char(binary(), binary:cp()) -> boolean().
+has_invalid_char(Bin, ValuePat) ->
+    binary:match(Bin, ValuePat) =/= nomatch.
 
 -spec is_chunked_framing([binary()]) -> boolean().
 is_chunked_framing(Codings) ->

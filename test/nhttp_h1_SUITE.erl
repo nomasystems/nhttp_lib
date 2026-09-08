@@ -71,6 +71,7 @@ groups() ->
         ]},
         {encoding, [parallel], [
             encode_simple_request,
+            encode_request_absent_body_matches_empty_body,
             encode_request_with_body,
             encode_request_custom_method,
             encode_request_all_methods,
@@ -460,6 +461,23 @@ encode_simple_request(_Config) ->
     Bin = iolist_to_binary(IOList),
     ?assertMatch(<<"GET / HTTP/1.1\r\n", _/binary>>, Bin),
     ?assertMatch({match, _}, re:run(Bin, <<"Host: localhost">>)).
+
+encode_request_absent_body_matches_empty_body(_Config) ->
+    Req = #{
+        method => get,
+        path => <<"/index.html">>,
+        headers => [{<<"Host">>, <<"localhost">>}, {<<"Accept">>, <<"*/*">>}]
+    },
+    {ok, Absent} = nhttp_h1:encode_request(Req),
+    {ok, Empty} = nhttp_h1:encode_request(Req#{body => <<>>}),
+    ?assertEqual(iolist_to_binary(Empty), iolist_to_binary(Absent)),
+    {ok, Prepared} = nhttp_h1:prepare_headers(maps:get(headers, Req)),
+    Opts = #{prepared => Prepared},
+    Bare = Req#{headers => []},
+    {ok, PrepAbsent} = nhttp_h1:encode_request(Bare, Opts),
+    {ok, PrepEmpty} = nhttp_h1:encode_request(Bare#{body => <<>>}, Opts),
+    ?assertEqual(iolist_to_binary(PrepEmpty), iolist_to_binary(PrepAbsent)),
+    ?assertEqual(iolist_to_binary(Absent), iolist_to_binary(PrepAbsent)).
 
 encode_request_with_body(_Config) ->
     Req = #{

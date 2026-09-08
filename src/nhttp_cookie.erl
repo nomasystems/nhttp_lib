@@ -150,8 +150,7 @@ so a re-encode also discards the rest.
 %%%-----------------------------------------------------------------------------
 %% COMPILED PATTERNS
 %%%-----------------------------------------------------------------------------
--define(PT_NON_COOKIE_OCTET, {?MODULE, non_cookie_octet_pattern}).
--define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
+-define(PT_ENCODE_PATTERNS, {?MODULE, encode_patterns}).
 -define(PT_NON_PATH_OCTET, {?MODULE, non_path_octet_pattern}).
 
 -on_load(init_patterns/0).
@@ -159,12 +158,12 @@ so a re-encode also discards the rest.
 -spec init_patterns() -> ok.
 init_patterns() ->
     ok = persistent_term:put(
-        ?PT_NON_COOKIE_OCTET, binary:compile_pattern(non_cookie_octet_bytes())
-    ),
-    ok = persistent_term:put(
         ?PT_NON_PATH_OCTET, binary:compile_pattern(non_path_octet_bytes())
     ),
-    ok = persistent_term:put(?PT_NON_TCHAR, nhttp_headers:non_tchar_pattern()),
+    ok = persistent_term:put(
+        ?PT_ENCODE_PATTERNS,
+        {nhttp_headers:non_tchar_pattern(), binary:compile_pattern(non_cookie_octet_bytes())}
+    ),
     ok.
 
 -spec non_cookie_octet_bytes() -> [binary(), ...].
@@ -238,8 +237,7 @@ Encode arbitrary data with Base64 before you put it in a cookie.
 encode_cookie([]) ->
     {ok, <<>>};
 encode_cookie([#{name := Name, value := Value} | Rest]) ->
-    NamePat = persistent_term:get(?PT_NON_TCHAR),
-    OctetPat = persistent_term:get(?PT_NON_COOKIE_OCTET),
+    {NamePat, OctetPat} = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
         ok ?= validate_cookie_name(Name, NamePat),
         ok ?= validate_cookie_value(Value, OctetPat),
@@ -320,9 +318,10 @@ bytes, which are often a session token.
 """.
 -spec encode_set_cookie(set_cookie()) -> {ok, binary()} | {error, set_cookie_error()}.
 encode_set_cookie(#{name := Name, value := Value} = SetCookie) ->
+    {NamePat, OctetPat} = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        ok ?= validate_cookie_name(Name, persistent_term:get(?PT_NON_TCHAR)),
-        ok ?= validate_cookie_value(Value, persistent_term:get(?PT_NON_COOKIE_OCTET)),
+        ok ?= validate_cookie_name(Name, NamePat),
+        ok ?= validate_cookie_value(Value, OctetPat),
         ok ?= validate_set_cookie_attrs(SetCookie),
         Base = <<Name/binary, "=", Value/binary>>,
         {ok, encode_set_cookie_attrs(Base, SetCookie)}

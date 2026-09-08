@@ -96,6 +96,7 @@ groups() ->
             reject_caller_framing_field_injection,
             reject_field_name_injection,
             reject_reason_phrase_injection,
+            reason_phrase_octet_set,
             reject_request_target_injection,
             valid_message_still_encodes,
             single_header_terminator,
@@ -927,6 +928,30 @@ reject_reason_phrase_injection(_Config) ->
     ),
     {ok, Io} = nhttp_h1:encode_response(#{status => 200, reason => <<>>, headers => []}),
     ?assertMatch(<<"HTTP/1.1 200 \r\n", _/binary>>, iolist_to_binary(Io)).
+
+%% RFC 9112 Section 4.1: "reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )".
+%% The refused set is every control octet other than HTAB, plus DEL. The
+%% encoder holds one compiled pattern for a field value and for a reason
+%% phrase, so this case pins the octet set that both readings share.
+reason_phrase_octet_set(_Config) ->
+    {_NameBad, ValueBad} = persistent_term:get({nhttp_h1, encode_patterns}),
+    ?assertEqual(persistent_term:get({nhttp_h1, field_value_bad_pattern}), ValueBad),
+    lists:foreach(
+        fun(C) ->
+            Reason = <<"a", C, "b">>,
+            Resp = #{status => 200, reason => Reason, headers => []},
+            case (C < 16#20 andalso C =/= $\t) orelse C =:= 16#7F of
+                true ->
+                    ?assertEqual(
+                        {error, {invalid_reason_phrase, Reason}},
+                        nhttp_h1:encode_response(Resp)
+                    );
+                false ->
+                    ?assertMatch({ok, _}, nhttp_h1:encode_response(Resp))
+            end
+        end,
+        lists:seq(16#00, 16#FF)
+    ).
 
 %% RFC 9112 Section 2.2: "A sender MUST NOT generate a bare CR (a CR character
 %% not immediately followed by LF) within any protocol elements other than the
