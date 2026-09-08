@@ -4,12 +4,8 @@
 QPACK static table for HTTP/3 (RFC 9204 Appendix A).
 
 This module provides the 99-entry static table used by QPACK header
-compression. Forward lookup by index uses compile-time pattern matching
-for O(1) access. Reverse lookups by name or name+value use maps cached
-in `persistent_term/0`, built once at module load via the `-on_load`
-callback below. Concurrent first-use callers therefore never race to
-build the maps and never trigger more than the single global GC pair
-caused by the two `persistent_term:put/2` calls.
+compression. Forward lookup by index and reverse lookup by name, or by
+name and value, are constant time.
 """.
 
 %%%-----------------------------------------------------------------------------

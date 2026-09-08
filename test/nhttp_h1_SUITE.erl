@@ -17,6 +17,7 @@ all() ->
         {group, request_parsing},
         {group, response_parsing},
         {group, encoding},
+        {group, prepared_headers},
         {group, streaming},
         {group, streaming_request},
         {group, chunked},
@@ -81,6 +82,18 @@ groups() ->
             encode_response_head,
             encode_response_existing_content_length,
             encode_response_transfer_encoding
+        ]},
+        {prepared_headers, [parallel], [
+            prepare_headers_accepts_an_empty_list,
+            prepare_headers_refuses_a_field_name_that_is_not_a_token,
+            prepare_headers_refuses_a_field_value_that_carries_a_control_byte,
+            prepared_request_writes_the_unprepared_octets,
+            prepared_response_writes_the_unprepared_octets,
+            prepared_response_head_writes_the_unprepared_octets,
+            prepared_block_precedes_the_fields_of_this_message,
+            prepared_framing_field_suppresses_the_derived_content_length,
+            prepared_block_reaches_a_response_with_trailers,
+            prepare_and_encode_agree_on_every_subject
         ]},
         {streaming, [sequence], [
             parse_partial_request_line,
@@ -568,6 +581,177 @@ encode_response_transfer_encoding(_Config) ->
     {ok, IOList} = nhttp_h1:encode_response(Resp),
     Bin = iolist_to_binary(IOList),
     ?assertEqual(nomatch, re:run(Bin, <<"content-length">>)).
+
+%%%-----------------------------------------------------------------------------
+%%% PREPARED HEADER BLOCK TESTS
+%%%-----------------------------------------------------------------------------
+
+prepare_headers_accepts_an_empty_list(_Config) ->
+    {ok, Prepared} = nhttp_h1:prepare_headers([]),
+    {ok, Io} = nhttp_h1:encode_response_head(http1_1, 200, [], #{prepared => Prepared}),
+    ?assertEqual(<<"HTTP/1.1 200 OK\r\n\r\n">>, iolist_to_binary(Io)).
+
+prepare_headers_refuses_a_field_name_that_is_not_a_token(_Config) ->
+    Fields = [{<<"Bad Name">>, <<"v">>}],
+    ?assertEqual({error, {invalid_field_name, <<"Bad Name">>}}, nhttp_h1:prepare_headers(Fields)),
+    ?assertEqual({error, {invalid_field_name, <<>>}}, nhttp_h1:prepare_headers([{<<>>, <<"v">>}])).
+
+prepare_headers_refuses_a_field_value_that_carries_a_control_byte(_Config) ->
+    Fields = [{<<"X-Split">>, <<"a\r\nEvil: yes">>}],
+    ?assertEqual(
+        {error, {invalid_field_value, <<"a\r\nEvil: yes">>}},
+        nhttp_h1:prepare_headers(Fields)
+    ).
+
+prepared_request_writes_the_unprepared_octets(_Config) ->
+    Fields = [{<<"Host">>, <<"localhost">>}, {<<"User-Agent">>, <<"acme/1.0">>}],
+    Req = #{method => get, path => <<"/index.html">>, headers => Fields},
+    {ok, Plain} = nhttp_h1:encode_request(Req),
+    {ok, Prepared} = nhttp_h1:prepare_headers(Fields),
+    {ok, Via} = nhttp_h1:encode_request(Req#{headers => []}, #{prepared => Prepared}),
+    ?assertEqual(iolist_to_binary(Plain), iolist_to_binary(Via)),
+    Post = Req#{method => post, body => <<"payload">>},
+    {ok, PlainPost} = nhttp_h1:encode_request(Post),
+    {ok, ViaPost} = nhttp_h1:encode_request(Post#{headers => []}, #{prepared => Prepared}),
+    ?assertEqual(iolist_to_binary(PlainPost), iolist_to_binary(ViaPost)),
+    {ok, Framed} = nhttp_h1:prepare_headers(Fields ++ [{<<"Content-Length">>, <<"7">>}]),
+    {ok, ViaFramed} = nhttp_h1:encode_request(Post#{headers => []}, #{prepared => Framed}),
+    {match, Once} = re:run(iolist_to_binary(ViaFramed), <<"content-length">>, [
+        caseless, global
+    ]),
+    ?assertEqual(1, length(Once)).
+
+prepared_response_writes_the_unprepared_octets(_Config) ->
+    Fields = [{<<"Server">>, <<"acme/1.0">>}, {<<"Cache-Control">>, <<"no-store">>}],
+    Resp = #{status => 200, reason => <<"OK">>, headers => Fields, body => <<"hello">>},
+    {ok, Plain} = nhttp_h1:encode_response(Resp),
+    {ok, Prepared} = nhttp_h1:prepare_headers(Fields),
+    {ok, Via} = nhttp_h1:encode_response(Resp#{headers => []}, #{prepared => Prepared}),
+    ?assertEqual(iolist_to_binary(Plain), iolist_to_binary(Via)).
+
+prepared_response_head_writes_the_unprepared_octets(_Config) ->
+    Fields = [{<<"Transfer-Encoding">>, <<"chunked">>}, {<<"Server">>, <<"acme/1.0">>}],
+    {ok, Plain} = nhttp_h1:encode_response_head(http1_1, 200, Fields),
+    {ok, Prepared} = nhttp_h1:prepare_headers(Fields),
+    {ok, Via} = nhttp_h1:encode_response_head(http1_1, 200, [], #{prepared => Prepared}),
+    ?assertEqual(iolist_to_binary(Plain), iolist_to_binary(Via)).
+
+prepared_block_precedes_the_fields_of_this_message(_Config) ->
+    {ok, Prepared} = nhttp_h1:prepare_headers([{<<"Server">>, <<"acme/1.0">>}]),
+    Resp = #{status => 200, reason => <<"OK">>, headers => [{<<"Date">>, <<"now">>}]},
+    {ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Prepared}),
+    ?assertEqual(
+        <<"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nServer: acme/1.0\r\nDate: now\r\n\r\n">>,
+        iolist_to_binary(Io)
+    ).
+
+prepared_framing_field_suppresses_the_derived_content_length(_Config) ->
+    {ok, Chunked} = nhttp_h1:prepare_headers([{<<"Transfer-Encoding">>, <<"chunked">>}]),
+    Resp = #{status => 200, reason => <<"OK">>, headers => [], body => <<"hello">>},
+    {ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Chunked}),
+    ?assertEqual(nomatch, re:run(iolist_to_binary(Io), <<"content-length">>, [caseless])),
+    {ok, Length} = nhttp_h1:prepare_headers([{<<"Content-Length">>, <<"5">>}]),
+    {ok, Io2} = nhttp_h1:encode_response(Resp, #{prepared => Length}),
+    {match, Matches} = re:run(iolist_to_binary(Io2), <<"content-length">>, [caseless, global]),
+    ?assertEqual(1, length(Matches)).
+
+prepared_block_reaches_a_response_with_trailers(_Config) ->
+    {ok, Prepared} = nhttp_h1:prepare_headers([{<<"Server">>, <<"acme/1.0">>}]),
+    Resp = #{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [{<<"Transfer-Encoding">>, <<"chunked">>}],
+        body => <<"hello">>,
+        trailers => [{<<"X-Checksum">>, <<"abc">>}]
+    },
+    {ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Prepared}),
+    Bin = iolist_to_binary(Io),
+    ?assertMatch({match, _}, re:run(Bin, <<"Server: acme/1.0">>)),
+    ?assertMatch({match, _}, re:run(Bin, <<"X-Checksum: abc">>)).
+
+%% Rule 4 of the task: one validator, proved by differential and not by
+%% inspection. Every subject runs alone, before a bad field value, and after a
+%% valid field line, so the order of refusal is compared as well.
+prepare_and_encode_agree_on_every_subject(_Config) ->
+    Subjects = [[{Name, <<"v">>}] || Name <- name_subjects()] ++ value_subjects(),
+    Fields = lists:append([arrangements(S) || S <- Subjects]),
+    ct:pal("~p field lists over ~p subjects", [length(Fields), length(Subjects)]),
+    ?assert(length(Fields) > 50000),
+    ?assertEqual([], lists:append([disagreement(F) || F <- Fields])).
+
+arrangements([{Name, Value}]) ->
+    [
+        [{Name, Value}],
+        [{Name, Value}, {<<"X-After">>, <<"bad\r\nvalue">>}],
+        [{<<"Host">>, <<"example.com">>}, {Name, Value}]
+    ].
+
+disagreement(Fields) ->
+    Direct = nhttp_h1:encode_response_head(http1_1, 200, Fields),
+    case {nhttp_h1:prepare_headers(Fields), Direct} of
+        {{error, Same}, {error, Same}} ->
+            [];
+        {{ok, Prepared}, {ok, Io}} ->
+            Via = nhttp_h1:encode_response_head(http1_1, 200, [], #{prepared => Prepared}),
+            case Via of
+                {ok, Io2} ->
+                    same_octets(iolist_to_binary(Io), iolist_to_binary(Io2), Fields);
+                Other ->
+                    [{prepared_path_refused, Fields, Other}]
+            end;
+        Other ->
+            [{disagreed, Fields, Other}]
+    end.
+
+same_octets(Bin, Bin, _Fields) -> [];
+same_octets(Bin, Other, Fields) -> [{octets, Fields, Bin, Other}].
+
+%% The static table is the field name set this tree already carries. It holds
+%% the two pseudo-header names as well, which HTTP/1.1 refuses.
+name_subjects() ->
+    Names = lists:usort([
+        Name
+     || I <- lists:seq(0, nhttp_qpack_static_table:size() - 1),
+        {ok, {Name, _Value}} <- [nhttp_qpack_static_table:lookup(I)]
+    ]),
+    Cased = [titlecase_name(N) || N <- Names],
+    Base = lists:usort(Names ++ Cased) ++ long_names(),
+    Base ++ lists:append([mutations(N) || N <- Base]).
+
+value_subjects() ->
+    Value = <<"the quick brown fox jumps over">>,
+    [[{<<"X-Subject">>, Mutant}] || Mutant <- [Value | mutations(Value)]].
+
+long_names() ->
+    Unit = <<"x-acme-long-field-name-segment-">>,
+    [long_name(Unit, Len) || Len <- [31, 47, 79, 128, 200]].
+
+long_name(Unit, Len) ->
+    Repeats = (Len div byte_size(Unit)) + 1,
+    binary:part(binary:copy(Unit, Repeats), 0, Len).
+
+mutations(Subject) ->
+    [
+        mutate(Subject, Pos, Octet)
+     || Pos <- lists:seq(0, byte_size(Subject) - 1), Octet <- hostile_octets()
+    ].
+
+mutate(Subject, Pos, Octet) ->
+    <<Head:Pos/binary, _:1/binary, Tail/binary>> = Subject,
+    <<Head/binary, Octet, Tail/binary>>.
+
+hostile_octets() ->
+    [$:, $\s, $\t, $\r, $\n, 0, 16#7F, $(, $,, $"].
+
+titlecase_name(Name) ->
+    Segments = binary:split(Name, <<"-">>, [global]),
+    lists:foldl(fun titlecase_join/2, <<>>, Segments).
+
+titlecase_join(Segment, <<>>) -> titlecase_segment(Segment);
+titlecase_join(Segment, Acc) -> <<Acc/binary, "-", (titlecase_segment(Segment))/binary>>.
+
+titlecase_segment(<<C, Rest/binary>>) when C >= $a, C =< $z -> <<(C - 32), Rest/binary>>;
+titlecase_segment(Segment) -> Segment.
 
 %%%-----------------------------------------------------------------------------
 %%% STREAMING TESTS (stateless - test {more, N} returns)

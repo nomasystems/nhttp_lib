@@ -88,7 +88,8 @@ groups() ->
             encode_response_mixed_case_transfer_encoding,
             encode_request_mixed_case_content_length,
             encode_request_mixed_case_transfer_encoding,
-            encode_response_framing_field_after_other_fields
+            encode_response_framing_field_after_other_fields,
+            encode_response_prepared_framing_field
         ]},
         {section_11_response_splitting, [parallel], [
             reject_field_value_injection,
@@ -762,6 +763,44 @@ encode_response_framing_field_after_other_fields(_Config) ->
             {<<"Transfer-Encoding">>, <<"chunked">>, <<"5\r\nhello\r\n0\r\n\r\n">>, 0}
         ]
     ).
+
+%% RFC 9112 Section 6.3: a message carries one framing field, never two. A
+%% prepared block is part of the header section, so a framing field inside it
+%% suppresses the derived Content-Length exactly as a message field does.
+encode_response_prepared_framing_field(_Config) ->
+    lists:foreach(
+        fun({Name, Value, Body, ClCount}) ->
+            {ok, Prepared} = nhttp_h1:prepare_headers([
+                {<<"Server">>, <<"nhttp">>},
+                {Name, Value}
+            ]),
+            {ok, Io} = nhttp_h1:encode_response(
+                #{
+                    status => 200,
+                    reason => <<"OK">>,
+                    headers => [{<<"Cache-Control">>, <<"no-store">>}],
+                    body => Body
+                },
+                #{prepared => Prepared}
+            ),
+            Bin = iolist_to_binary(Io),
+            ?assertEqual(ClCount, count_field(<<"content-length">>, Bin)),
+            ?assertEqual(1, count_field(string:lowercase(Name), Bin)),
+            {ok, #{body := <<"hello">>}, Consumed} = nhttp_h1:parse_response(Bin),
+            ?assertEqual(byte_size(Bin), Consumed)
+        end,
+        [
+            {<<"Content-Length">>, <<"5">>, <<"hello">>, 1},
+            {<<"content-length">>, <<"5">>, <<"hello">>, 1},
+            {<<"Transfer-Encoding">>, <<"chunked">>, <<"5\r\nhello\r\n0\r\n\r\n">>, 0}
+        ]
+    ),
+    {ok, Plain} = nhttp_h1:prepare_headers([{<<"Server">>, <<"nhttp">>}]),
+    {ok, Derived} = nhttp_h1:encode_response(
+        #{status => 200, reason => <<"OK">>, headers => [], body => <<"hello">>},
+        #{prepared => Plain}
+    ),
+    ?assertEqual(1, count_field(<<"content-length">>, iolist_to_binary(Derived))).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 11.1 - Response Splitting

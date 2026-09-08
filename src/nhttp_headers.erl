@@ -146,8 +146,7 @@ case-insensitively (RFC 9110 §5.1), so `<<"Content-Length">>` and
 `<<"content-length">>` name the same field.
 
 A caller that asks about a fixed set of names walks the list once and
-compares each stored name with this function, which keeps `to_lower/1`
-off the path.
+compares each stored name with this function.
 """.
 -spec name_eq(binary(), binary()) -> boolean().
 name_eq(Name, Name) ->
@@ -160,9 +159,8 @@ name_eq(_Name, _Other) ->
 -doc """
 The compiled pattern that matches every octet that is not a `tchar`.
 
-A caller that scans many tokens in one pass reads the pattern once and
-passes it to `binary:match/2` for each one, which keeps the
-`persistent_term` lookup off the per-token path.
+A caller that scans many tokens reads the pattern once and passes it to
+`binary:match/2` for each one.
 """.
 -spec non_tchar_pattern() -> binary:cp().
 non_tchar_pattern() ->
@@ -179,10 +177,9 @@ set(Name, Value, Headers) ->
     do_delete(Lower, Headers, []) ++ [{Lower, Value}].
 
 -doc """
-Lowercase an ASCII binary using HTTP header semantics. Common header
-names hit a binary-pattern fast path; everything else falls through to
-a comprehension. RFC 9110 §5.1: field names are ASCII, so non-ASCII
-upper-half bytes pass through unchanged.
+Lowercase an ASCII binary using HTTP header semantics. RFC 9110 §5.1:
+field names are ASCII, so non-ASCII upper-half bytes pass through
+unchanged.
 """.
 -spec to_lower(binary()) -> binary().
 to_lower(<<"host">>) -> <<"host">>;

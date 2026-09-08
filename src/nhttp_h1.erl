@@ -1,10 +1,9 @@
 -module(nhttp_h1).
 
 -moduledoc """
-HTTP/1.1 codec module - High-performance binary:split implementation.
+HTTP/1.1 request and response codec.
 
-Provides parsing and encoding for HTTP/1.1 requests and responses.
-Uses binary:split BIF for optimal parsing performance.
+This module parses and encodes HTTP/1.1 messages (RFC 9112).
 
 ## Parsing
 
@@ -17,8 +16,8 @@ the remaining buffer:
 Rest = nhttp_h1:split_at(Binary, Consumed).
 ```
 
-This pattern is optimal for performance as it avoids creating intermediate
-binaries until the consumer explicitly needs the remainder.
+No remainder binary is built until the caller asks for one with
+`split_at/2`.
 
 For incomplete data, parsing returns `{more, MinBytes}` where MinBytes
 is a hint for how many more bytes might be needed.
@@ -66,6 +65,14 @@ value or reason phrase that carries CR, LF, NUL, or another control byte,
 and a request target that carries a byte at or below `0x20`. RFC 9112
 Section 11.1 names that filter as the mitigation for response splitting and
 request smuggling. A refused message is never repaired and never truncated.
+
+A caller that sends the same field lines on many messages validates them
+once with `prepare_headers/1` and passes the result through `t:enc_opts/0`:
+
+```erlang
+{ok, Static} = nhttp_h1:prepare_headers(StaticFields),
+{ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Static}).
+```
 
 `encode_request/1` and `encode_response/1` consume the canonical
 `t:nhttp_lib:request/0` / `t:nhttp_lib:response/0` map shape. The `body`
@@ -116,10 +123,13 @@ a trailer section closes with `encode_trailers/1` in place of
     encode_chunk/1,
     encode_last_chunk/0,
     encode_request/1,
+    encode_request/2,
     encode_response/1,
     encode_response/2,
     encode_response_head/3,
-    encode_trailers/1
+    encode_response_head/4,
+    encode_trailers/1,
+    prepare_headers/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -142,6 +152,7 @@ a trailer section closes with `encode_trailers/1` in place of
     opts/0,
     parse_error/0,
     parse_result/1,
+    prepared/0,
     req/0,
     resp/0,
     version/0
@@ -181,8 +192,31 @@ Encoder options for `encode_response/2`.
   answers a `CONNECT` request with a 2xx status uses it, because RFC 9110
   Section 8.6 forbids the field there and the response map carries no
   request method.
+
+`prepared` carries a field block that `prepare_headers/1` validated once.
+The encoder writes those octets without a second scan. The derived
+`Content-Length` comes first, then the prepared block, then the field lines
+of this message. `content_length` does not apply to a request, because the
+derived field there follows the body length.
 """.
--type enc_opts() :: #{content_length => auto | omit}.
+-type enc_opts() :: #{
+    content_length => auto | omit,
+    prepared => prepared()
+}.
+
+-record(prepared, {
+    block = <<>> :: binary(),
+    framed = false :: boolean()
+}).
+
+-doc """
+A field block that `prepare_headers/1` validated once.
+
+The value holds the field lines as one binary and the answer to the framing
+question: whether one of those lines is `Content-Length` or
+`Transfer-Encoding`.
+""".
+-opaque prepared() :: #prepared{}.
 
 -doc """
 Reason an encoder refuses to serialise a message.
@@ -662,26 +696,27 @@ mitigation for request smuggling and response splitting. No value is
 repaired and no byte is stripped. The message is refused whole.
 """.
 -spec encode_request(req()) -> {ok, iolist()} | {error, encode_error()}.
-encode_request(#{method := Method, path := Path} = Req) ->
-    Headers = maps:get(headers, Req, []),
-    maybe
-        ok ?= validate_request_target(Path),
-        Version = maps:get(version, Req, http1_1),
-        Body = maps:get(body, Req, <<>>),
-        Len = iolist_size(Body),
-        {ok, EncHeaders} ?= encode_header_block(Headers, Len, Len > 0),
-        {ok, [
-            nhttp_lib:encode_method(Method),
-            <<" ">>,
-            Path,
-            <<" ">>,
-            encode_version(Version),
-            <<"\r\n">>,
-            EncHeaders,
-            <<"\r\n">>,
-            Body
-        ]}
-    end.
+encode_request(Req) ->
+    encode_request_1(Req, none).
+
+-doc """
+Encode an HTTP/1.1 request to iolist under the given encoder options.
+
+See `encode_request/1` for the framing rules and the rejected byte classes.
+The request path reads the `prepared` key of `t:enc_opts/0` only. A request
+carries a derived `Content-Length` when its body is not empty, so
+`content_length` has no meaning here.
+
+```erlang
+{ok, Static} = nhttp_h1:prepare_headers([{<<"User-Agent">>, <<"acme/1.0">>}]),
+{ok, Io} = nhttp_h1:encode_request(Req, #{prepared => Static}).
+```
+""".
+-spec encode_request(req(), enc_opts()) -> {ok, iolist()} | {error, encode_error()}.
+encode_request(Req, #{prepared := Prepared}) ->
+    encode_request_1(Req, Prepared);
+encode_request(Req, _EncOpts) ->
+    encode_request_1(Req, none).
 
 -doc """
 Encode an HTTP/1.1 response to iolist.
@@ -736,9 +771,15 @@ lines, so the encoder returns
 `{error, {trailers_require_chunked, Trailers}}` rather than drop them.
 
 `encode_trailers/1` states which trailer field names the encoder refuses.
+
+A `prepared` block travels ahead of the field lines of this message. A
+response that carries a trailer section keeps its `Transfer-Encoding` in the
+message header list, because `require_chunked_framing/2` reads that list and
+a prepared block records only that a framing field is present, never which
+transfer coding is final.
 """.
 -spec encode_response(resp(), enc_opts()) -> {ok, iolist()} | {error, encode_error()}.
-encode_response(#{status := Status, trailers := Trailers} = Resp, _EncOpts) when
+encode_response(#{status := Status, trailers := Trailers} = Resp, EncOpts) when
     Trailers =/= []
 ->
     Reason = maps:get(reason, Resp, <<>>),
@@ -748,7 +789,7 @@ encode_response(#{status := Status, trailers := Trailers} = Resp, _EncOpts) when
         ok ?= require_chunked_framing(Headers, Trailers),
         Version = maps:get(version, Resp, http1_1),
         Body = maps:get(body, Resp, <<>>),
-        {ok, EncHeaders} ?= encode_headers(Headers),
+        {ok, EncHeaders} ?= encode_static_headers(Headers, EncOpts),
         {ok, Terminator} ?= encode_trailers(Trailers),
         {ok, [
             encode_version(Version),
@@ -763,29 +804,10 @@ encode_response(#{status := Status, trailers := Trailers} = Resp, _EncOpts) when
             Terminator
         ]}
     end;
-encode_response(#{status := Status} = Resp, EncOpts) ->
-    Reason = maps:get(reason, Resp, <<>>),
-    Headers = maps:get(headers, Resp, []),
-    maybe
-        ok ?= validate_reason_phrase(Reason),
-        Version = maps:get(version, Resp, http1_1),
-        Body = maps:get(body, Resp, <<>>),
-        {ok, EncHeaders} ?=
-            encode_header_block(
-                Headers, iolist_size(Body), allows_content_length(Status, EncOpts)
-            ),
-        {ok, [
-            encode_version(Version),
-            <<" ">>,
-            integer_to_binary(Status),
-            <<" ">>,
-            Reason,
-            <<"\r\n">>,
-            EncHeaders,
-            <<"\r\n">>,
-            Body
-        ]}
-    end.
+encode_response(Resp, #{prepared := Prepared} = EncOpts) ->
+    encode_response_1(Resp, EncOpts, Prepared);
+encode_response(Resp, EncOpts) ->
+    encode_response_1(Resp, EncOpts, none).
 
 -doc """
 Encode HTTP/1.x response headers for streaming.
@@ -809,6 +831,78 @@ encode_response_head(Version, Status, Headers) ->
             EncHeaders,
             <<"\r\n">>
         ]}
+    end.
+
+-doc """
+Encode HTTP/1.x response headers for streaming, under the given encoder
+options.
+
+The head path reads the `prepared` key of `t:enc_opts/0` only. A streaming
+response derives no `Content-Length`, so `content_length` has no meaning
+here. The prepared block travels ahead of the field lines of this message.
+""".
+-spec encode_response_head(version(), nhttp_lib:status(), nhttp_lib:headers(), enc_opts()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_response_head(Version, Status, Headers, EncOpts) ->
+    maybe
+        {ok, EncHeaders} ?= encode_static_headers(Headers, EncOpts),
+        {ok, [
+            encode_version(Version),
+            <<" ">>,
+            integer_to_binary(Status),
+            <<" ">>,
+            reason_phrase(Status),
+            <<"\r\n">>,
+            EncHeaders,
+            <<"\r\n">>
+        ]}
+    end.
+
+-doc """
+Validate a field list once and return the field lines as one binary.
+
+The encoders read every octet of every field name and every field value on
+every call, because RFC 9112 Section 11.1 names that filtering as the
+mitigation for request smuggling and response splitting. A caller that sends
+the same field lines on many messages pays for the same octets on every
+message. `prepare_headers/1` moves that cost to one call.
+
+```erlang
+{ok, Static} = nhttp_h1:prepare_headers([
+    {<<"Server">>, <<"acme/1.0">>},
+    {<<"Cache-Control">>, <<"no-store">>}
+]),
+{ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Static}).
+```
+
+The value is opaque and this function is the only path that builds one. A
+caller that fabricates the record writes octets that no validator read, and
+the library cannot prevent that any more than it can prevent a call to a
+private function.
+
+`prepare_headers/1` refuses exactly what the encoders refuse, with the same
+values: `{error, {invalid_field_name, Name}}` for a name that is not a token
+(RFC 9110 Section 5.6.2) and `{error, {invalid_field_value, Value}}` for a
+value that carries CR, LF, NUL, another control byte, or `0x7F`
+(RFC 9110 Section 5.5).
+
+The block is for field lines that many messages reuse.
+`iolist_to_binary/1` copies them once here, so a caller that prepares a
+block for a single message pays more than a caller that prepares nothing.
+
+The encoder does not compare a caller supplied `Content-Length` against the
+body length, and a prepared block does not change that.
+""".
+-spec prepare_headers(nhttp_lib:headers()) -> {ok, prepared()} | {error, encode_error()}.
+prepare_headers(Headers) ->
+    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+    case encode_framed_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err ->
+            Err;
+        {framed, Lines} ->
+            {ok, #prepared{block = iolist_to_binary(Lines), framed = true}};
+        Lines ->
+            {ok, #prepared{block = iolist_to_binary(Lines), framed = false}}
     end.
 
 -doc """
@@ -1055,6 +1149,96 @@ encode_body_chunk(Body) ->
         0 -> [];
         _ -> encode_chunk(Body)
     end.
+
+-compile({inline, [encode_request_1/2, encode_response_1/3, header_block/4]}).
+
+-spec encode_request_1(req(), prepared() | none) -> {ok, iolist()} | {error, encode_error()}.
+encode_request_1(#{method := Method, path := Path} = Req, Prepared) ->
+    Headers = maps:get(headers, Req, []),
+    maybe
+        ok ?= validate_request_target(Path),
+        Version = maps:get(version, Req, http1_1),
+        Body = maps:get(body, Req, <<>>),
+        Len = iolist_size(Body),
+        {ok, EncHeaders} ?= header_block(Headers, Len, Len > 0, Prepared),
+        {ok, [
+            nhttp_lib:encode_method(Method),
+            <<" ">>,
+            Path,
+            <<" ">>,
+            encode_version(Version),
+            <<"\r\n">>,
+            EncHeaders,
+            <<"\r\n">>,
+            Body
+        ]}
+    end.
+
+-spec encode_response_1(resp(), enc_opts(), prepared() | none) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_response_1(#{status := Status} = Resp, EncOpts, Prepared) ->
+    Reason = maps:get(reason, Resp, <<>>),
+    Headers = maps:get(headers, Resp, []),
+    maybe
+        ok ?= validate_reason_phrase(Reason),
+        Version = maps:get(version, Resp, http1_1),
+        Body = maps:get(body, Resp, <<>>),
+        {ok, EncHeaders} ?=
+            header_block(
+                Headers,
+                iolist_size(Body),
+                allows_content_length(Status, EncOpts),
+                Prepared
+            ),
+        {ok, [
+            encode_version(Version),
+            <<" ">>,
+            integer_to_binary(Status),
+            <<" ">>,
+            Reason,
+            <<"\r\n">>,
+            EncHeaders,
+            <<"\r\n">>,
+            Body
+        ]}
+    end.
+
+-spec header_block(nhttp_lib:headers(), non_neg_integer(), boolean(), prepared() | none) ->
+    {ok, iolist()} | {error, encode_error()}.
+header_block(Headers, Len, Allows, none) ->
+    encode_header_block(Headers, Len, Allows);
+header_block(Headers, Len, Allows, Prepared) ->
+    encode_prepared_block(Headers, Len, Allows, Prepared).
+
+-spec encode_prepared_block(nhttp_lib:headers(), non_neg_integer(), boolean(), prepared()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_prepared_block(Headers, _Len, false, #prepared{block = Block}) ->
+    prepend_block(Block, encode_headers(Headers));
+encode_prepared_block(Headers, _Len, true, #prepared{block = Block, framed = true}) ->
+    prepend_block(Block, encode_headers(Headers));
+encode_prepared_block(Headers, Len, true, #prepared{block = Block, framed = false}) ->
+    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+    case encode_framed_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err ->
+            Err;
+        {framed, Lines} ->
+            {ok, [Block | Lines]};
+        Lines ->
+            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
+            {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">>, Block | Lines]}
+    end.
+
+-spec encode_static_headers(nhttp_lib:headers(), enc_opts()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_static_headers(Headers, #{prepared := #prepared{block = Block}}) ->
+    prepend_block(Block, encode_headers(Headers));
+encode_static_headers(Headers, _EncOpts) ->
+    encode_headers(Headers).
+
+-spec prepend_block(binary(), {ok, iolist()} | {error, encode_error()}) ->
+    {ok, iolist()} | {error, encode_error()}.
+prepend_block(Block, {ok, Lines}) -> {ok, [Block | Lines]};
+prepend_block(_Block, {error, _} = Err) -> Err.
 
 -spec encode_header_block(nhttp_lib:headers(), non_neg_integer(), boolean()) ->
     {ok, iolist()} | {error, encode_error()}.
