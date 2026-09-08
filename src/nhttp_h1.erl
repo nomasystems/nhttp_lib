@@ -80,35 +80,6 @@ via `encode_chunk/1`, then close the body with `encode_last_chunk/0`
 (set `Transfer-Encoding: chunked` in the headers). A message that carries
 a trailer section closes with `encode_trailers/1` in place of
 `encode_last_chunk/0`. The same staged pattern applies to chunked requests.
-
-## What encoder validation costs
-
-The encoders read every octet of every field name and every field value.
-The scan is about two thirds of the cost of an encode call.
-
-The instrument is `binary:match/2` against a `binary:cp()` that
-`binary:compile_pattern/1` builds once, from `-on_load`, and holds in
-`persistent_term`. The field value pattern carries 32 single octet
-alternatives. The field name pattern carries 179.
-
-`binary:match/2` runs Aho-Corasick for a pattern of more than one member,
-and Boyer-Moore for a pattern of exactly one. The Aho-Corasick path costs
-0.1 reductions and 0.9 nanoseconds per octet. That cost per octet does not
-change with the number of alternatives, so a smaller byte set buys nothing.
-The single octet path costs 0.013 reductions and 0.006 nanoseconds per
-octet, which makes the step from one alternative to two a factor of 8 in
-reductions.
-
-One call costs about 0.015 microseconds before it reads an octet, and the
-encoder makes two calls per field line. For a message of ordinary field
-values the call count sets the wall clock. Only a long value makes the
-octet count dominate. A ten field request costs about 90 reductions, of
-which about 60 belong to the scan.
-
-The `Content-Length` that the encoder derives skips both scans, because
-`integer_to_binary/1` wrote those octets and no caller supplied them. Every
-field that a caller supplies is scanned, including one that a caller
-supplies under the same name.
 """.
 
 -compile(
@@ -1333,6 +1304,7 @@ validate_field_name(Name, NamePat) ->
 
 -spec validate_field_value(binary(), binary:cp()) -> ok | {error, encode_error()}.
 validate_field_value(Value, ValuePat) ->
+    %% re:run charges PCRE2 backtrack loops, not octets, so it hides a scan of any length.
     case binary:match(Value, ValuePat) of
         nomatch -> ok;
         _ -> {error, {invalid_field_value, Value}}
