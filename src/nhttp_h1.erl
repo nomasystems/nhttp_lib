@@ -77,8 +77,9 @@ memory: it is emitted inline after the header block and a
 For streaming bodies, do not populate `body` in the map. Send the
 header block first via `encode_response_head/3`, then emit each chunk
 via `encode_chunk/1`, then close the body with `encode_last_chunk/0`
-(set `Transfer-Encoding: chunked` in the headers). The same staged
-pattern applies to chunked requests.
+(set `Transfer-Encoding: chunked` in the headers). A message that carries
+a trailer section closes with `encode_trailers/1` in place of
+`encode_last_chunk/0`. The same staged pattern applies to chunked requests.
 
 ## What encoder validation costs
 
@@ -146,7 +147,8 @@ supplies under the same name.
     encode_request/1,
     encode_response/1,
     encode_response/2,
-    encode_response_head/3
+    encode_response_head/3,
+    encode_trailers/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -221,7 +223,9 @@ encoder never repairs the value and never strips a byte from it.
     {invalid_field_name, binary()}
     | {invalid_field_value, binary()}
     | {invalid_reason_phrase, binary()}
-    | {invalid_request_target, binary()}.
+    | {invalid_request_target, binary()}
+    | {forbidden_trailer_field, binary()}
+    | {trailers_require_chunked, nhttp_lib:headers()}.
 
 -type opts() :: #{
     max_header_size => pos_integer(),
@@ -748,8 +752,46 @@ Encode an HTTP/1.1 response to iolist under the given encoder options.
 
 See `encode_response/1` for the framing rules, the rejected byte classes,
 and `t:enc_opts/0` for the options.
+
+A `trailers` key that holds a non-empty field list frames the body with the
+chunked transfer coding: the header block, one chunk that carries the whole
+body, then the last chunk, the trailer section and the closing CRLF. The
+header list must already carry a `Transfer-Encoding` whose final coding is
+`chunked`, because RFC 9110 Section 6.5.1 makes a trailer section possible
+only when an explicit framing mechanism enables it, and RFC 9112
+Section 7.1.2 names the chunked transfer coding as that mechanism for
+HTTP/1.1. A response framed any other way holds no position for the field
+lines, so the encoder returns
+`{error, {trailers_require_chunked, Trailers}}` rather than drop them.
+
+`encode_trailers/1` states which trailer field names the encoder refuses.
 """.
 -spec encode_response(resp(), enc_opts()) -> {ok, iolist()} | {error, encode_error()}.
+encode_response(#{status := Status, trailers := Trailers} = Resp, _EncOpts) when
+    Trailers =/= []
+->
+    Reason = maps:get(reason, Resp, <<>>),
+    Headers = maps:get(headers, Resp, []),
+    maybe
+        ok ?= validate_reason_phrase(Reason),
+        ok ?= require_chunked_framing(Headers, Trailers),
+        Version = maps:get(version, Resp, http1_1),
+        Body = maps:get(body, Resp, <<>>),
+        {ok, EncHeaders} ?= encode_headers(Headers),
+        {ok, Terminator} ?= encode_trailers(Trailers),
+        {ok, [
+            encode_version(Version),
+            <<" ">>,
+            integer_to_binary(Status),
+            <<" ">>,
+            Reason,
+            <<"\r\n">>,
+            EncHeaders,
+            <<"\r\n">>,
+            encode_body_chunk(Body),
+            Terminator
+        ]}
+    end;
 encode_response(#{status := Status} = Resp, EncOpts) ->
     Reason = maps:get(reason, Resp, <<>>),
     Headers = maps:get(headers, Resp, []),
@@ -798,6 +840,48 @@ encode_response_head(Version, Status, Headers) ->
             EncHeaders,
             <<"\r\n">>
         ]}
+    end.
+
+-doc """
+Encode the terminating sequence of a chunked message, with a trailer section.
+
+The return carries the last chunk, the trailer field lines and the single
+CRLF that ends `chunked-body` (RFC 9112 Section 7.1: `chunked-body = *chunk
+last-chunk trailer-section CRLF`). A caller emits it in place of
+`encode_last_chunk/0`, and `encode_trailers([])` writes exactly what
+`encode_last_chunk/0` writes.
+
+A trailer field is validated as a header field is. The encoder returns
+`{error, {invalid_field_name, Name}}` for a name that is not a token
+(RFC 9110 Section 5.6.2) and `{error, {invalid_field_value, Value}}` for a
+value that carries CR, LF, NUL, another control byte, or `0x7F`
+(RFC 9110 Section 5.5).
+
+The encoder also refuses the names `transfer-encoding`, `content-length`,
+`host` and `trailer` with `{error, {forbidden_trailer_field, Name}}`. RFC 9112
+Section 7.1.3 has a recipient compute the content length and rewrite
+`Transfer-Encoding` at the point where the trailer section arrives, so a
+recipient that merges one of those fields into the header section holds two
+contradictory framing statements for one message. RFC 9112 Section 11.1 names
+that filtering as the mitigation for request smuggling and response
+splitting. The four names are a defence against a recipient that merges in
+breach of RFC 9110 Section 6.5.1. They are not an RFC enumeration, and the
+list does not grow.
+
+RFC 9110 Section 6.5.1 puts the general rule on the sender: generate a
+trailer field only when the definition of that field name permits trailer
+use. No registry records that permission, so the encoder cannot check it and
+the caller owns it. RFC 9110 Section 6.6.2 asks a sender that intends to
+write a trailer section to announce the names in a `Trailer` header field.
+""".
+-spec encode_trailers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
+encode_trailers([]) ->
+    {ok, [encode_last_chunk()]};
+encode_trailers(Trailers) ->
+    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+    case encode_trailer_lines(Trailers, NamePat, ValuePat) of
+        {error, _} = Err -> Err;
+        Lines -> {ok, [<<"0\r\n">>, Lines, <<"\r\n">>]}
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -890,6 +974,34 @@ chunked_body_stream(Codings) ->
         false -> until_close
     end.
 
+-spec chunked_framing(nhttp_lib:headers()) -> boolean().
+chunked_framing(Headers) ->
+    case transfer_coding_list(transfer_encoding_values(Headers, [])) of
+        absent -> false;
+        Codings -> is_chunked_framing(Codings)
+    end.
+
+-spec transfer_encoding_values(nhttp_lib:headers(), [binary()]) -> [binary()].
+transfer_encoding_values([], Acc) ->
+    lists:reverse(Acc);
+transfer_encoding_values([{Name, Value} | Rest], Acc) when
+    byte_size(Name) =:= byte_size(<<"transfer-encoding">>)
+->
+    case nhttp_headers:name_eq(Name, <<"transfer-encoding">>) of
+        true -> transfer_encoding_values(Rest, [Value | Acc]);
+        false -> transfer_encoding_values(Rest, Acc)
+    end;
+transfer_encoding_values([_Field | Rest], Acc) ->
+    transfer_encoding_values(Rest, Acc).
+
+-spec require_chunked_framing(nhttp_lib:headers(), nhttp_lib:headers()) ->
+    ok | {error, encode_error()}.
+require_chunked_framing(Headers, Trailers) ->
+    case chunked_framing(Headers) of
+        true -> ok;
+        false -> {error, {trailers_require_chunked, Trailers}}
+    end.
+
 -spec content_length_body_mode([binary()]) ->
     body_mode() | {error, duplicate_content_length | invalid_content_length}.
 content_length_body_mode([]) ->
@@ -968,6 +1080,13 @@ detect_body_mode(Headers) ->
             chunked_body_mode(Codings)
     end.
 
+-spec encode_body_chunk(iodata()) -> iolist().
+encode_body_chunk(Body) ->
+    case iolist_size(Body) of
+        0 -> [];
+        _ -> encode_chunk(Body)
+    end.
+
 -spec encode_headers(nhttp_lib:headers()) -> {ok, iolist()} | {error, encode_error()}.
 encode_headers(Headers) ->
     {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
@@ -985,6 +1104,21 @@ encode_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
         ok ?= validate_field_name(Name, NamePat),
         ok ?= validate_field_value(Value, ValuePat),
         case encode_lines(Rest, NamePat, ValuePat) of
+            {error, _} = Err -> Err;
+            Tail -> [Name, <<": ">>, Value, <<"\r\n">> | Tail]
+        end
+    end.
+
+-spec encode_trailer_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
+    iolist() | {error, encode_error()}.
+encode_trailer_lines([], _NamePat, _ValuePat) ->
+    [];
+encode_trailer_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
+    maybe
+        ok ?= validate_field_name(Name, NamePat),
+        ok ?= validate_trailer_name(Name),
+        ok ?= validate_field_value(Value, ValuePat),
+        case encode_trailer_lines(Rest, NamePat, ValuePat) of
             {error, _} = Err -> Err;
             Tail -> [Name, <<": ">>, Value, <<"\r\n">> | Tail]
         end
@@ -1220,6 +1354,13 @@ validate_request_target(Target) ->
         _ -> {error, {invalid_request_target, Target}}
     end.
 
+-spec validate_trailer_name(binary()) -> ok | {error, encode_error()}.
+validate_trailer_name(Name) ->
+    case is_forbidden_trailer_name(Name) of
+        false -> ok;
+        true -> {error, {forbidden_trailer_field, Name}}
+    end.
+
 -spec has_invalid_char(binary()) -> boolean().
 has_invalid_char(Bin) ->
     binary:match(Bin, persistent_term:get(?PT_FIELD_VALUE_BAD)) =/= nomatch.
@@ -1233,6 +1374,19 @@ is_chunked_framing([], _Seen) -> false;
 is_chunked_framing([<<"chunked">>], Seen) -> Seen =:= 0;
 is_chunked_framing([<<"chunked">> | Rest], Seen) -> is_chunked_framing(Rest, Seen + 1);
 is_chunked_framing([_Coding | Rest], Seen) -> is_chunked_framing(Rest, Seen).
+
+%% RFC 9112 Section 11.1. The rationale for these four names is in `encode_trailers/1`.
+-spec is_forbidden_trailer_name(binary()) -> boolean().
+is_forbidden_trailer_name(Name) when byte_size(Name) =:= byte_size(<<"transfer-encoding">>) ->
+    nhttp_headers:name_eq(Name, <<"transfer-encoding">>);
+is_forbidden_trailer_name(Name) when byte_size(Name) =:= byte_size(<<"content-length">>) ->
+    nhttp_headers:name_eq(Name, <<"content-length">>);
+is_forbidden_trailer_name(Name) when byte_size(Name) =:= byte_size(<<"trailer">>) ->
+    nhttp_headers:name_eq(Name, <<"trailer">>);
+is_forbidden_trailer_name(Name) when byte_size(Name) =:= byte_size(<<"host">>) ->
+    nhttp_headers:name_eq(Name, <<"host">>);
+is_forbidden_trailer_name(_Name) ->
+    false.
 
 -spec is_valid_chunk_ext_tail(binary()) -> boolean().
 is_valid_chunk_ext_tail(<<>>) -> true;

@@ -51,9 +51,10 @@ fed chunk-by-chunk through the streaming-body callback (see
 
 The `trailers` field is the symmetric convenience for trailing header
 fields (RFC 9110 §6.5) when sent alongside an in-memory body. For
-streaming, emit trailers separately after the body. H1 emits trailer
-fields between `encode_last_chunk/0` and the closing CRLF; H2 / H3
-emit them via a final `send_headers/4` call with `fin`.
+streaming, emit trailers separately after the body. H1 writes the last
+chunk, the trailer section and the closing CRLF in one call to
+`nhttp_h1:encode_trailers/1`; H2 / H3 emit them via a final
+`send_headers/4` call with `fin`.
 
 ## WebSocket umbrella re-exports
 

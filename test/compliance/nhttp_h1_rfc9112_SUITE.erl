@@ -77,6 +77,8 @@ groups() ->
             handle_large_chunk_size,
             ignore_chunk_extensions,
             handle_trailer_fields,
+            encode_trailer_section,
+            trailers_require_chunked_framing,
             reject_chunk_data_without_crlf_request,
             reject_chunk_data_without_crlf_response,
             short_chunk_data_returns_more
@@ -96,7 +98,9 @@ groups() ->
             valid_message_still_encodes,
             single_header_terminator,
             reject_field_injection_at_every_position,
-            first_offending_field_names_the_error
+            first_offending_field_names_the_error,
+            reject_trailer_field_injection,
+            reject_framing_trailer_field
         ]}
     ].
 
@@ -523,6 +527,99 @@ handle_trailer_fields(_Config) ->
     {ok, #{body := Body}, _} = nhttp_h1:parse_response(Resp),
     ?assertEqual(<<"hello">>, iolist_to_binary(Body)).
 
+%% RFC 9112 Section 7.1: chunked-body = *chunk last-chunk trailer-section CRLF.
+%% One call writes the last chunk, the field lines and the single CRLF that
+%% closes the body. RFC 9110 Section 6.6.2 names the Trailer header field that
+%% announces the section.
+encode_trailer_section(_Config) ->
+    {ok, Empty} = nhttp_h1:encode_trailers([]),
+    ?assertEqual(nhttp_h1:encode_last_chunk(), iolist_to_binary(Empty)),
+
+    {ok, Io} = nhttp_h1:encode_trailers([{<<"x-checksum">>, <<"abc123">>}]),
+    ?assertEqual(<<"0\r\nx-checksum: abc123\r\n\r\n">>, iolist_to_binary(Io)),
+
+    Head = <<"HTTP/1.1 200 OK\r\n",
+             "Transfer-Encoding: chunked\r\n",
+             "Trailer: X-Checksum\r\n",
+             "\r\n">>,
+    Wire = iolist_to_binary([Head, nhttp_h1:encode_chunk(<<"hello">>), Io]),
+    {ok, 200, Headers, Rest} = nhttp_h1:parse_response_headers(Wire),
+    Stream = nhttp_h1:body_stream_from_response(get, 200, Headers),
+    {ok, Chunks, _Stream, Consumed} = nhttp_h1:parse_response_body(Rest, Stream),
+    ?assertEqual(byte_size(Rest), Consumed),
+    ?assertEqual(<<"hello">>, iolist_to_binary([D || {data, D} <- Chunks])),
+    ?assertEqual(
+        [{<<"x-checksum">>, <<"abc123">>}],
+        lists:append([T || {fin, T} <- Chunks])
+    ).
+
+%% RFC 9110 Section 6.5.1: "A trailer section is only possible when supported by
+%% the version of HTTP in use and enabled by an explicit framing mechanism."
+%% RFC 9112 Section 7.1.2 names the chunked transfer coding as that mechanism.
+%% Content-Length framing holds no position for the field lines, so the encoder
+%% refuses the message instead of dropping the trailers.
+trailers_require_chunked_framing(_Config) ->
+    Trailers = [{<<"x-checksum">>, <<"abc123">>}],
+    Base = #{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [],
+        body => <<"hello">>,
+        trailers => Trailers
+    },
+    lists:foreach(
+        fun(Headers) ->
+            ?assertEqual(
+                {error, {trailers_require_chunked, Trailers}},
+                nhttp_h1:encode_response(Base#{headers => Headers})
+            )
+        end,
+        [
+            [],
+            [{<<"content-length">>, <<"5">>}],
+            [{<<"Transfer-Encoding">>, <<"gzip">>}],
+            [{<<"Transfer-Encoding">>, <<"chunked, gzip">>}],
+            [{<<"x-seventeen-bytes">>, <<"1">>}]
+        ]
+    ),
+
+    {ok, Io} = nhttp_h1:encode_response(
+        Base#{headers => [{<<"Transfer-Encoding">>, <<"chunked">>}]}
+    ),
+    ?assertEqual(
+        <<"HTTP/1.1 200 OK\r\n",
+          "Transfer-Encoding: chunked\r\n",
+          "\r\n",
+          "5\r\nhello\r\n",
+          "0\r\nx-checksum: abc123\r\n\r\n">>,
+        iolist_to_binary(Io)
+    ),
+
+    {ok, GzipIo} = nhttp_h1:encode_response(
+        Base#{headers => [{<<"Transfer-Encoding">>, <<"gzip, chunked">>}]}
+    ),
+    ?assertMatch(
+        <<"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\n", _/binary>>,
+        iolist_to_binary(GzipIo)
+    ),
+
+    {ok, EmptyIo} = nhttp_h1:encode_response(
+        Base#{headers => [{<<"Transfer-Encoding">>, <<"chunked">>}], body => <<>>}
+    ),
+    ?assertEqual(
+        <<"HTTP/1.1 200 OK\r\n",
+          "Transfer-Encoding: chunked\r\n",
+          "\r\n",
+          "0\r\nx-checksum: abc123\r\n\r\n">>,
+        iolist_to_binary(EmptyIo)
+    ),
+
+    {ok, NoneIo} = nhttp_h1:encode_response(Base#{trailers => []}),
+    ?assertEqual(
+        <<"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello">>,
+        iolist_to_binary(NoneIo)
+    ).
+
 %% RFC 9112 Section 7.1: chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF.
 %% The CRLF behind chunk-data is mandatory. Data long enough to satisfy the
 %% chunk-size, with any other pair of octets behind it, is a refusal and not a
@@ -890,6 +987,82 @@ first_offending_field_names_the_error(_Config) ->
         {error, {invalid_field_name, <<>>}},
         encode_both([{<<>>, <<"v">>}, {<<"x">>, BadValue} | Filler])
     ).
+
+%% RFC 9110 Section 5.5 and RFC 9112 Section 11.1 hold over the trailer section
+%% as they hold over the header section. A chunked message ends with the field
+%% lines the trailer encoder writes, so an unscanned CR there splits the message
+%% exactly as one in the header section does.
+reject_trailer_field_injection(_Config) ->
+    Clean = {<<"p">>, <<"1">>},
+    lists:foreach(
+        fun(Value) ->
+            Trailers = [{<<"x">>, Value}],
+            Behind = [Clean, {<<"x">>, Value}],
+            ?assertEqual(
+                {error, {invalid_field_value, Value}}, nhttp_h1:encode_trailers(Trailers)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_value, Value}}, nhttp_h1:encode_trailers(Behind)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_value, Value}}, encode_chunked_response(Trailers)
+            )
+        end,
+        injection_values()
+    ),
+    lists:foreach(
+        fun(Name) ->
+            Trailers = [{Name, <<"v">>}],
+            Behind = [Clean, {Name, <<"v">>}],
+            ?assertEqual(
+                {error, {invalid_field_name, Name}}, nhttp_h1:encode_trailers(Trailers)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_name, Name}}, nhttp_h1:encode_trailers(Behind)
+            ),
+            ?assertEqual(
+                {error, {invalid_field_name, Name}}, encode_chunked_response(Trailers)
+            )
+        end,
+        injection_values() ++ [<<"x y">>, <<"x:y">>, <<>>]
+    ).
+
+%% RFC 9112 Section 11.1. RFC 9112 Section 7.1.3 has a recipient compute the
+%% content length and rewrite Transfer-Encoding at the point where the trailer
+%% section arrives. A recipient that merges one of these four names into the
+%% header section, against RFC 9110 Section 6.5.1, then holds two framing
+%% statements for one message. The four names are a defence against that
+%% recipient. They are not an RFC enumeration: RFC 9110 blesses ETag
+%% (Section 8.8.3), Accept-Ranges (Section 14.3) and Authentication-Info
+%% (Section 11.6.3) in a trailer section by name, and those still encode.
+reject_framing_trailer_field(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            Trailers = [{Name, <<"1">>}],
+            ?assertEqual(
+                {error, {forbidden_trailer_field, Name}}, nhttp_h1:encode_trailers(Trailers)
+            ),
+            ?assertEqual(
+                {error, {forbidden_trailer_field, Name}}, encode_chunked_response(Trailers)
+            )
+        end,
+        [
+            <<"transfer-encoding">>,
+            <<"Transfer-Encoding">>,
+            <<"content-length">>,
+            <<"Content-Length">>,
+            <<"host">>,
+            <<"Host">>,
+            <<"trailer">>,
+            <<"Trailer">>
+        ]
+    ),
+    {ok, Io} = nhttp_h1:encode_trailers([
+        {<<"etag">>, <<"\"xyzzy\"">>},
+        {<<"accept-ranges">>, <<"bytes">>},
+        {<<"authentication-info">>, <<"nextnonce=\"1\"">>}
+    ]),
+    ?assertEqual(1, count_terminators(iolist_to_binary(Io))).
 %%%-----------------------------------------------------------------------------
 %%% Helpers
 %%%-----------------------------------------------------------------------------
@@ -958,3 +1131,13 @@ is_field_line(LowerName, Line) ->
         <<Candidate:Size/binary, $:, _/binary>> -> string:lowercase(Candidate) =:= LowerName;
         _ -> false
     end.
+
+-spec encode_chunked_response(nhttp_lib:headers()) -> {ok, iolist()} | {error, term()}.
+encode_chunked_response(Trailers) ->
+    nhttp_h1:encode_response(#{
+        status => 200,
+        reason => <<"OK">>,
+        headers => [{<<"Transfer-Encoding">>, <<"chunked">>}],
+        body => <<"hello">>,
+        trailers => Trailers
+    }).
