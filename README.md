@@ -28,9 +28,9 @@ end.
 ```
 
 The request map is the canonical `t:nhttp_lib:request/0` shape: `method`,
-`path`, `scheme`, `authority`, and `headers` are always populated; `peer`,
-`protocol`, and `version` are filled by the parser. Use `nhttp_headers:get/2`
-to look up header values.
+`path`, `scheme`, `authority`, and `headers` are always populated. The
+parser fills `peer` and `version`. Use `nhttp_headers:get/2` to look up
+header values.
 
 ### Encoding
 
@@ -40,13 +40,14 @@ Response = #{
     headers => [{<<"content-type">>, <<"text/plain">>}],
     body => <<"Hello, World!">>
 },
-IoData = nhttp_h1:encode_response(Response).
+{ok, IoData} = nhttp_h1:encode_response(Response).
 ```
 
-`encode_request/1` and `encode_response/1` return an `iolist()` directly.
-For chunked / streaming bodies, omit `body` from the map and emit the
-header block with `encode_response_head/3`, body chunks with
-`encode_chunk/1`, and a trailing `encode_last_chunk/0`.
+`encode_request/1` and `encode_response/1` return
+`{ok, iolist()} | {error, encode_error()}`. For chunked / streaming bodies,
+omit `body` from the map and emit the header block with
+`encode_response_head/3`, body chunks with `encode_chunk/1`, and a trailing
+`encode_last_chunk/0`.
 
 ## Features
 

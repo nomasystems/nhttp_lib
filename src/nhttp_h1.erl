@@ -54,6 +54,21 @@ end.
 
 ## Encoding
 
+A caller that sends the same field lines on many messages validates them
+once with `prepare_headers/1` and passes the result through `t:enc_opts/0`:
+
+```erlang
+{ok, Static} = nhttp_h1:prepare_headers(StaticFields),
+{ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Static}).
+```
+
+A prepared block is validated once, the field lines of each message are
+validated again, and no octet reaches the output unread. The derived
+`Content-Length` comes first, then the prepared block, then the field lines
+of this message.
+
+A caller that holds no block to reuse calls the encoder directly:
+
 ```erlang
 {ok, IOList} = nhttp_h1:encode_request(Request).
 {ok, IOList} = nhttp_h1:encode_response(Response).
@@ -65,14 +80,6 @@ value or reason phrase that carries CR, LF, NUL, or another control byte,
 and a request target that carries a byte at or below `0x20`. RFC 9112
 Section 11.1 names that filter as the mitigation for response splitting and
 request smuggling. A refused message is never repaired and never truncated.
-
-A caller that sends the same field lines on many messages validates them
-once with `prepare_headers/1` and passes the result through `t:enc_opts/0`:
-
-```erlang
-{ok, Static} = nhttp_h1:prepare_headers(StaticFields),
-{ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Static}).
-```
 
 `encode_request/1` and `encode_response/1` consume the canonical
 `t:nhttp_lib:request/0` / `t:nhttp_lib:response/0` map shape. The `body`
