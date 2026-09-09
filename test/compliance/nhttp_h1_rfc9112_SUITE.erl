@@ -103,7 +103,8 @@ groups() ->
             reject_field_injection_at_every_position,
             first_offending_field_names_the_error,
             reject_trailer_field_injection,
-            reject_framing_trailer_field
+            reject_framing_trailer_field,
+            field_value_octet_set_at_every_length
         ]}
     ].
 
@@ -1237,3 +1238,49 @@ encode_chunked_response(Trailers) ->
         body => <<"hello">>,
         trailers => Trailers
     }).
+
+%% RFC 9110 Section 5.5 names the field value octet set, and RFC 9112 Section
+%% 11.1 names the filter that reads it. The encoder reads a value below 112
+%% octets with `binary:match/2` and a value at that length or above with a word
+%% scan, and the sweep holds the two instruments to the same answer. It walks
+%% every position of a short value and the word and stride boundaries of a long
+%% one, over five fillers, and refuses or accepts each of the 256 octets.
+field_value_octet_set_at_every_length(_Config) ->
+    lists:foreach(
+        fun(Filler) ->
+            [
+                sweep_value_octet(Filler, Len, Pos)
+             || Len <- lists:seq(0, 130) ++ [255, 448, 4096],
+                Pos <- sweep_positions(Len)
+            ]
+        end,
+        [$v, $\t, $\s, 16#80, 16#FF]
+    ).
+
+-spec sweep_positions(non_neg_integer()) -> [non_neg_integer()].
+sweep_positions(Len) when Len =< 20 ->
+    lists:seq(0, Len - 1);
+sweep_positions(Len) ->
+    Edges = [0, 1, 54, 55, 56, 57, 110, 111, 112, 113, 447, 448, Len div 2, Len - 2, Len - 1],
+    lists:usort([P || P <- Edges, P >= 0, P < Len]).
+
+-spec sweep_value_octet(byte(), non_neg_integer(), non_neg_integer()) -> ok.
+sweep_value_octet(Filler, Len, Pos) ->
+    Base = binary:copy(<<Filler>>, Len),
+    <<Head:Pos/binary, _, Tail/binary>> = Base,
+    lists:foreach(
+        fun(C) ->
+            Value = <<Head/binary, C, Tail/binary>>,
+            Resp = #{status => 200, reason => <<"OK">>, headers => [{<<"x">>, Value}]},
+            case (C < 16#20 andalso C =/= $\t) orelse C =:= 16#7F of
+                true ->
+                    ?assertEqual(
+                        {error, {invalid_field_value, Value}},
+                        nhttp_h1:encode_response(Resp)
+                    );
+                false ->
+                    ?assertMatch({ok, _}, nhttp_h1:encode_response(Resp))
+            end
+        end,
+        lists:seq(16#00, 16#FF)
+    ).

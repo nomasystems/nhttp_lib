@@ -718,3 +718,45 @@ trailer_pair_gen() ->
         {valid_token_gen(), valid_value_gen()},
         {Name, Value}
     ).
+
+%% RFC 9110 Section 5.5 and RFC 9112 Section 11.1. The encoder reads a field
+%% value with one of two instruments, and the length picks between them. The
+%% property compares the encoder against the octet set at every length, so a
+%% disagreement between the two instruments fails it.
+-spec prop_field_value_scan_agrees_with_the_octet_set() -> triq:property().
+prop_field_value_scan_agrees_with_the_octet_set() ->
+    ?FORALL(
+        Value,
+        field_value_scan_gen(),
+        begin
+            Resp = #{status => 200, reason => <<"OK">>, headers => [{<<"x">>, Value}]},
+            Clean = binary:match(Value, field_value_bad_pattern()) =:= nomatch,
+            case nhttp_h1:encode_response(Resp) of
+                {ok, _} -> Clean;
+                {error, {invalid_field_value, Reported}} -> Reported =:= Value andalso not Clean;
+                _ -> false
+            end
+        end
+    ).
+
+-spec field_value_bad_pattern() -> binary:cp().
+field_value_bad_pattern() ->
+    binary:compile_pattern([<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>]).
+
+-spec field_value_scan_gen() -> triq_dom:domain().
+field_value_scan_gen() ->
+    ?LET(
+        {Len, Filler, Mutations},
+        {int(0, 300), elements([$v, $\t, $\s, 16#80, 16#FF]), list({int(0, 299), int(0, 255)})},
+        mutate_octets(binary:copy(<<Filler>>, Len), Mutations)
+    ).
+
+-spec mutate_octets(binary(), [{non_neg_integer(), byte()}]) -> binary().
+mutate_octets(Bin, []) ->
+    Bin;
+mutate_octets(<<>>, _Mutations) ->
+    <<>>;
+mutate_octets(Bin, [{Pos, Octet} | Rest]) ->
+    At = Pos rem byte_size(Bin),
+    <<Head:At/binary, _, Tail/binary>> = Bin,
+    mutate_octets(<<Head/binary, Octet, Tail/binary>>, Rest).

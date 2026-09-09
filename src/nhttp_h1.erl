@@ -284,6 +284,19 @@ encoder never repairs the value and never strips a byte from it.
 -define(REQUEST_LINE_ALLOWANCE, 8192).
 -define(MAX_CHUNK_SIZE_LINE, 1024).
 
+%% The field value scan below this length runs on `binary:match/2`, and at
+%% this length and above it runs on the word scan of
+%% `has_forbidden_value_octet/1`. Two unrolled strides of that loop.
+-define(VALUE_WORD_SCAN_MIN, 112).
+
+%% Seven octet words for the field value scan. `bnot` and `band` on a 56 bit
+%% word stay inside a small integer, and 64 bits would allocate a bignum.
+-define(W_LOW7, 16#7F7F7F7F7F7F7F).
+-define(W_TAB7, 16#09090909090909).
+-define(W_SUB32, 16#60606060606060).
+-define(W_ONE7, 16#01010101010101).
+-define(W_HIGH7, 16#80808080808080).
+
 %%%-----------------------------------------------------------------------------
 %% COMPILED PATTERNS
 %%%-----------------------------------------------------------------------------
@@ -1554,12 +1567,22 @@ validate_field_name(Name, NamePat) ->
         _ -> {error, {invalid_field_name, Name}}
     end.
 
+%% RFC 9110 Section 5.5 forbids 0x00 to 0x1F except 0x09, and 0x7F. Two
+%% instruments read the same octet set, and the length picks between them.
+%% `binary:match/2` charges one reduction per ten octets up to its trap and
+%% stops counting above it, so a long value goes to the word scan, which
+%% charges one reduction per call at every length. re:run/3 charges PCRE2
+%% backtrack loops and not octets, so it hides a scan of any length.
 -spec validate_field_value(binary(), binary:cp()) -> ok | {error, encode_error()}.
-validate_field_value(Value, ValuePat) ->
-    %% re:run charges PCRE2 backtrack loops, not octets, so it hides a scan of any length.
+validate_field_value(Value, ValuePat) when byte_size(Value) < ?VALUE_WORD_SCAN_MIN ->
     case binary:match(Value, ValuePat) of
         nomatch -> ok;
         _ -> {error, {invalid_field_value, Value}}
+    end;
+validate_field_value(Value, _ValuePat) ->
+    case has_forbidden_value_octet(Value) of
+        false -> ok;
+        true -> {error, {invalid_field_value, Value}}
     end.
 
 -spec validate_reason_phrase(binary(), binary:cp()) -> ok | {error, encode_error()}.
@@ -1596,6 +1619,51 @@ has_invalid_char(Bin) ->
 -spec has_invalid_char(binary(), binary:cp()) -> boolean().
 has_invalid_char(Bin, ValuePat) ->
     binary:match(Bin, ValuePat) =/= nomatch.
+
+%% The field value octet set of RFC 9110 Section 5.5, read seven octets at a
+%% time. Every clause reuses the match context, so the loop allocates one
+%% context for the whole value and charges one reduction per call.
+%%
+%% `forbidden_in_word/1` holds the octet set as three carry free word tests.
+%% `U` clears the high bit of every octet, and `V` maps 0x09 to 0x00, which
+%% turns "below 0x20 and not 0x09" into "between 0x01 and 0x1F". Every
+%% addend keeps each octet under 0x100, so no carry crosses an octet and
+%% every test is exact per octet rather than only for the word.
+-spec has_forbidden_value_octet(binary()) -> boolean().
+has_forbidden_value_octet(
+    <<A:56, B:56, C:56, D:56, E:56, F:56, G:56, H:56, Rest/binary>>
+) ->
+    case
+        forbidden_in_word(A) orelse forbidden_in_word(B) orelse
+            forbidden_in_word(C) orelse forbidden_in_word(D) orelse
+            forbidden_in_word(E) orelse forbidden_in_word(F) orelse
+            forbidden_in_word(G) orelse forbidden_in_word(H)
+    of
+        true -> true;
+        false -> has_forbidden_value_octet(Rest)
+    end;
+has_forbidden_value_octet(<<A:56, Rest/binary>>) ->
+    case forbidden_in_word(A) of
+        true -> true;
+        false -> has_forbidden_value_octet(Rest)
+    end;
+has_forbidden_value_octet(<<C, Rest/binary>>) when C > 16#1F, C =/= 16#7F ->
+    has_forbidden_value_octet(Rest);
+has_forbidden_value_octet(<<16#09, Rest/binary>>) ->
+    has_forbidden_value_octet(Rest);
+has_forbidden_value_octet(<<_, _/binary>>) ->
+    true;
+has_forbidden_value_octet(<<>>) ->
+    false.
+
+-compile({inline, [forbidden_in_word/1]}).
+
+-spec forbidden_in_word(non_neg_integer()) -> boolean().
+forbidden_in_word(W) ->
+    U = W band ?W_LOW7,
+    V = U bxor ?W_TAB7,
+    Low = (V + ?W_LOW7) band (bnot (V + ?W_SUB32)),
+    (((Low bor (U + ?W_ONE7)) band (bnot W)) band ?W_HIGH7) =/= 0.
 
 -spec is_chunked_framing([binary()]) -> boolean().
 is_chunked_framing(Codings) ->
