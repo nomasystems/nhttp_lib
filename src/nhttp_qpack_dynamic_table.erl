@@ -7,8 +7,8 @@
 -moduledoc """
 QPACK dynamic table implementation based on RFC 9204 Section 3.2.
 
-Uses map-based O(1) lookups for both forward (absolute index to entry) and
-reverse (name/value to absolute index) directions.
+Lookups are constant time in both directions: forward from an absolute
+index to an entry, and reverse from a name and value to an absolute index.
 """.
 
 %%%-----------------------------------------------------------------------------

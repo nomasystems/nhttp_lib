@@ -47,6 +47,7 @@ code and reason.
     scan_utf8/2,
     validate_control_frame/3
 ]).
+-compile({inline, [{decode_complete, 6}, {decode_unmasked_complete, 5}, {effective_cap, 1}]}).
 
 -export_type([
     close_code/0,
@@ -89,6 +90,8 @@ code and reason.
 -type encode_opts() :: #{mask => boolean()}.
 
 -type frame_limits() :: #{max_frame_size => pos_integer() | infinity}.
+
+-type frame_cap() :: pos_integer() | infinity.
 
 -type frame_too_large() :: {frame_too_large, DeclaredLength :: pos_integer()}.
 
@@ -135,7 +138,7 @@ declared payload length. Equivalent to `decode(Data, #{})`.
 """.
 -spec decode(binary()) -> decode_result().
 decode(Data) ->
-    decode(Data, #{}).
+    decode_message_masked(Data, infinity).
 
 -doc """
 Decode a masked WebSocket frame (client-to-server).
@@ -148,18 +151,17 @@ buffered (RFC 6455 §10.4).
 """.
 -spec decode(binary(), frame_limits()) -> decode_result().
 decode(Data, Limits) ->
-    maybe
-        ok ?= check_declared_length(Data, effective_cap(Limits)),
-        decode_message_masked(Data)
-    end.
+    decode_message_masked(Data, effective_cap(Limits)).
 
 -doc """
 Decode a raw frame with no cap on the declared payload length.
 Equivalent to `decode_raw(Data, Role, #{})`.
 """.
 -spec decode_raw(binary(), client | server) -> raw_decode_result().
-decode_raw(Data, Role) ->
-    decode_raw(Data, Role, #{}).
+decode_raw(Data, client) ->
+    decode_raw_unmasked(Data, infinity);
+decode_raw(Data, server) ->
+    decode_raw_masked(Data, infinity).
 
 -doc """
 Decode a raw frame, returning Fin, Opcode, Payload, Rest separately.
@@ -171,11 +173,10 @@ A declared payload length above `max_frame_size` returns
 buffered (RFC 6455 §10.4).
 """.
 -spec decode_raw(binary(), client | server, frame_limits()) -> raw_decode_result().
-decode_raw(Data, Role, Limits) ->
-    maybe
-        ok ?= check_declared_length(Data, effective_cap(Limits)),
-        decode_raw_role(Data, Role)
-    end.
+decode_raw(Data, client, Limits) ->
+    decode_raw_unmasked(Data, effective_cap(Limits));
+decode_raw(Data, server, Limits) ->
+    decode_raw_masked(Data, effective_cap(Limits)).
 
 -doc """
 Decode an unmasked WebSocket frame (server-to-client) with no cap on the
@@ -183,7 +184,7 @@ declared payload length. Equivalent to `decode_unmasked(Data, #{})`.
 """.
 -spec decode_unmasked(binary()) -> decode_result().
 decode_unmasked(Data) ->
-    decode_unmasked(Data, #{}).
+    decode_message_unmasked(Data, infinity).
 
 -doc """
 Decode an unmasked WebSocket frame (server-to-client).
@@ -195,10 +196,7 @@ buffered (RFC 6455 §10.4).
 """.
 -spec decode_unmasked(binary(), frame_limits()) -> decode_result().
 decode_unmasked(Data, Limits) ->
-    maybe
-        ok ?= check_declared_length(Data, effective_cap(Limits)),
-        decode_message_unmasked(Data)
-    end.
+    decode_message_unmasked(Data, effective_cap(Limits)).
 
 %%%-----------------------------------------------------------------------------
 %% SHARED HELPERS (USED BY STATEFUL MESSAGE-LEVEL DECODER)
@@ -356,17 +354,6 @@ encode_masked_header(Opcode, Len, MaskKey) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: DECODE
 %%%-----------------------------------------------------------------------------
--spec check_declared_length(binary(), pos_integer() | infinity) -> ok | {error, frame_too_large()}.
-check_declared_length(_Data, infinity) ->
-    ok;
-check_declared_length(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
-    {error, {frame_too_large, Len}};
-check_declared_length(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
-    {error, {frame_too_large, Len}};
-check_declared_length(_Data, _Cap) ->
-    %% A 7-bit length is at most 125, which the §5.5 floor on the cap always admits.
-    ok.
-
 -spec decode_complete(0 | 1, 0..7, 0..15, binary(), binary(), binary()) -> decode_result().
 decode_complete(_Fin, Rsv, _Opcode, _MaskKey, _Data, _Rest) when Rsv =/= 0 ->
     {error, reserved_bits_set};
@@ -382,184 +369,200 @@ decode_complete(Fin, 0, Opcode, MaskKey, Data, Rest) ->
             Err
     end.
 
--spec decode_message_masked(binary()) -> decode_result().
+-spec decode_message_masked(binary(), frame_cap()) -> decode_result().
+decode_message_masked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_message_masked(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
 decode_message_masked(
-    <<Fin:1, Rsv:3, Opcode:4, 1:1, Len:7, MaskKey:4/binary, Data:Len/binary, Rest/binary>>
+    <<Fin:1, Rsv:3, Opcode:4, 1:1, Len:7, MaskKey:4/binary, Data:Len/binary, Rest/binary>>, _Cap
 ) when Len < 126 ->
     decode_complete(Fin, Rsv, Opcode, MaskKey, Data, Rest);
 decode_message_masked(
-    <<Fin:1, Rsv:3, Opcode:4, 1:1, 126:7, Len:16, MaskKey:4/binary, Data:Len/binary, Rest/binary>>
+    <<Fin:1, Rsv:3, Opcode:4, 1:1, 126:7, Len:16, MaskKey:4/binary, Data:Len/binary, Rest/binary>>,
+    _Cap
 ) ->
     decode_complete(Fin, Rsv, Opcode, MaskKey, Data, Rest);
 decode_message_masked(
     <<Fin:1, Rsv:3, Opcode:4, 1:1, 127:7, 0:1, Len:63, MaskKey:4/binary, Data:Len/binary,
-        Rest/binary>>
+        Rest/binary>>,
+    _Cap
 ) ->
     decode_complete(Fin, Rsv, Opcode, MaskKey, Data, Rest);
-decode_message_masked(<<_Fin:1, _Rsv:3, _Opcode:4, 0:1, _Len:7, _Rest/binary>>) ->
+decode_message_masked(<<_Fin:1, _Rsv:3, _Opcode:4, 0:1, _Len:7, _Rest/binary>>, _Cap) ->
     {error, unmasked_client_frame};
-decode_message_masked(Binary) when byte_size(Binary) < 2 ->
+decode_message_masked(Binary, _Cap) when byte_size(Binary) < 2 ->
     {more, 2};
-decode_message_masked(<<_:8, 1:1, Len:7, Rest/binary>>) when Len < 126 ->
+decode_message_masked(<<_:8, 1:1, Len:7, Rest/binary>>, _Cap) when Len < 126 ->
     Needed = 4 + Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_message_masked(<<_:8, 1:1, 126:7, Rest/binary>>) when byte_size(Rest) < 2 ->
+decode_message_masked(<<_:8, 1:1, 126:7, Rest/binary>>, _Cap) when byte_size(Rest) < 2 ->
     {more, 2 - byte_size(Rest)};
-decode_message_masked(<<_:8, 1:1, 126:7, Len:16, Rest/binary>>) ->
+decode_message_masked(<<_:8, 1:1, 126:7, Len:16, Rest/binary>>, _Cap) ->
     Needed = 4 + Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_message_masked(<<_:8, 1:1, 127:7, Rest/binary>>) when byte_size(Rest) < 8 ->
+decode_message_masked(<<_:8, 1:1, 127:7, Rest/binary>>, _Cap) when byte_size(Rest) < 8 ->
     {more, 8 - byte_size(Rest)};
-decode_message_masked(<<_:8, 1:1, 127:7, _:1, Len:63, Rest/binary>>) ->
+decode_message_masked(<<_:8, 1:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
     Needed = 4 + Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_message_masked(_) ->
+decode_message_masked(_, _Cap) ->
     {error, invalid_frame}.
 
--spec decode_message_unmasked(binary()) -> decode_result().
-decode_message_unmasked(<<Fin:1, Rsv:3, Opcode:4, 0:1, Len:7, Data:Len/binary, Rest/binary>>) when
+-spec decode_message_unmasked(binary(), frame_cap()) -> decode_result().
+decode_message_unmasked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_message_unmasked(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_message_unmasked(
+    <<Fin:1, Rsv:3, Opcode:4, 0:1, Len:7, Data:Len/binary, Rest/binary>>, _Cap
+) when
     Len < 126
 ->
     decode_unmasked_complete(Fin, Rsv, Opcode, Data, Rest);
 decode_message_unmasked(
-    <<Fin:1, Rsv:3, Opcode:4, 0:1, 126:7, Len:16, Data:Len/binary, Rest/binary>>
+    <<Fin:1, Rsv:3, Opcode:4, 0:1, 126:7, Len:16, Data:Len/binary, Rest/binary>>, _Cap
 ) ->
     decode_unmasked_complete(Fin, Rsv, Opcode, Data, Rest);
 decode_message_unmasked(
-    <<Fin:1, Rsv:3, Opcode:4, 0:1, 127:7, 0:1, Len:63, Data:Len/binary, Rest/binary>>
+    <<Fin:1, Rsv:3, Opcode:4, 0:1, 127:7, 0:1, Len:63, Data:Len/binary, Rest/binary>>, _Cap
 ) ->
     decode_unmasked_complete(Fin, Rsv, Opcode, Data, Rest);
-decode_message_unmasked(<<_:8, 1:1, _:7, _/binary>>) ->
+decode_message_unmasked(<<_:8, 1:1, _:7, _/binary>>, _Cap) ->
     {error, masked_server_frame};
-decode_message_unmasked(Binary) when byte_size(Binary) < 2 ->
+decode_message_unmasked(Binary, _Cap) when byte_size(Binary) < 2 ->
     {more, 2};
-decode_message_unmasked(<<_:8, 0:1, Len:7, Rest/binary>>) when Len < 126 ->
+decode_message_unmasked(<<_:8, 0:1, Len:7, Rest/binary>>, _Cap) when Len < 126 ->
     Needed = Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_message_unmasked(<<_:8, 0:1, 126:7, Rest/binary>>) when byte_size(Rest) < 2 ->
+decode_message_unmasked(<<_:8, 0:1, 126:7, Rest/binary>>, _Cap) when byte_size(Rest) < 2 ->
     {more, 2 - byte_size(Rest)};
-decode_message_unmasked(<<_:8, 0:1, 126:7, Len:16, Rest/binary>>) ->
+decode_message_unmasked(<<_:8, 0:1, 126:7, Len:16, Rest/binary>>, _Cap) ->
     Needed = Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_message_unmasked(<<_:8, 0:1, 127:7, Rest/binary>>) when byte_size(Rest) < 8 ->
+decode_message_unmasked(<<_:8, 0:1, 127:7, Rest/binary>>, _Cap) when byte_size(Rest) < 8 ->
     {more, 8 - byte_size(Rest)};
-decode_message_unmasked(<<_:8, 0:1, 127:7, _:1, Len:63, Rest/binary>>) ->
+decode_message_unmasked(<<_:8, 0:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
     Needed = Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_message_unmasked(_) ->
+decode_message_unmasked(_, _Cap) ->
     {error, invalid_frame}.
 
--spec decode_raw_masked(binary()) -> raw_decode_result().
-decode_raw_masked(<<_Fin:1, Rsv:3, _Opcode:4, _/binary>>) when Rsv =/= 0 ->
+-spec decode_raw_masked(binary(), frame_cap()) -> raw_decode_result().
+decode_raw_masked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_raw_masked(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_raw_masked(<<_Fin:1, Rsv:3, _Opcode:4, _/binary>>, _Cap) when Rsv =/= 0 ->
     {error, reserved_bits_set};
 decode_raw_masked(
-    <<Fin:1, 0:3, Opcode:4, 1:1, Len:7, MaskKey:4/binary, Data:Len/binary, Rest/binary>>
+    <<Fin:1, 0:3, Opcode:4, 1:1, Len:7, MaskKey:4/binary, Data:Len/binary, Rest/binary>>, _Cap
 ) when Len < 126 ->
     {ok, Fin, Opcode, unmask(MaskKey, Data), Rest};
 decode_raw_masked(
-    <<Fin:1, 0:3, Opcode:4, 1:1, 126:7, Len:16, MaskKey:4/binary, Data:Len/binary, Rest/binary>>
+    <<Fin:1, 0:3, Opcode:4, 1:1, 126:7, Len:16, MaskKey:4/binary, Data:Len/binary, Rest/binary>>,
+    _Cap
 ) ->
     {ok, Fin, Opcode, unmask(MaskKey, Data), Rest};
 decode_raw_masked(
     <<Fin:1, 0:3, Opcode:4, 1:1, 127:7, 0:1, Len:63, MaskKey:4/binary, Data:Len/binary,
-        Rest/binary>>
+        Rest/binary>>,
+    _Cap
 ) ->
     {ok, Fin, Opcode, unmask(MaskKey, Data), Rest};
-decode_raw_masked(<<_:8, 0:1, _:7, _/binary>>) ->
+decode_raw_masked(<<_:8, 0:1, _:7, _/binary>>, _Cap) ->
     {error, unmasked_client_frame};
-decode_raw_masked(Binary) when byte_size(Binary) < 2 ->
+decode_raw_masked(Binary, _Cap) when byte_size(Binary) < 2 ->
     {more, 2};
-decode_raw_masked(<<_:8, 1:1, Len:7, Rest/binary>>) when Len < 126 ->
+decode_raw_masked(<<_:8, 1:1, Len:7, Rest/binary>>, _Cap) when Len < 126 ->
     Needed = 4 + Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_raw_masked(<<_:8, 1:1, 126:7, Rest/binary>>) when byte_size(Rest) < 2 ->
+decode_raw_masked(<<_:8, 1:1, 126:7, Rest/binary>>, _Cap) when byte_size(Rest) < 2 ->
     {more, 2 - byte_size(Rest)};
-decode_raw_masked(<<_:8, 1:1, 126:7, Len:16, Rest/binary>>) ->
+decode_raw_masked(<<_:8, 1:1, 126:7, Len:16, Rest/binary>>, _Cap) ->
     Needed = 4 + Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_raw_masked(<<_:8, 1:1, 127:7, Rest/binary>>) when byte_size(Rest) < 8 ->
+decode_raw_masked(<<_:8, 1:1, 127:7, Rest/binary>>, _Cap) when byte_size(Rest) < 8 ->
     {more, 8 - byte_size(Rest)};
-decode_raw_masked(<<_:8, 1:1, 127:7, _:1, Len:63, Rest/binary>>) ->
+decode_raw_masked(<<_:8, 1:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
     Needed = 4 + Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_raw_masked(_) ->
+decode_raw_masked(_, _Cap) ->
     {error, invalid_frame}.
 
--spec decode_raw_role(binary(), client | server) -> raw_decode_result().
-decode_raw_role(Data, client) ->
-    decode_raw_unmasked(Data);
-decode_raw_role(Data, server) ->
-    decode_raw_masked(Data).
-
--spec decode_raw_unmasked(binary()) -> raw_decode_result().
-decode_raw_unmasked(<<_:1, Rsv:3, _:4, _/binary>>) when Rsv =/= 0 ->
+-spec decode_raw_unmasked(binary(), frame_cap()) -> raw_decode_result().
+decode_raw_unmasked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_raw_unmasked(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+decode_raw_unmasked(<<_:1, Rsv:3, _:4, _/binary>>, _Cap) when Rsv =/= 0 ->
     {error, reserved_bits_set};
-decode_raw_unmasked(<<Fin:1, 0:3, Opcode:4, 0:1, Len:7, Data:Len/binary, Rest/binary>>) when
+decode_raw_unmasked(<<Fin:1, 0:3, Opcode:4, 0:1, Len:7, Data:Len/binary, Rest/binary>>, _Cap) when
     Len < 126
 ->
     {ok, Fin, Opcode, Data, Rest};
 decode_raw_unmasked(
-    <<Fin:1, 0:3, Opcode:4, 0:1, 126:7, Len:16, Data:Len/binary, Rest/binary>>
+    <<Fin:1, 0:3, Opcode:4, 0:1, 126:7, Len:16, Data:Len/binary, Rest/binary>>, _Cap
 ) ->
     {ok, Fin, Opcode, Data, Rest};
 decode_raw_unmasked(
-    <<Fin:1, 0:3, Opcode:4, 0:1, 127:7, 0:1, Len:63, Data:Len/binary, Rest/binary>>
+    <<Fin:1, 0:3, Opcode:4, 0:1, 127:7, 0:1, Len:63, Data:Len/binary, Rest/binary>>, _Cap
 ) ->
     {ok, Fin, Opcode, Data, Rest};
-decode_raw_unmasked(<<_:8, 1:1, _:7, _/binary>>) ->
+decode_raw_unmasked(<<_:8, 1:1, _:7, _/binary>>, _Cap) ->
     {error, masked_server_frame};
-decode_raw_unmasked(Binary) when byte_size(Binary) < 2 ->
+decode_raw_unmasked(Binary, _Cap) when byte_size(Binary) < 2 ->
     {more, 2};
-decode_raw_unmasked(<<_:8, 0:1, Len:7, Rest/binary>>) when Len < 126 ->
+decode_raw_unmasked(<<_:8, 0:1, Len:7, Rest/binary>>, _Cap) when Len < 126 ->
     Needed = Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_raw_unmasked(<<_:8, 0:1, 126:7, Rest/binary>>) when byte_size(Rest) < 2 ->
+decode_raw_unmasked(<<_:8, 0:1, 126:7, Rest/binary>>, _Cap) when byte_size(Rest) < 2 ->
     {more, 2 - byte_size(Rest)};
-decode_raw_unmasked(<<_:8, 0:1, 126:7, Len:16, Rest/binary>>) ->
+decode_raw_unmasked(<<_:8, 0:1, 126:7, Len:16, Rest/binary>>, _Cap) ->
     Needed = Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_raw_unmasked(<<_:8, 0:1, 127:7, Rest/binary>>) when byte_size(Rest) < 8 ->
+decode_raw_unmasked(<<_:8, 0:1, 127:7, Rest/binary>>, _Cap) when byte_size(Rest) < 8 ->
     {more, 8 - byte_size(Rest)};
-decode_raw_unmasked(<<_:8, 0:1, 127:7, _:1, Len:63, Rest/binary>>) ->
+decode_raw_unmasked(<<_:8, 0:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
     Needed = Len - byte_size(Rest),
     case Needed > 0 of
         true -> {more, Needed};
         false -> {error, decode_failed}
     end;
-decode_raw_unmasked(_) ->
+decode_raw_unmasked(_, _Cap) ->
     {error, invalid_frame}.
 
 -spec decode_unmasked_complete(0 | 1, 0..7, 0..15, binary(), binary()) -> decode_result().
@@ -576,7 +579,7 @@ decode_unmasked_complete(Fin, 0, Opcode, Data, Rest) ->
             Err
     end.
 
--spec effective_cap(frame_limits()) -> pos_integer() | infinity.
+-spec effective_cap(frame_limits()) -> frame_cap().
 effective_cap(Limits) ->
     case maps:get(max_frame_size, Limits, infinity) of
         infinity -> infinity;

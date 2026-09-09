@@ -337,9 +337,7 @@ send_headers(
 
 -doc """
 Encode and send a complete response (headers + body) on a request stream.
-Combines HEADERS and DATA frames into a single `send_fin` action, avoiding
-redundant stream lookups and state transitions compared to calling
-`send_headers/4` then `send_data/4` separately.
+Combines the HEADERS and DATA frames into one `send_fin` action.
 """.
 -spec send_response(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), iodata()) ->
     {ok, conn(), [action()]} | {error, h3_error()}.

@@ -4,19 +4,19 @@
 Protocol-agnostic header utilities.
 
 Headers carried by `t:nhttp_lib:headers/0` are an ordered list of
-`{Name, Value}` binary pairs. The codec layers normalise names to
-lowercase at parse time. Application code should construct headers
-with lowercase names; the lookup functions in this module accept any
-casing and normalise internally so mixed-case calls are still safe.
+`{Name, Value}` binary pairs. The codec layers write names in lowercase
+at parse time. This module stores the name that the caller gives and
+never rewrites it. `append/3` and `set/3` store the lowercase form of
+the name that they add, and leave every other entry alone.
 
 Key invariants:
 
-- Header names compare case-insensitively (RFC 9110 §5.1). All
-  lookup functions in this module call `to_lower/1` on the input
-  name before matching.
-- Multi-valued headers retain insertion order. `get/2,3` returns the
-  first match; `delete/2` removes every occurrence; `append/3`
-  appends without removing existing entries.
+- Header names compare case-insensitively (RFC 9110 §5.1). A lookup
+  matches a stored name in any case, so `get/2` with
+  `<<"content-length">>` finds a stored `Content-Length`.
+- Multi-valued headers keep insertion order. `get/2,3` returns the
+  first match. `delete/2` removes every occurrence. `append/3`
+  appends and keeps existing entries.
 """.
 
 -compile(
@@ -35,9 +35,27 @@ Key invariants:
     has/2,
     is_tchar/1,
     is_token/1,
+    name_eq/2,
+    non_tchar_pattern/0,
     set/3,
     to_lower/1
 ]).
+
+%%%-----------------------------------------------------------------------------
+%% COMPILED PATTERNS
+%%%-----------------------------------------------------------------------------
+-define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
+
+-on_load(init_patterns/0).
+
+-spec init_patterns() -> ok.
+init_patterns() ->
+    ok = persistent_term:put(?PT_NON_TCHAR, binary:compile_pattern(non_tchar_bytes())),
+    ok.
+
+-spec non_tchar_bytes() -> [binary(), ...].
+non_tchar_bytes() ->
+    [<<C>> || C <- lists:seq(0, 255), not is_tchar(C)].
 
 %%%-----------------------------------------------------------------------------
 %% PUBLIC API
@@ -117,8 +135,36 @@ True iff `Bin` is a `token` per RFC 9110 §5.6.2: `token = 1*tchar`. An
 empty binary is not a token.
 """.
 -spec is_token(binary()) -> boolean().
-is_token(<<>>) -> false;
-is_token(Bin) -> is_token_chars(Bin).
+is_token(<<>>) ->
+    false;
+is_token(Bin) ->
+    binary:match(Bin, persistent_term:get(?PT_NON_TCHAR)) =:= nomatch.
+
+-doc """
+True iff two field names name the same field. Field names compare
+case-insensitively (RFC 9110 §5.1), so `<<"Content-Length">>` and
+`<<"content-length">>` name the same field.
+
+A caller that asks about a fixed set of names walks the list once and
+compares each stored name with this function.
+""".
+-spec name_eq(binary(), binary()) -> boolean().
+name_eq(Name, Name) ->
+    true;
+name_eq(Name, Other) when byte_size(Name) =:= byte_size(Other) ->
+    name_eq(Name, Other, byte_size(Name) - 1);
+name_eq(_Name, _Other) ->
+    false.
+
+-doc """
+The compiled pattern that matches every octet that is not a `tchar`.
+
+A caller that scans many tokens reads the pattern once and passes it to
+`binary:match/2` for each one.
+""".
+-spec non_tchar_pattern() -> binary:cp().
+non_tchar_pattern() ->
+    persistent_term:get(?PT_NON_TCHAR).
 
 -doc """
 Replace every occurrence of `Name` with a single `{Name, Value}` entry.
@@ -131,10 +177,9 @@ set(Name, Value, Headers) ->
     do_delete(Lower, Headers, []) ++ [{Lower, Value}].
 
 -doc """
-Lowercase an ASCII binary using HTTP header semantics. Common header
-names hit a binary-pattern fast path; everything else falls through to
-a comprehension. RFC 9110 §5.1: field names are ASCII, so non-ASCII
-upper-half bytes pass through unchanged.
+Lowercase an ASCII binary using HTTP header semantics. RFC 9110 §5.1:
+field names are ASCII, so non-ASCII upper-half bytes pass through
+unchanged.
 """.
 -spec to_lower(binary()) -> binary().
 to_lower(<<"host">>) -> <<"host">>;
@@ -203,31 +248,57 @@ to_lower(<<>>) -> <<>>;
 to_lower(Bin) -> <<<<(to_lower_byte(C))>> || <<C>> <= Bin>>.
 
 %%%-----------------------------------------------------------------------------
+%%%-----------------------------------------------------------------------------
 %% INTERNAL
 %%%-----------------------------------------------------------------------------
 -spec do_delete(binary(), nhttp_lib:headers(), nhttp_lib:headers()) -> nhttp_lib:headers().
-do_delete(Name, [{Name, _} | Rest], Acc) -> do_delete(Name, Rest, Acc);
-do_delete(Name, [Pair | Rest], Acc) -> do_delete(Name, Rest, [Pair | Acc]);
-do_delete(_, [], Acc) -> lists:reverse(Acc).
+do_delete(Name, [{Name, _} | Rest], Acc) ->
+    do_delete(Name, Rest, Acc);
+do_delete(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
+    case name_eq(Stored, Name, byte_size(Name) - 1) of
+        true -> do_delete(Name, Rest, Acc);
+        false -> do_delete(Name, Rest, [Pair | Acc])
+    end;
+do_delete(Name, [Pair | Rest], Acc) ->
+    do_delete(Name, Rest, [Pair | Acc]);
+do_delete(_, [], Acc) ->
+    lists:reverse(Acc).
 
 -spec do_get(binary(), nhttp_lib:headers(), Default) -> binary() | Default.
-do_get(Name, [{Name, Value} | _], _Default) -> Value;
-do_get(Name, [_ | Rest], Default) -> do_get(Name, Rest, Default);
-do_get(_, [], Default) -> Default.
+do_get(Name, [{Name, Value} | _], _Default) ->
+    Value;
+do_get(Name, [{Stored, Value} | Rest], Default) when byte_size(Stored) =:= byte_size(Name) ->
+    case name_eq(Stored, Name, byte_size(Name) - 1) of
+        true -> Value;
+        false -> do_get(Name, Rest, Default)
+    end;
+do_get(Name, [_ | Rest], Default) ->
+    do_get(Name, Rest, Default);
+do_get(_, [], Default) ->
+    Default.
 
 -spec do_has(binary(), nhttp_lib:headers()) -> boolean().
-do_has(Name, [{Name, _} | _]) -> true;
-do_has(Name, [_ | Rest]) -> do_has(Name, Rest);
-do_has(_, []) -> false.
-
--spec is_token_chars(binary()) -> boolean().
-is_token_chars(<<>>) ->
+do_has(Name, [{Name, _} | _]) ->
     true;
-is_token_chars(<<C, Rest/binary>>) ->
-    case is_tchar(C) of
-        true -> is_token_chars(Rest);
-        false -> false
-    end.
+do_has(Name, [{Stored, _} | Rest]) when byte_size(Stored) =:= byte_size(Name) ->
+    name_eq(Stored, Name, byte_size(Name) - 1) orelse do_has(Name, Rest);
+do_has(Name, [_ | Rest]) ->
+    do_has(Name, Rest);
+do_has(_, []) ->
+    false.
+
+-compile({inline, [name_eq/3]}).
+-spec name_eq(binary(), binary(), integer()) -> boolean().
+name_eq(_Stored, _Other, -1) ->
+    true;
+name_eq(Stored, Other, I) ->
+    byte_name_eq(binary:at(Stored, I), binary:at(Other, I)) andalso
+        name_eq(Stored, Other, I - 1).
+
+-compile({inline, [byte_name_eq/2]}).
+-spec byte_name_eq(byte(), byte()) -> boolean().
+byte_name_eq(C, C) -> true;
+byte_name_eq(C, D) -> to_lower_byte(C) =:= to_lower_byte(D).
 
 -compile({inline, [to_lower_byte/1]}).
 -spec to_lower_byte(byte()) -> byte().

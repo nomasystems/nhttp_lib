@@ -4,13 +4,8 @@
 Static Huffman encoder/decoder for HPACK (RFC 7541 Appendix B).
 
 This module implements the static Huffman table used by HPACK for
-HTTP/2 header compression. The code table is optimized for HTTP
-header values with common ASCII characters having shorter codes.
-
-Decoding uses a generated 4-bit (nibble) finite state machine: each
-state is a function clause that consumes one nibble of the input and
-emits decoded bytes, which the BEAM compiles to a per-state jump table.
-The encode function uses bit accumulation with proper EOS padding.
+HTTP/2 header compression. The code table gives the shortest codes to
+the ASCII characters that are common in HTTP header values.
 """.
 
 %%%-----------------------------------------------------------------------------

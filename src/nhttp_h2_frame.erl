@@ -3,9 +3,7 @@
 -moduledoc """
 HTTP/2 binary frame encoding and decoding.
 
-This module implements RFC 9113 Section 4-6 binary framing layer.
-It provides zero-copy parsing using binary pattern matching and
-efficient encoding using iolists.
+This module implements the RFC 9113 Section 4 to 6 binary framing layer.
 
 ## Decoding
 
@@ -363,7 +361,7 @@ headers_with_continuation(StreamId, EndStream, HeaderBlock, MaxFrameSize) ->
 preface() ->
     {ok, ?PREFACE}.
 
--doc "Split buffer at position, returning the remainder. This is the intentional single allocation point for callers.".
+-doc "Split buffer at position, returning the remainder.".
 -spec split_at(binary(), non_neg_integer()) -> binary().
 split_at(<<Bin/binary>>, Pos) ->
     <<_:Pos/binary, Rest/binary>> = Bin,

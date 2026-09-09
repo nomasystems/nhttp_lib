@@ -53,6 +53,8 @@ Flow-control and END_STREAM ride on the DATA frame.
 %% INLINE DIRECTIVES (PERFORMANCE OPTIMIZATION)
 %%%-----------------------------------------------------------------------------
 -compile({inline, [is_active_state/1]}).
+-compile({inline, [is_peer_initiated/2]}).
+-compile({inline, [update_peer_opened_count/5]}).
 -compile({inline, [transition_on_recv_end_stream/2]}).
 -compile({inline, [transition_on_send_end_stream/2]}).
 
@@ -303,6 +305,17 @@ set_peer(#h2_conn{} = Conn, {{_, _, _, _, _, _, _, _}, Port} = Peer) when
 %%%-----------------------------------------------------------------------------
 -doc "Process incoming data and return events. May return frames to send (e.g., SETTINGS_ACK, PING_ACK, WINDOW_UPDATE).".
 -spec recv(conn(), binary()) -> recv_result().
+recv(#h2_conn{role = server, state = preface, buffer = <<>>} = Conn, Data) ->
+    maybe
+        ok ?= validate_preface_buffer(Data),
+        recv_loop(Conn, Data, [], [])
+    end;
+recv(#h2_conn{role = server, state = preface, buffer = Buffer} = Conn, Data) ->
+    Buffered = <<Buffer/binary, Data/binary>>,
+    maybe
+        ok ?= validate_preface_buffer(Buffered),
+        recv_loop(Conn#h2_conn{buffer = <<>>}, Buffered, [], [])
+    end;
 recv(#h2_conn{buffer = <<>>} = Conn, Data) ->
     recv_loop(Conn, Data, [], []);
 recv(#h2_conn{buffer = Buffer} = Conn, Data) ->
@@ -1146,8 +1159,8 @@ rapid_reset_error() ->
             "(RFC 9113 Section 10.5)"
         >>}}.
 
--spec recv_frames(conn(), binary(), [[event()]], iodata()) -> recv_result().
-recv_frames(Conn, Data, EventsAcc, ToSend) ->
+-spec recv_loop(conn(), binary(), [[event()]], iodata()) -> recv_result().
+recv_loop(Conn, Data, EventsAcc, ToSend) ->
     MaxFrameSize = maps:get(
         max_frame_size, Conn#h2_conn.local_settings, ?H2_DEFAULT_MAX_FRAME_SIZE
     ),
@@ -1180,15 +1193,6 @@ recv_frames(Conn, Data, EventsAcc, ToSend) ->
         {error, _} = Error ->
             Error
     end.
-
--spec recv_loop(conn(), binary(), [[event()]], iodata()) -> recv_result().
-recv_loop(#h2_conn{role = server, state = preface} = Conn, Data, EventsAcc, ToSend) ->
-    case validate_preface_buffer(Data) of
-        ok -> recv_frames(Conn, Data, EventsAcc, ToSend);
-        {error, _} = Error -> Error
-    end;
-recv_loop(Conn, Data, EventsAcc, ToSend) ->
-    recv_frames(Conn, Data, EventsAcc, ToSend).
 
 -spec store_or_remove_stream(
     #{nhttp_lib:stream_id() => #h2_stream{}}, nhttp_lib:stream_id(), #h2_stream{}

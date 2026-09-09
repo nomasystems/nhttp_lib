@@ -96,7 +96,8 @@ groups() ->
             h1_encode_response_single_terminator,
             h1_request_method_is_token,
             h1_content_length_is_digits,
-            h1_transfer_encoding_field_lines_join
+            h1_transfer_encoding_field_lines_join,
+            h1_field_value_scan_agrees_with_the_octet_set
         ]},
         {h2_props, [parallel], [
             h2_headers_roundtrip,
@@ -360,6 +361,9 @@ h1_content_length_is_digits(Config) ->
 
 h1_transfer_encoding_field_lines_join(Config) ->
     run_property(nhttp_h1_props, prop_transfer_encoding_field_lines_join, Config).
+
+h1_field_value_scan_agrees_with_the_octet_set(Config) ->
+    run_property(nhttp_h1_props, prop_field_value_scan_agrees_with_the_octet_set, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% HTTP/2 PROPERTY TESTS

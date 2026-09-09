@@ -148,6 +148,43 @@ so a re-encode also discards the rest.
 -define(RFC850_YEAR_CENTURY_THRESHOLD, 100).
 
 %%%-----------------------------------------------------------------------------
+%% COMPILED PATTERNS
+%%%-----------------------------------------------------------------------------
+-define(PT_ENCODE_PATTERNS, {?MODULE, encode_patterns}).
+-define(PT_NON_PATH_OCTET, {?MODULE, non_path_octet_pattern}).
+
+-on_load(init_patterns/0).
+
+-spec init_patterns() -> ok.
+init_patterns() ->
+    ok = persistent_term:put(
+        ?PT_NON_PATH_OCTET, binary:compile_pattern(non_path_octet_bytes())
+    ),
+    ok = persistent_term:put(
+        ?PT_ENCODE_PATTERNS,
+        {nhttp_headers:non_tchar_pattern(), binary:compile_pattern(non_cookie_octet_bytes())}
+    ),
+    ok.
+
+-spec non_cookie_octet_bytes() -> [binary(), ...].
+non_cookie_octet_bytes() ->
+    [<<C>> || C <- lists:seq(0, 255), not is_cookie_octet(C)].
+
+-spec is_cookie_octet(byte()) -> boolean().
+is_cookie_octet(16#21) -> true;
+is_cookie_octet(C) when C >= 16#23, C =< 16#2B -> true;
+is_cookie_octet(C) when C >= 16#2D, C =< 16#3A -> true;
+is_cookie_octet(C) when C >= 16#3C, C =< 16#5B -> true;
+is_cookie_octet(C) when C >= 16#5D, C =< 16#7E -> true;
+is_cookie_octet(_C) -> false.
+
+-spec non_path_octet_bytes() -> [binary(), ...].
+non_path_octet_bytes() ->
+    [<<C>> || C <- lists:seq(16#00, 16#1F)] ++
+        [<<16#7F>>, <<$;>>] ++
+        [<<C>> || C <- lists:seq(16#80, 16#FF)].
+
+%%%-----------------------------------------------------------------------------
 %% COOKIE HEADER ENCODING/DECODING
 %%%-----------------------------------------------------------------------------
 -doc """
@@ -199,11 +236,15 @@ Encode arbitrary data with Base64 before you put it in a cookie.
 -spec encode_cookie([t()]) -> {ok, binary()} | {error, cookie_error()}.
 encode_cookie([]) ->
     {ok, <<>>};
-encode_cookie([#{name := Name, value := Value} | Rest] = Cookies) ->
+encode_cookie([#{name := Name, value := Value} | Rest]) ->
+    {NamePat, OctetPat} = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        ok ?= validate_cookies(Cookies),
-        Pairs = [encode_cookie_pair(C) || C <- Rest],
-        {ok, iolist_to_binary([Name, $=, Value | Pairs])}
+        ok ?= validate_cookie_name(Name, NamePat),
+        ok ?= validate_cookie_value(Value, OctetPat),
+        case encode_cookie_pairs(Rest, NamePat, OctetPat) of
+            {error, _} = Err -> Err;
+            Pairs -> {ok, iolist_to_binary([Name, $=, Value | Pairs])}
+        end
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -277,9 +318,10 @@ bytes, which are often a session token.
 """.
 -spec encode_set_cookie(set_cookie()) -> {ok, binary()} | {error, set_cookie_error()}.
 encode_set_cookie(#{name := Name, value := Value} = SetCookie) ->
+    {NamePat, OctetPat} = persistent_term:get(?PT_ENCODE_PATTERNS),
     maybe
-        ok ?= validate_cookie_name(Name),
-        ok ?= validate_cookie_value(Value),
+        ok ?= validate_cookie_name(Name, NamePat),
+        ok ?= validate_cookie_value(Value, OctetPat),
         ok ?= validate_set_cookie_attrs(SetCookie),
         Base = <<Name/binary, "=", Value/binary>>,
         {ok, encode_set_cookie_attrs(Base, SetCookie)}
@@ -288,64 +330,75 @@ encode_set_cookie(#{name := Name, value := Value} = SetCookie) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - COOKIE ENCODING
 %%%-----------------------------------------------------------------------------
--spec encode_cookie_pair(t()) -> iolist().
-encode_cookie_pair(#{name := Name, value := Value}) ->
-    [<<"; ">>, Name, $=, Value].
+-spec encode_cookie_pairs([t()], binary:cp(), binary:cp()) ->
+    iolist() | {error, cookie_error()}.
+encode_cookie_pairs([], _NamePat, _OctetPat) ->
+    [];
+encode_cookie_pairs([#{name := Name, value := Value} | Rest], NamePat, OctetPat) ->
+    maybe
+        ok ?= validate_cookie_name(Name, NamePat),
+        ok ?= validate_cookie_value(Value, OctetPat),
+        case encode_cookie_pairs(Rest, NamePat, OctetPat) of
+            {error, _} = Err -> Err;
+            Tail -> [<<"; ">>, Name, $=, Value | Tail]
+        end
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - ENCODE VALIDATION (RFC 6265 SECTION 4.1.1)
 %%%-----------------------------------------------------------------------------
--spec validate_cookies([t()]) -> ok | {error, cookie_error()}.
-validate_cookies([]) ->
-    ok;
-validate_cookies([#{name := Name, value := Value} | Rest]) ->
-    maybe
-        ok ?= validate_cookie_name(Name),
-        ok ?= validate_cookie_value(Value),
-        validate_cookies(Rest)
-    end.
+-compile({inline, [validate_cookie_name/2, validate_cookie_value/2]}).
 
--spec validate_cookie_name(binary()) -> ok | {error, {invalid_cookie_name, name_violation()}}.
-validate_cookie_name(<<>>) ->
+-spec validate_cookie_name(binary(), binary:cp()) ->
+    ok | {error, {invalid_cookie_name, name_violation()}}.
+validate_cookie_name(<<>>, _NamePat) ->
     {error, {invalid_cookie_name, empty}};
-validate_cookie_name(Name) ->
-    case nhttp_headers:is_token(Name) of
-        true -> ok;
-        false -> {error, {invalid_cookie_name, non_token_octet}}
+validate_cookie_name(Name, NamePat) ->
+    case binary:match(Name, NamePat) of
+        nomatch -> ok;
+        _ -> {error, {invalid_cookie_name, non_token_octet}}
     end.
 
--spec validate_cookie_value(binary()) -> ok | {error, {invalid_cookie_value, value_violation()}}.
-validate_cookie_value(<<$", Rest/binary>>) ->
-    validate_quoted_cookie_value(Rest);
-validate_cookie_value(Value) ->
-    check_cookie_octets(Value).
-
--spec validate_quoted_cookie_value(binary()) ->
+-spec validate_cookie_value(binary(), binary:cp()) ->
     ok | {error, {invalid_cookie_value, value_violation()}}.
-validate_quoted_cookie_value(<<>>) ->
-    {error, {invalid_cookie_value, unbalanced_quote}};
-validate_quoted_cookie_value(Rest) ->
-    Last = byte_size(Rest) - 1,
-    case binary:at(Rest, Last) of
-        $" -> check_cookie_octets(binary:part(Rest, 0, Last));
-        _ -> {error, {invalid_cookie_value, unbalanced_quote}}
+validate_cookie_value(Value, OctetPat) ->
+    case binary:match(Value, OctetPat) of
+        nomatch -> ok;
+        {0, _} -> validate_quoted_cookie_value(Value, byte_size(Value), OctetPat);
+        {Pos, _} -> {error, {invalid_cookie_value, classify_cookie_octet(binary:at(Value, Pos))}}
     end.
 
--spec check_cookie_octets(binary()) -> ok | {error, {invalid_cookie_value, value_violation()}}.
-check_cookie_octets(<<>>) ->
+-spec validate_quoted_cookie_value(binary(), non_neg_integer(), binary:cp()) ->
+    ok | {error, {invalid_cookie_value, value_violation()}}.
+validate_quoted_cookie_value(Value, Size, OctetPat) when Size >= 2 ->
+    case {binary:at(Value, 0), binary:at(Value, Size - 1)} of
+        {$", $"} -> scan_quoted_cookie_octets(Value, Size, OctetPat);
+        {$", _} -> {error, {invalid_cookie_value, unbalanced_quote}};
+        {C, _} -> {error, {invalid_cookie_value, classify_cookie_octet(C)}}
+    end;
+validate_quoted_cookie_value(Value, _Size, _OctetPat) ->
+    quoted_or_bad_octet(binary:at(Value, 0)).
+
+-spec quoted_or_bad_octet(byte()) -> {error, {invalid_cookie_value, value_violation()}}.
+quoted_or_bad_octet($") -> {error, {invalid_cookie_value, unbalanced_quote}};
+quoted_or_bad_octet(C) -> {error, {invalid_cookie_value, classify_cookie_octet(C)}}.
+
+-spec scan_quoted_cookie_octets(binary(), non_neg_integer(), binary:cp()) ->
+    ok | {error, {invalid_cookie_value, value_violation()}}.
+scan_quoted_cookie_octets(_Value, 2, _OctetPat) ->
     ok;
-check_cookie_octets(<<C, _/binary>>) when C =< 16#1F; C =:= 16#7F ->
-    {error, {invalid_cookie_value, control_char}};
-check_cookie_octets(<<C, _/binary>>) when
-    C =:= $\s; C =:= $"; C =:= $,; C =:= $;; C =:= $\\
-->
-    {error, {invalid_cookie_value, separator}};
-check_cookie_octets(<<C, _/binary>>) when C >= 16#80 ->
-    {error, {invalid_cookie_value, non_ascii}};
-check_cookie_octets(<<_, Rest/binary>>) ->
-    %% What survives the clauses above is exactly cookie-octet:
-    %% %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E.
-    check_cookie_octets(Rest).
+scan_quoted_cookie_octets(Value, Size, OctetPat) ->
+    case binary:match(Value, OctetPat, [{scope, {1, Size - 2}}]) of
+        nomatch ->
+            ok;
+        {Pos, _} ->
+            {error, {invalid_cookie_value, classify_cookie_octet(binary:at(Value, Pos))}}
+    end.
+
+-spec classify_cookie_octet(byte()) -> control_char | separator | non_ascii.
+classify_cookie_octet(C) when C =< 16#1F; C =:= 16#7F -> control_char;
+classify_cookie_octet(C) when C >= 16#80 -> non_ascii;
+classify_cookie_octet(_C) -> separator.
 
 -spec validate_set_cookie_attrs(set_cookie()) -> ok | {error, set_cookie_error()}.
 validate_set_cookie_attrs(SetCookie) ->
@@ -367,67 +420,69 @@ validate_optional_domain(_) ->
     ok.
 
 -spec validate_path(binary()) -> ok | {error, {invalid_path, path_violation()}}.
-validate_path(<<>>) ->
+validate_path(Path) ->
+    validate_path(Path, byte_size(Path)).
+
+-spec validate_path(binary(), non_neg_integer()) ->
+    ok | {error, {invalid_path, path_violation()}}.
+validate_path(_Path, 0) ->
     {error, {invalid_path, empty}};
-validate_path(<<$/, Rest/binary>>) ->
-    check_path_octets(Rest);
-validate_path(_) ->
-    %% RFC 6265 Section 5.2.4: a user agent replaces any other value with
-    %% the default-path, so emitting one is a silent no-op.
-    {error, {invalid_path, no_leading_slash}}.
-
--spec check_path_octets(binary()) -> ok | {error, {invalid_path, path_violation()}}.
-check_path_octets(<<>>) ->
-    ok;
-check_path_octets(<<C, _/binary>>) when C =< 16#1F; C =:= 16#7F ->
-    {error, {invalid_path, control_char}};
-check_path_octets(<<$;, _/binary>>) ->
-    {error, {invalid_path, semicolon}};
-check_path_octets(<<C, _/binary>>) when C >= 16#80 ->
-    {error, {invalid_path, non_ascii}};
-check_path_octets(<<_, Rest/binary>>) ->
-    check_path_octets(Rest).
-
--spec validate_domain(binary()) -> ok | {error, {invalid_domain, domain_violation()}}.
-validate_domain(<<>>) ->
-    {error, {invalid_domain, empty}};
-validate_domain(<<$., Rest/binary>>) ->
-    %% RFC 6265 Section 5.2.3: a user agent strips one leading dot.
-    validate_domain_labels(Rest);
-validate_domain(Domain) ->
-    validate_domain_labels(Domain).
-
--spec validate_domain_labels(binary()) -> ok | {error, {invalid_domain, domain_violation()}}.
-validate_domain_labels(<<>>) ->
-    {error, {invalid_domain, empty}};
-validate_domain_labels(Domain) ->
-    check_domain_labels(binary:split(Domain, <<".">>, [global])).
-
--spec check_domain_labels([binary()]) -> ok | {error, {invalid_domain, domain_violation()}}.
-check_domain_labels([]) ->
-    ok;
-check_domain_labels([<<>> | _]) ->
-    {error, {invalid_domain, empty_label}};
-check_domain_labels([Label | Rest]) ->
-    case is_domain_label(Label) of
-        true -> check_domain_labels(Rest);
-        false -> {error, {invalid_domain, invalid_label}}
+validate_path(Path, _Size) ->
+    case binary:at(Path, 0) of
+        $/ -> scan_path_octets(Path);
+        _ -> {error, {invalid_path, no_leading_slash}}
     end.
 
--spec is_domain_label(binary()) -> boolean().
-is_domain_label(Label) ->
-    Last = byte_size(Label) - 1,
-    is_let_dig(binary:first(Label)) andalso
-        is_let_dig(binary:at(Label, Last)) andalso
-        is_ldh(Label).
+-spec scan_path_octets(binary()) -> ok | {error, {invalid_path, path_violation()}}.
+scan_path_octets(Path) ->
+    case binary:match(Path, persistent_term:get(?PT_NON_PATH_OCTET)) of
+        nomatch -> ok;
+        {Pos, _} -> {error, {invalid_path, classify_path_octet(binary:at(Path, Pos))}}
+    end.
 
--spec is_ldh(binary()) -> boolean().
-is_ldh(<<>>) ->
-    true;
-is_ldh(<<C, Rest/binary>>) ->
-    case is_ldh_char(C) of
-        true -> is_ldh(Rest);
-        false -> false
+-spec classify_path_octet(byte()) -> control_char | semicolon | non_ascii.
+classify_path_octet(C) when C =< 16#1F; C =:= 16#7F -> control_char;
+classify_path_octet(C) when C >= 16#80 -> non_ascii;
+classify_path_octet(_C) -> semicolon.
+
+-spec validate_domain(binary()) -> ok | {error, {invalid_domain, domain_violation()}}.
+validate_domain(Domain) ->
+    Start = leading_dot_offset(Domain),
+    case byte_size(Domain) of
+        Size when Size > Start -> scan_domain(Domain, Start, Start, Size);
+        _ -> {error, {invalid_domain, empty}}
+    end.
+
+-spec leading_dot_offset(binary()) -> 0..1.
+leading_dot_offset(<<$., _/binary>>) -> 1;
+leading_dot_offset(_) -> 0.
+
+-spec scan_domain(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, {invalid_domain, domain_violation()}}.
+scan_domain(Domain, LabelStart, Size, Size) ->
+    end_domain_label(Domain, LabelStart, Size);
+scan_domain(Domain, LabelStart, Pos, Size) ->
+    case binary:at(Domain, Pos) of
+        $. ->
+            maybe
+                ok ?= end_domain_label(Domain, LabelStart, Pos),
+                scan_domain(Domain, Pos + 1, Pos + 1, Size)
+            end;
+        C ->
+            case is_ldh_char(C) of
+                true -> scan_domain(Domain, LabelStart, Pos + 1, Size);
+                false -> {error, {invalid_domain, invalid_label}}
+            end
+    end.
+
+-spec end_domain_label(binary(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, {invalid_domain, domain_violation()}}.
+end_domain_label(_Domain, Start, Start) ->
+    {error, {invalid_domain, empty_label}};
+end_domain_label(Domain, Start, End) ->
+    case is_let_dig(binary:at(Domain, Start)) andalso is_let_dig(binary:at(Domain, End - 1)) of
+        true -> ok;
+        false -> {error, {invalid_domain, invalid_label}}
     end.
 
 -spec is_ldh_char(byte()) -> boolean().

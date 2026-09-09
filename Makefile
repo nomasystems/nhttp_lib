@@ -57,7 +57,7 @@ fuzz:
 
 binopt:
 	@for f in src/*.erl; do \
-		$(ERLC) +bin_opt_info -I $(INCLUDE) -o /tmp "$$f" 2>&1 | grep -E "^src/"; \
+		$(ERLC) +bin_opt_info -I $(INCLUDE) -o /tmp "$$f" 2>&1 | grep -E "^src/" | grep -v "OPTIMIZED: match context reused"; \
 	done
 	@rm -f /tmp/nhttp*.beam
 
