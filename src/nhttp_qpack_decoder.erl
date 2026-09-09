@@ -16,7 +16,17 @@ The decoder receives:
 When a field section references a dynamic table entry that has not
 yet been inserted, the stream is blocked until the encoder stream
 delivers the missing entries.
+
+Every field name and every field value that arrives as a literal is read
+against the rule of RFC 9113 §8.2.1, which RFC 9114 §4.1.2 repeats. A
+refusal returns `t:field_error/0`, which is outside the decompression error
+set, because the two carry different severity: RFC 9114 §4.1.2 makes a
+malformed field a stream error, and RFC 9204 §2.2 makes a decompression
+failure a connection error. An invalid field never enters the dynamic table,
+so a name or a value that arrives as a table index needs no second read.
 """.
+
+-compile({inline, [check_field/2, check_value/2, tag/2]}).
 
 %%%-----------------------------------------------------------------------------
 %% EXPORTS
@@ -30,7 +40,7 @@ delivers the missing entries.
 %%%-----------------------------------------------------------------------------
 %% TYPE EXPORTS
 %%%-----------------------------------------------------------------------------
--export_type([config/0, state/0]).
+-export_type([config/0, field_error/0, state/0]).
 
 %%%-----------------------------------------------------------------------------
 %% TYPES
@@ -41,6 +51,21 @@ delivers the missing entries.
 }.
 
 -type field_line() :: {binary(), binary()}.
+
+-type field_reason() ::
+    nhttp_headers:field_name_error() | nhttp_headers:field_value_error().
+
+-doc """
+A field that arrived from the peer breaks the rule of RFC 9113 §8.2.1, which
+RFC 9114 §4.1.2 repeats for HTTP/3. The third element is the field name, so
+that a caller can name the offending field in its diagnostic.
+
+This shape is deliberately outside the decompression error set. RFC 9114
+§4.1.2 makes a malformed field a stream error of type H3_MESSAGE_ERROR, where
+a decompression failure is a connection error of type
+QPACK_DECOMPRESSION_FAILED (RFC 9204 §2.2).
+""".
+-type field_error() :: {invalid_field, field_reason(), binary()}.
 
 -type unblocked_result() :: {
     nhttp_lib:stream_id(), iodata(), [field_line()]
@@ -282,6 +307,7 @@ resolve_representation(
     maybe
         {ok, {Name, _}} ?=
             nhttp_qpack_static_table:lookup(Index),
+        ok ?= check_value(Name, Value),
         {ok, {Name, Value}, false}
     end;
 resolve_representation(
@@ -293,6 +319,7 @@ resolve_representation(
     maybe
         {ok, {Name, _}} ?=
             nhttp_qpack_dynamic_table:lookup(AbsIndex, DynTable),
+        ok ?= check_value(Name, Value),
         {ok, {Name, Value}, true}
     end;
 resolve_representation(
@@ -304,12 +331,39 @@ resolve_representation(
     maybe
         {ok, {Name, _}} ?=
             nhttp_qpack_dynamic_table:lookup(AbsIndex, DynTable),
+        ok ?= check_value(Name, Value),
         {ok, {Name, Value}, true}
     end;
 resolve_representation(
     {literal, Name, Value, _NI}, _Base, _DynTable
 ) ->
-    {ok, {Name, Value}, false}.
+    maybe
+        ok ?= check_field(Name, Value),
+        {ok, {Name, Value}, false}
+    end.
+
+%%%-----------------------------------------------------------------------------
+%% INTERNAL - FIELD VALIDITY (RFC 9113 SECTION 8.2.1, RFC 9114 SECTION 4.1.2)
+%%%
+%%% Every name and every value that arrives as a literal is read here. A name
+%%% that arrives as a table index is not read again: the static table holds
+%%% lowercase names, and `apply_encoder_instruction/2' refuses an invalid
+%%% entry, so the dynamic table holds none.
+%%%-----------------------------------------------------------------------------
+-spec check_field(binary(), binary()) -> ok | {error, field_error()}.
+check_field(Name, Value) ->
+    maybe
+        ok ?= tag(Name, nhttp_headers:validate_field_name(Name)),
+        check_value(Name, Value)
+    end.
+
+-spec check_value(binary(), binary()) -> ok | {error, field_error()}.
+check_value(Name, Value) ->
+    tag(Name, nhttp_headers:validate_field_value(Value)).
+
+-spec tag(binary(), ok | {error, field_reason()}) -> ok | {error, field_error()}.
+tag(_Name, ok) -> ok;
+tag(Name, {error, Reason}) -> {error, {invalid_field, Reason, Name}}.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - DECODER STREAM DATA
@@ -372,6 +426,7 @@ apply_encoder_instruction(
     maybe
         {ok, {Name, _}} ?=
             nhttp_qpack_static_table:lookup(Index),
+        ok ?= check_value(Name, Value),
         {ok, NewTable} ?=
             nhttp_qpack_dynamic_table:insert(
                 Name, Value, DynTable
@@ -389,6 +444,7 @@ apply_encoder_instruction(
             nhttp_qpack_dynamic_table:lookup(
                 AbsIndex, DynTable
             ),
+        ok ?= check_value(Name, Value),
         {ok, NewTable} ?=
             nhttp_qpack_dynamic_table:insert(
                 Name, Value, DynTable
@@ -400,6 +456,7 @@ apply_encoder_instruction(
     #qpack_dec{dynamic_table = DynTable} = State
 ) ->
     maybe
+        ok ?= check_field(Name, Value),
         {ok, NewTable} ?=
             nhttp_qpack_dynamic_table:insert(
                 Name, Value, DynTable

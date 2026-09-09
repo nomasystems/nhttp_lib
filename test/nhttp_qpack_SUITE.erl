@@ -14,6 +14,9 @@ blocked stream handling, acknowledgment flow, and error paths.
 
 -compile([export_all, nowarn_export_all]).
 
+-define(TABLE_CAPACITY, 4096).
+-define(TABLE_CONFIG, #{max_table_capacity => ?TABLE_CAPACITY, max_blocked_streams => 10}).
+
 %%%-----------------------------------------------------------------------------
 %%% CT CALLBACKS
 %%%-----------------------------------------------------------------------------
@@ -27,7 +30,8 @@ all() ->
         {group, sequential},
         {group, reconcile},
         {group, error_paths},
-        {group, decoder_coverage}
+        {group, decoder_coverage},
+        {group, field_validity}
     ].
 
 groups() ->
@@ -74,6 +78,18 @@ groups() ->
             decoder_literal_name_ref_fields,
             decoder_post_base_fields,
             decoder_empty_encoder_stream
+        ]},
+        {field_validity, [parallel], [
+            literal_uppercase_name_is_invalid_field,
+            literal_name_with_interior_colon_is_invalid_field,
+            literal_empty_name_is_invalid_field,
+            literal_value_with_cr_is_invalid_field,
+            literal_value_edge_whitespace_is_invalid_field,
+            literal_name_ref_value_is_validated,
+            literal_pseudo_header_name_is_accepted,
+            encoder_stream_literal_name_is_validated,
+            encoder_stream_name_ref_value_is_validated,
+            refused_insert_leaves_the_dynamic_table_unchanged
         ]}
     ].
 
@@ -693,8 +709,145 @@ decoder_empty_encoder_stream(_Config) ->
     _ = Dec1.
 
 %%%-----------------------------------------------------------------------------
+%%% FIELD VALIDITY TESTS (RFC 9113 SECTION 8.2.1, RFC 9114 SECTION 4.1.2)
+%%%
+%%% The decoder reports a field that breaks the rule apart from a
+%%% decompression failure, because RFC 9114 Section 4.1.2 makes the first a
+%%% stream error and RFC 9204 Section 2.2 makes the second a connection error.
+%%%-----------------------------------------------------------------------------
+
+literal_uppercase_name_is_invalid_field(_Config) ->
+    ?assertEqual(
+        {error, {invalid_field, uppercase_field_name, <<"X-Bad">>}},
+        decode_literal(<<"X-Bad">>, <<"v">>)
+    ).
+
+literal_name_with_interior_colon_is_invalid_field(_Config) ->
+    ?assertEqual(
+        {error, {invalid_field, invalid_field_name_char, <<"x:bad">>}},
+        decode_literal(<<"x:bad">>, <<"v">>)
+    ).
+
+literal_empty_name_is_invalid_field(_Config) ->
+    ?assertEqual(
+        {error, {invalid_field, empty_field_name, <<>>}},
+        decode_literal(<<>>, <<"v">>)
+    ).
+
+literal_value_with_cr_is_invalid_field(_Config) ->
+    ?assertEqual(
+        {error, {invalid_field, invalid_field_value_char, <<"x-bad">>}},
+        decode_literal(<<"x-bad">>, <<"a\rb">>)
+    ).
+
+literal_value_edge_whitespace_is_invalid_field(_Config) ->
+    ?assertEqual(
+        {error, {invalid_field, field_value_edge_whitespace, <<"x-bad">>}},
+        decode_literal(<<"x-bad">>, <<" v">>)
+    ),
+    ?assertEqual(
+        {error, {invalid_field, field_value_edge_whitespace, <<"x-bad">>}},
+        decode_literal(<<"x-bad">>, <<"v\t">>)
+    ).
+
+%% The name comes from the static table, which holds lowercase names, but the
+%% value comes from the wire and is read.
+literal_name_ref_value_is_validated(_Config) ->
+    {ok, Dec} = nhttp_qpack:new_decoder(#{}),
+    Section = field_section([{literal_name_ref, static, 0, <<"a\nb">>, false}]),
+    ?assertMatch(
+        {error, {invalid_field, invalid_field_value_char, _}},
+        nhttp_qpack:decode_field_section(Dec, 0, Section)
+    ).
+
+literal_pseudo_header_name_is_accepted(_Config) ->
+    ?assertMatch(
+        {ok, _Dec, _DecStream, [{<<":method">>, <<"GET">>}]},
+        decode_literal(<<":method">>, <<"GET">>)
+    ).
+
+encoder_stream_literal_name_is_validated(_Config) ->
+    {ok, Dec} = nhttp_qpack:new_decoder(?TABLE_CONFIG),
+    Data = encoder_stream([
+        nhttp_qpack_encoder_instruction:encode_insert_literal_name(
+            <<"X-Bad">>, <<"v">>, false
+        )
+    ]),
+    ?assertEqual(
+        {error, {invalid_field, uppercase_field_name, <<"X-Bad">>}},
+        nhttp_qpack:feed_encoder_stream(Dec, Data)
+    ).
+
+encoder_stream_name_ref_value_is_validated(_Config) ->
+    {ok, Dec} = nhttp_qpack:new_decoder(?TABLE_CONFIG),
+    Data = encoder_stream([
+        nhttp_qpack_encoder_instruction:encode_insert_name_ref(
+            static, 0, <<"a\rb">>, false
+        )
+    ]),
+    ?assertMatch(
+        {error, {invalid_field, invalid_field_value_char, _}},
+        nhttp_qpack:feed_encoder_stream(Dec, Data)
+    ).
+
+%% A refused insert must not advance the insert count. A field section that
+%% requires the second entry stays blocked, which it cannot do if the entry
+%% had landed.
+refused_insert_leaves_the_dynamic_table_unchanged(_Config) ->
+    {ok, Dec0} = nhttp_qpack:new_decoder(?TABLE_CONFIG),
+    Good = encoder_stream([
+        nhttp_qpack_encoder_instruction:encode_insert_literal_name(
+            <<"x-good">>, <<"1">>, false
+        )
+    ]),
+    {ok, Dec1, []} = nhttp_qpack:feed_encoder_stream(Dec0, Good),
+    Bad = iolist_to_binary(
+        nhttp_qpack_encoder_instruction:encode_insert_literal_name(
+            <<"X-Bad">>, <<"2">>, false
+        )
+    ),
+    ?assertEqual(
+        {error, {invalid_field, uppercase_field_name, <<"X-Bad">>}},
+        nhttp_qpack:feed_encoder_stream(Dec1, Bad)
+    ),
+    OneEntry = field_section([{indexed, dynamic, 0}], 1, 1),
+    ?assertMatch(
+        {ok, _Dec, _DecStream, [{<<"x-good">>, <<"1">>}]},
+        nhttp_qpack:decode_field_section(Dec1, 0, OneEntry)
+    ),
+    TwoEntries = field_section([{indexed, dynamic, 0}], 2, 2),
+    ?assertMatch({blocked, _Dec}, nhttp_qpack:decode_field_section(Dec1, 4, TwoEntries)).
+
+%%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
+
+-spec decode_literal(binary(), binary()) -> term().
+decode_literal(Name, Value) ->
+    {ok, Dec} = nhttp_qpack:new_decoder(#{}),
+    Section = field_section([{literal, Name, Value, false}]),
+    nhttp_qpack:decode_field_section(Dec, 0, Section).
+
+-spec field_section([nhttp_qpack_field_line:representation()]) -> binary().
+field_section(Reps) ->
+    field_section(Reps, 0, 0).
+
+-spec field_section(
+    [nhttp_qpack_field_line:representation()], non_neg_integer(), non_neg_integer()
+) -> binary().
+field_section(Reps, RequiredInsertCount, Base) ->
+    Prefix = nhttp_qpack_field_line:encode_prefix(
+        RequiredInsertCount, Base, ?TABLE_CAPACITY div 32
+    ),
+    Encoded = [nhttp_qpack_field_line:encode_representation(Rep, false) || Rep <- Reps],
+    iolist_to_binary([Prefix, Encoded]).
+
+-spec encoder_stream([iodata()]) -> binary().
+encoder_stream(Instructions) ->
+    iolist_to_binary([
+        nhttp_qpack_encoder_instruction:encode_set_capacity(?TABLE_CAPACITY)
+        | Instructions
+    ]).
 
 -spec encode_decode_sequence(
     [[{binary(), binary()}]],

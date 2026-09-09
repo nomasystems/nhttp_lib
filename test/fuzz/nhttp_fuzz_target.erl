@@ -2,7 +2,7 @@
 -module(nhttp_fuzz_target).
 
 -moduledoc """
-Oracles and corpus storage for the four wire-facing parsers.
+Oracles and corpus storage for the five wire-facing parsers.
 
 The library is pure, so the oracle is simple. For any binary input, a parser
 returns one of the shapes that its `-spec` declares. It does not raise, and it
@@ -46,7 +46,7 @@ artefact readable in a diff.
 
 -export_type([target/0, outcome/0, finding/0]).
 
--type target() :: h1 | h2_frame | h3_frame | ws_frame.
+-type target() :: h1 | h2_frame | h3_frame | qpack | ws_frame.
 
 -doc """
 Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
@@ -78,13 +78,17 @@ Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
 
 -define(H1_PEER, {{127, 0, 0, 1}, 12345}).
 
+%% A capacity and a blocked stream budget above zero, so that the dynamic
+%% table, the eviction path and the blocked stream path are all reachable.
+-define(QPACK_CONFIG, #{max_table_capacity => 4096, max_blocked_streams => 8}).
+
 %%%-----------------------------------------------------------------------------
 %%% TARGETS
 %%%-----------------------------------------------------------------------------
 -doc "Every target the harness drives, in the order the task file lists them.".
 -spec all() -> [target(), ...].
 all() ->
-    [h1, h2_frame, h3_frame, ws_frame].
+    [h1, h2_frame, h3_frame, qpack, ws_frame].
 
 -doc """
 Drive one target with `Bin` and check every return against its `-spec`.
@@ -119,6 +123,11 @@ check(h2_frame, Bin) ->
     );
 check(h3_frame, Bin) ->
     rest_result(fun() -> nhttp_h3_frame:decode(Bin) end, Bin, infinity, fun is_h3_frame/1);
+check(qpack, Bin) ->
+    maybe
+        {ok, Dec} ?= qpack_feed_encoder(Bin),
+        qpack_field_section(Dec, Bin)
+    end;
 check(ws_frame, Bin) ->
     Capped = #{max_frame_size => ?WS_CAP},
     Bound = ?WS_CAP + ?WS_MAX_HEADER,
@@ -197,6 +206,57 @@ rest_result(Fun, Bin, MoreBound, Shape) ->
             end;
         {more, N} ->
             check_more(N, MoreBound);
+        {error, _Reason} ->
+            {ok, refused};
+        Other ->
+            {error, {undeclared_return, Other}}
+    catch
+        Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
+    end.
+
+-doc """
+Feed one input to the QPACK encoder stream and return the decoder it leaves.
+
+The encoder stream carries no outcome of its own, because it buffers what it
+cannot yet parse and reports `{ok, _, []}` for almost every input. It is
+driven for its crash and shape oracle, and for the dynamic table state that it
+hands to the field section decode.
+""".
+-spec qpack_feed_encoder(binary()) -> {ok, nhttp_qpack:decoder()} | {error, finding()}.
+qpack_feed_encoder(Bin) ->
+    {ok, Dec0} = nhttp_qpack:new_decoder(?QPACK_CONFIG),
+    try nhttp_qpack:feed_encoder_stream(Dec0, Bin) of
+        {ok, Dec1, Unblocked} ->
+            case is_unblocked_list(Unblocked) of
+                true -> {ok, Dec1};
+                false -> {error, {bad_value_shape, Unblocked}}
+            end;
+        {error, _Reason} ->
+            {ok, Dec0};
+        Other ->
+            {error, {undeclared_return, Other}}
+    catch
+        Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
+    end.
+
+-doc """
+Check `nhttp_qpack:decode_field_section/3`, which declares
+`{ok, Decoder, DecoderStreamData :: iodata(), [{binary(), binary()}]}
+| {blocked, Decoder} | {error, Reason}`.
+
+`{blocked, _}` is the incomplete shape: the section names a dynamic table
+entry that the encoder stream has not delivered.
+""".
+-spec qpack_field_section(nhttp_qpack:decoder(), binary()) -> result().
+qpack_field_section(Dec, Bin) ->
+    try nhttp_qpack:decode_field_section(Dec, 0, Bin) of
+        {ok, _Dec1, DecData, FieldLines} ->
+            case is_iodata(DecData) andalso is_field_lines(FieldLines) of
+                true -> {ok, parsed};
+                false -> {error, {bad_value_shape, {DecData, FieldLines}}}
+            end;
+        {blocked, _Dec1} ->
+            {ok, incomplete};
         {error, _Reason} ->
             {ok, refused};
         Other ->
@@ -293,6 +353,32 @@ is_h2_frame({window_update, _StreamId, Increment}) -> is_integer(Increment);
 is_h2_frame({continuation, _StreamId, _EndHeaders, Block}) -> is_binary(Block);
 is_h2_frame({unknown, Type}) -> is_integer(Type);
 is_h2_frame(_) -> false.
+
+-spec is_field_lines(term()) -> boolean().
+is_field_lines(Lines) when is_list(Lines) -> lists:all(fun is_field_line/1, Lines);
+is_field_lines(_) -> false.
+
+-spec is_field_line(term()) -> boolean().
+is_field_line({Name, Value}) -> is_binary(Name) andalso is_binary(Value);
+is_field_line(_) -> false.
+
+-spec is_unblocked_list(term()) -> boolean().
+is_unblocked_list(Results) when is_list(Results) -> lists:all(fun is_unblocked/1, Results);
+is_unblocked_list(_) -> false.
+
+-spec is_unblocked(term()) -> boolean().
+is_unblocked({StreamId, DecData, Lines}) ->
+    is_integer(StreamId) andalso is_iodata(DecData) andalso is_field_lines(Lines);
+is_unblocked(_) ->
+    false.
+
+-spec is_iodata(term()) -> boolean().
+is_iodata(Term) ->
+    try iolist_size(Term) of
+        _ -> true
+    catch
+        _:_ -> false
+    end.
 
 -spec is_h3_frame(term()) -> boolean().
 is_h3_frame({data, Payload}) -> is_binary(Payload);

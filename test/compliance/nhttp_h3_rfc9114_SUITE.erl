@@ -51,7 +51,20 @@ groups() ->
             connection_header_forbidden,
             trailers_with_pseudo_forbidden,
             trailers_delivered_as_event,
-            content_length_mismatch_is_stream_error
+            content_length_mismatch_is_stream_error,
+            request_uppercase_field_name_is_stream_error,
+            response_uppercase_field_name_is_stream_error,
+            trailers_uppercase_field_name_is_stream_error,
+            request_field_name_with_space_is_stream_error,
+            request_field_name_with_interior_colon_is_stream_error,
+            request_field_value_with_cr_is_stream_error,
+            request_field_value_with_lf_is_stream_error,
+            request_field_value_with_leading_space_is_stream_error,
+            request_field_value_with_trailing_htab_is_stream_error,
+            uppercase_content_length_is_stream_error,
+            uppercase_connection_header_is_stream_error,
+            conformant_request_with_pseudo_headers_accepted,
+            qpack_decompression_failure_is_connection_error
         ]},
         {section_5_connection, [parallel], [
             goaway_decreasing_id_allowed,
@@ -65,7 +78,9 @@ groups() ->
             encoder_stream_closed_is_connection_error,
             decoder_stream_closed_is_connection_error,
             server_receives_push_stream_is_connection_error,
-            unknown_uni_stream_type_ignored
+            unknown_uni_stream_type_ignored,
+            encoder_stream_uppercase_insert_is_connection_error,
+            encoder_stream_lowercase_insert_accepted
         ]},
         {section_7_frames, [parallel], [
             first_control_frame_must_be_settings,
@@ -114,6 +129,8 @@ end_per_group(_Group, _Config) ->
 -define(PEER_CTRL, 2).
 -define(PEER_ENC, 6).
 -define(PEER_DEC, 10).
+
+-define(QPACK_CAPACITY, 4096).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 4 - HTTP Expression
@@ -278,6 +295,102 @@ content_length_mismatch_is_stream_error(_Config) ->
     Result = nhttp_h3:recv(Server1, 0, iolist_to_binary(DataFrame), fin),
     assert_h3_stream_error(Result, h3_message_error).
 
+%% RFC9114-4.2-1: characters in field names are converted to lowercase before
+%% encoding, and a request or a response that carries an uppercase character
+%% in a field name is malformed.
+%% RFC9114-4.1.2-2: an uppercase field name, an invalid character in a field
+%% name, and an invalid character in a field value are malformed, and a
+%% malformed request or response is a stream error of type H3_MESSAGE_ERROR.
+
+request_uppercase_field_name_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"X-Custom">>, <<"v">>}]
+    ).
+
+response_uppercase_field_name_is_stream_error(_Config) ->
+    Client = fresh_client(),
+    Bytes = raw_headers_frame([
+        {<<":status">>, <<"200">>},
+        {<<"Content-Type">>, <<"text/plain">>}
+    ]),
+    Result = nhttp_h3:recv(Client, 1, Bytes, fin),
+    assert_h3_stream_error(Result, h3_message_error).
+
+trailers_uppercase_field_name_is_stream_error(_Config) ->
+    Server = server_with_peer_streams(),
+    HeaderBytes = raw_headers_frame(minimal_request_headers()),
+    {ok, [{request, 0, _, nofin}], Server1, _} =
+        nhttp_h3:recv(Server, 0, HeaderBytes, nofin),
+    TrailerBytes = raw_headers_frame([{<<"X-Trace">>, <<"abc">>}]),
+    Result = nhttp_h3:recv(Server1, 0, TrailerBytes, fin),
+    assert_h3_stream_error(Result, h3_message_error).
+
+request_field_name_with_space_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"x custom">>, <<"v">>}]
+    ).
+
+request_field_name_with_interior_colon_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"x:custom">>, <<"v">>}]
+    ).
+
+request_field_value_with_cr_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"x-custom">>, <<"a\rb">>}]
+    ).
+
+request_field_value_with_lf_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"x-custom">>, <<"a\nb">>}]
+    ).
+
+request_field_value_with_leading_space_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"x-custom">>, <<" v">>}]
+    ).
+
+request_field_value_with_trailing_htab_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"x-custom">>, <<"v\t">>}]
+    ).
+
+%% RFC9114-4.1.2-3: an uppercase `Content-Length` is malformed, so the
+%% framing check of Section 4.1.2 never runs against a name that a
+%% case-sensitive lookup cannot find.
+uppercase_content_length_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"Content-Length">>, <<"10">>}]
+    ).
+
+uppercase_connection_header_is_stream_error(_Config) ->
+    assert_raw_request_stream_error(
+        minimal_request_headers() ++ [{<<"Connection">>, <<"keep-alive">>}]
+    ).
+
+conformant_request_with_pseudo_headers_accepted(_Config) ->
+    Server = server_with_peer_streams(),
+    Headers = minimal_request_headers() ++ [{<<"x-custom">>, <<"a b">>}],
+    Bytes = raw_headers_frame(Headers),
+    {ok, Events, _Server1, _} = nhttp_h3:recv(Server, 0, Bytes, fin),
+    ?assertMatch(
+        [
+            {request, 0,
+                #{method := get, path := <<"/">>, headers := [{<<"x-custom">>, <<"a b">>}]}, fin}
+        ],
+        Events
+    ).
+
+%% RFC9204-2.2-1: a reference to a static table entry that does not exist is
+%% a connection error of type QPACK_DECOMPRESSION_FAILED. The field validity
+%% rule must not move this error onto the stream error path.
+qpack_decompression_failure_is_connection_error(_Config) ->
+    Server = server_with_peer_streams(),
+    Section = raw_field_section([{indexed, static, 200}]),
+    {ok, Frame} = nhttp_h3_frame:headers(Section),
+    Result = nhttp_h3:recv(Server, 0, iolist_to_binary(Frame), fin),
+    assert_h3_connection_error(Result, qpack_decompression_failed).
+
 %%%-----------------------------------------------------------------------------
 %%% Section 5 - Connection
 %%%-----------------------------------------------------------------------------
@@ -347,6 +460,30 @@ unknown_uni_stream_type_ignored(_Config) ->
     TypeBin = nquic_varint:encode(16#21),
     {ok, [], _Server1, _} = nhttp_h3:recv(Server, 14, iolist_to_binary(TypeBin), nofin),
     ok.
+
+%% RFC9204-2.2.3-1: an error on the encoder stream is a connection error of
+%% type QPACK_ENCODER_STREAM_ERROR. An invalid field name must not enter the
+%% dynamic table, because every later field section that indexes the entry
+%% re-emits it.
+encoder_stream_uppercase_insert_is_connection_error(_Config) ->
+    Server = server_with_table_capacity(),
+    Instructions = encoder_stream_inserts([{<<"X-Bad">>, <<"v">>}]),
+    Result = nhttp_h3:recv(Server, ?PEER_ENC, Instructions, nofin),
+    assert_h3_connection_error(Result, qpack_encoder_stream_error).
+
+encoder_stream_lowercase_insert_accepted(_Config) ->
+    Server = server_with_table_capacity(),
+    Instructions = encoder_stream_inserts([{<<"x-bad">>, <<"v">>}]),
+    {ok, [], Server1, _} = nhttp_h3:recv(Server, ?PEER_ENC, Instructions, nofin),
+    Section = raw_field_section(
+        [{literal, N, V, false} || {N, V} <- minimal_request_headers()] ++
+            [{indexed, dynamic, 0}],
+        1,
+        1
+    ),
+    {ok, Frame} = nhttp_h3_frame:headers(Section),
+    {ok, Events, _Server2, _} = nhttp_h3:recv(Server1, 0, iolist_to_binary(Frame), fin),
+    ?assertMatch([{request, 0, #{headers := [{<<"x-bad">>, <<"v">>}]}, fin}], Events).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 7 - Frames
@@ -505,6 +642,44 @@ minimal_request_headers() ->
         {<<":authority">>, <<"example.com">>},
         {<<":path">>, <<"/">>}
     ].
+
+server_with_table_capacity() ->
+    C0 = nhttp_h3:new(server, #{qpack_max_table_capacity => ?QPACK_CAPACITY}),
+    {ok, C1, _} = nhttp_h3:init_local_streams(C0, #{
+        control => 3, encoder => 7, decoder => 11
+    }),
+    connect_peer_streams(C1).
+
+encoder_stream_inserts(Pairs) ->
+    iolist_to_binary([
+        nhttp_qpack_encoder_instruction:encode_set_capacity(?QPACK_CAPACITY)
+        | [
+            nhttp_qpack_encoder_instruction:encode_insert_literal_name(Name, Value, false)
+         || {Name, Value} <- Pairs
+        ]
+    ]).
+
+%% A field section built from representations, not from the encoder. The
+%% encoder cannot emit an uppercase field name, and this suite tests what a
+%% peer puts on the wire.
+raw_field_section(Reps) ->
+    raw_field_section(Reps, 0, 0).
+
+raw_field_section(Reps, RequiredInsertCount, Base) ->
+    MaxEntries = ?QPACK_CAPACITY div 32,
+    Prefix = nhttp_qpack_field_line:encode_prefix(RequiredInsertCount, Base, MaxEntries),
+    Encoded = [nhttp_qpack_field_line:encode_representation(Rep, false) || Rep <- Reps],
+    iolist_to_binary([Prefix, Encoded]).
+
+raw_headers_frame(Headers) ->
+    Section = raw_field_section([{literal, Name, Value, false} || {Name, Value} <- Headers]),
+    {ok, Frame} = nhttp_h3_frame:headers(Section),
+    iolist_to_binary(Frame).
+
+assert_raw_request_stream_error(Headers) ->
+    Server = server_with_peer_streams(),
+    Result = nhttp_h3:recv(Server, 0, raw_headers_frame(Headers), fin),
+    assert_h3_stream_error(Result, h3_message_error).
 
 encode_request_stream_headers(_Conn, _StreamId, Headers) ->
     {ok, Enc0} = nhttp_qpack:new_encoder(#{max_table_capacity => 0, max_blocked_streams => 0}),

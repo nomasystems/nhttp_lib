@@ -2,7 +2,7 @@
 -module(nhttp_fuzz_SUITE).
 
 -moduledoc """
-Fuzz harness for the four wire-facing parsers.
+Fuzz harness for the five wire-facing parsers.
 
 The `oracle`, `corpus`, `mutation` and `structured` groups run in CI. They use
 a fixed seed, so a failure reproduces from the seed that the report prints.
@@ -52,18 +52,21 @@ groups() ->
             corpus_h1,
             corpus_h2_frame,
             corpus_h3_frame,
+            corpus_qpack,
             corpus_ws_frame
         ]},
         {mutation, [parallel], [
             mutate_h1,
             mutate_h2_frame,
             mutate_h3_frame,
+            mutate_qpack,
             mutate_ws_frame
         ]},
         {structured, [parallel], [
             structured_h1,
             structured_h2_frame,
             structured_h3_frame,
+            structured_qpack,
             structured_ws_frame
         ]},
         {campaign, [], [campaign]}
@@ -155,6 +158,7 @@ corpus_covers_every_target(_Config) ->
 corpus_h1(_Config) -> replay(h1).
 corpus_h2_frame(_Config) -> replay(h2_frame).
 corpus_h3_frame(_Config) -> replay(h3_frame).
+corpus_qpack(_Config) -> replay(qpack).
 corpus_ws_frame(_Config) -> replay(ws_frame).
 
 %%%-----------------------------------------------------------------------------
@@ -163,6 +167,7 @@ corpus_ws_frame(_Config) -> replay(ws_frame).
 mutate_h1(_Config) -> mutation_run(h1).
 mutate_h2_frame(_Config) -> mutation_run(h2_frame).
 mutate_h3_frame(_Config) -> mutation_run(h3_frame).
+mutate_qpack(_Config) -> mutation_run(qpack).
 mutate_ws_frame(_Config) -> mutation_run(ws_frame).
 
 %%%-----------------------------------------------------------------------------
@@ -171,6 +176,7 @@ mutate_ws_frame(_Config) -> mutation_run(ws_frame).
 structured_h1(_Config) -> structured_run(h1).
 structured_h2_frame(_Config) -> structured_run(h2_frame).
 structured_h3_frame(_Config) -> structured_run(h3_frame).
+structured_qpack(_Config) -> structured_run(qpack).
 structured_ws_frame(_Config) -> structured_run(ws_frame).
 
 %%%-----------------------------------------------------------------------------
