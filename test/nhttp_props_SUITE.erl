@@ -14,6 +14,7 @@ This suite runs all property tests defined in:
 - nhttp_h3_props
 - nhttp_ws_props
 - nhttp_cookie_props
+- nhttp_headers_props
 """.
 
 -include_lib("common_test/include/ct.hrl").
@@ -37,7 +38,8 @@ all() ->
         {group, ws_props},
         {group, cookie_props},
         {group, msg_props},
-        {group, compress_props}
+        {group, compress_props},
+        {group, headers_props}
     ].
 
 groups() ->
@@ -179,6 +181,12 @@ groups() ->
             compress_decompress_random_binary_no_crash,
             compress_decompress_respects_max,
             compress_decompress_rejects_trailing_bytes
+        ]},
+        {headers_props, [parallel], [
+            headers_field_name_accepts_only_the_rfc_octets,
+            headers_field_value_agrees_with_the_octet_set,
+            headers_lower_field_name_matches_byte_wise_lowercase,
+            headers_lower_field_name_does_not_copy_a_lowercase_name
         ]}
     ].
 
@@ -601,3 +609,27 @@ compress_decompress_rejects_trailing_bytes(Config) ->
 -spec run_property(module(), atom(), list()) -> ok.
 run_property(Module, Property, Config) ->
     ct_property_test:quickcheck(Module:Property(), Config).
+
+%%%-----------------------------------------------------------------------------
+%%% HEADERS PROPERTY TESTS
+%%%-----------------------------------------------------------------------------
+
+headers_field_name_accepts_only_the_rfc_octets(Config) ->
+    run_property(
+        nhttp_headers_props, prop_validate_field_name_accepts_only_the_rfc_octets, Config
+    ).
+
+headers_field_value_agrees_with_the_octet_set(Config) ->
+    run_property(
+        nhttp_headers_props, prop_validate_field_value_agrees_with_the_octet_set, Config
+    ).
+
+headers_lower_field_name_matches_byte_wise_lowercase(Config) ->
+    run_property(
+        nhttp_headers_props, prop_lower_field_name_matches_byte_wise_lowercase, Config
+    ).
+
+headers_lower_field_name_does_not_copy_a_lowercase_name(Config) ->
+    run_property(
+        nhttp_headers_props, prop_lower_field_name_does_not_copy_a_lowercase_name, Config
+    ).
