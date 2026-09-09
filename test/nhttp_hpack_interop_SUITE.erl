@@ -388,11 +388,19 @@ run_decode_cases([Case | Rest], State, File) ->
     SeqNo = maps:get(<<"seqno">>, Case),
     case nhttp_hpack:decode(Wire, State) of
         {ok, DecodedHeaders, NewState} ->
+            ?assertEqual(rfc9113_valid, field_validity(ExpectedHeaders), #{
+                file => File, seqno => SeqNo
+            }),
             ?assertEqual(
                 ExpectedHeaders,
                 DecodedHeaders,
                 #{file => File, seqno => SeqNo}
             ),
+            run_decode_cases(Rest, NewState, File);
+        {invalid_field, Reason, NewState} ->
+            ?assertEqual({rfc9113_invalid, Reason}, field_validity(ExpectedHeaders), #{
+                file => File, seqno => SeqNo
+            }),
             run_decode_cases(Rest, NewState, File);
         {error, Reason} ->
             ct:fail("Decode failed for ~s seqno ~p: ~p", [File, SeqNo, Reason])
@@ -422,14 +430,36 @@ run_roundtrip_cases([Case | Rest], EncState, DecState, Opts, File) ->
     {ok, Encoded, NewEncState} = nhttp_hpack:encode(Headers, EncState, Opts),
     case nhttp_hpack:decode(iolist_to_binary(Encoded), DecState) of
         {ok, DecodedHeaders, NewDecState} ->
+            ?assertEqual(rfc9113_valid, field_validity(Headers), #{file => File, seqno => SeqNo}),
             ?assertEqual(
                 Headers,
                 DecodedHeaders,
                 #{file => File, seqno => SeqNo}
             ),
             run_roundtrip_cases(Rest, NewEncState, NewDecState, Opts, File);
+        {invalid_field, Reason, NewDecState} ->
+            ?assertEqual({rfc9113_invalid, Reason}, field_validity(Headers), #{
+                file => File, seqno => SeqNo
+            }),
+            run_roundtrip_cases(Rest, NewEncState, NewDecState, Opts, File);
         {error, Reason} ->
             ct:fail("Roundtrip decode failed for ~s seqno ~p: ~p", [File, SeqNo, Reason])
+    end.
+
+%% A recorded story carries what a 2012 server put on the wire, and five cases
+%% across two stories hold a field value with trailing whitespace, which
+%% RFC 9113 Section 8.2.1 forbids. The decoder must refuse exactly those, so
+%% the expected header list decides which outcome each case asserts.
+-spec field_validity(nhttp_hpack:headers()) ->
+    rfc9113_valid | {rfc9113_invalid, nhttp_hpack:field_error()}.
+field_validity([]) ->
+    rfc9113_valid;
+field_validity([{Name, Value} | Rest]) ->
+    case {nhttp_headers:validate_field_name(Name), nhttp_headers:validate_field_value(Value)} of
+        {ok, ok} -> field_validity(Rest);
+        {{error, uppercase_field_name}, _} -> {rfc9113_invalid, uppercase_header_name};
+        {{error, _}, _} -> {rfc9113_invalid, invalid_header_name};
+        {ok, {error, _}} -> {rfc9113_invalid, invalid_header_value}
     end.
 
 -spec parse_headers([map()]) -> nhttp_hpack:headers().

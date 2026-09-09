@@ -87,6 +87,14 @@ groups() ->
             te_trailers_allowed,
             te_non_trailers_forbidden,
             uppercase_header_name_is_stream_error,
+            invalid_field_name_char_is_stream_error,
+            interior_colon_in_field_name_is_stream_error,
+            pseudo_header_name_is_accepted,
+            invalid_field_value_char_is_stream_error,
+            field_value_edge_whitespace_is_stream_error,
+            invalid_field_keeps_the_dynamic_table_in_step,
+            invalid_field_value_in_response_is_stream_error,
+            invalid_field_value_in_trailers_is_stream_error,
             trailers_with_pseudo_header_is_stream_error,
             trailers_deliver_after_fin,
             content_length_mismatch_is_stream_error,
@@ -489,6 +497,110 @@ uppercase_header_name_is_stream_error(_Config) ->
         nhttp_h2_frame:decode(iolist_to_binary(OutData)),
     ok.
 
+
+%% RFC 9113 Section 8.2.1: a field name must not hold an octet in 0x00-0x20,
+%% 0x41-0x5A or 0x7F-0xFF.
+invalid_field_name_char_is_stream_error(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            assert_field_block_rejected(literal_indexed(Name, <<"v">>))
+        end,
+        [
+            <<"x", 16#20, "y">>,
+            <<"x", 16#00, "y">>,
+            <<"x", 16#7F, "y">>,
+            <<"x", 16#FF, "y">>
+        ]
+    ).
+
+%% RFC 9113 Section 8.2.1: only the single leading colon of a pseudo-header
+%% field is allowed in a field name.
+interior_colon_in_field_name_is_stream_error(_Config) ->
+    assert_field_block_rejected(literal_indexed(<<"x:y">>, <<"v">>)).
+
+%% RFC 9113 Section 8.3: a pseudo-header field name starts with a single colon.
+%% The name rule of Section 8.2.1 must not refuse that colon.
+pseudo_header_name_is_accepted(_Config) ->
+    Conn0 = server_with_preface(),
+    Block = <<
+        (literal_plain(<<":method">>, <<"GET">>))/binary,
+        (literal_plain(<<":scheme">>, <<"https">>))/binary,
+        (literal_plain(<<":path">>, <<"/">>))/binary
+    >>,
+    {ok, Frame} = nhttp_h2_frame:headers(1, fin, fin, Block),
+    {ok, [{request, 1, _, fin}], _Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Frame)),
+    ok.
+
+%% RFC 9113 Section 8.2.1: a field value must not hold NUL, LF or CR at any
+%% position.
+invalid_field_value_char_is_stream_error(_Config) ->
+    lists:foreach(
+        fun(Value) ->
+            assert_field_block_rejected(literal_indexed(<<"x-test">>, Value))
+        end,
+        [
+            <<"a", 16#00, "b">>,
+            <<"a", 16#0A, "b">>,
+            <<"a", 16#0D, "b">>
+        ]
+    ).
+
+%% RFC 9113 Section 8.2.1: a field value must not start or end with SP or HTAB.
+field_value_edge_whitespace_is_stream_error(_Config) ->
+    assert_field_block_rejected(literal_indexed(<<"x-test">>, <<16#20, "v">>)),
+    assert_field_block_rejected(literal_indexed(<<"x-test">>, <<"v", 16#09>>)).
+
+%% RFC 9113 Section 4.3 makes an endpoint decompress a field block even when it
+%% discards the frames, so a refused field still takes its dynamic table slot.
+%% The entry carries the refusal instead, so index 62 stays live and every
+%% message that repeats the malformed value is refused in turn.
+invalid_field_keeps_the_dynamic_table_in_step(_Config) ->
+    Conn0 = server_with_preface(),
+    BadBlock = request_block(literal_indexed(<<"x-bad">>, <<"a", 16#0D, "b">>)),
+    {ok, BadFrame} = nhttp_h2_frame:headers(1, fin, fin, BadBlock),
+    {ok, _, Conn1, BadOut} = nhttp_h2:recv(Conn0, iolist_to_binary(BadFrame)),
+    {ok, {rst_stream, 1, protocol_error}, _} = nhttp_h2_frame:decode(iolist_to_binary(BadOut)),
+
+    %% Index 62 resolves, so the insert happened. It carries the refusal, so the
+    %% malformed value never reaches the application.
+    RepeatBlock = request_block(<<16#BE>>),
+    {ok, RepeatFrame} = nhttp_h2_frame:headers(3, fin, fin, RepeatBlock),
+    {ok, _, Conn2, RepeatOut} = nhttp_h2:recv(Conn1, iolist_to_binary(RepeatFrame)),
+    {ok, {rst_stream, 3, protocol_error}, _} =
+        nhttp_h2_frame:decode(iolist_to_binary(RepeatOut)),
+
+    %% Only the value of entry 62 was refused, so a field that reuses its name
+    %% with a value of its own is accepted.
+    ReuseBlock = request_block(<<16#7E, 1, "v">>),
+    {ok, ReuseFrame} = nhttp_h2_frame:headers(5, fin, fin, ReuseBlock),
+    {ok, [{request, 5, Request, fin}], _Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(ReuseFrame)),
+    ?assertEqual(<<"v">>, nhttp_headers:get(<<"x-bad">>, maps:get(headers, Request))),
+    ok.
+
+
+%% RFC 9113 Section 8.2.1 applies to every field section. The decode precedes
+%% the request, response and trailer split, so all three refuse alike.
+invalid_field_value_in_response_is_stream_error(_Config) ->
+    Conn0 = client_with_server_preface(),
+    {ok, _StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    Block = <<16#88, (literal_indexed(<<"x-test">>, <<"a", 16#0D, "b">>))/binary>>,
+    {ok, Frame} = nhttp_h2_frame:headers(2, fin, fin, Block),
+    {ok, _Events, _Conn2, OutData} = nhttp_h2:recv(Conn1, iolist_to_binary(Frame)),
+    {ok, {rst_stream, 2, protocol_error}, _} =
+        nhttp_h2_frame:decode(iolist_to_binary(OutData)),
+    ok.
+
+invalid_field_value_in_trailers_is_stream_error(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, ReqFrame} = nhttp_h2_frame:headers(1, nofin, fin, request_block(<<>>)),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(ReqFrame)),
+    Trailers = literal_indexed(<<"x-trailer">>, <<"a", 16#0D, "b">>),
+    {ok, TrailerFrame} = nhttp_h2_frame:headers(1, fin, fin, Trailers),
+    {ok, _Events, _Conn2, OutData} = nhttp_h2:recv(Conn1, iolist_to_binary(TrailerFrame)),
+    {ok, {rst_stream, 1, protocol_error}, _} =
+        nhttp_h2_frame:decode(iolist_to_binary(OutData)),
+    ok.
+
 trailers_with_pseudo_header_is_stream_error(_Config) ->
     Conn0 = server_with_preface(),
     ReqBlock = encode_headers(minimal_request_headers()),
@@ -681,6 +793,35 @@ assert_request_rejected(Headers) ->
     {ok, Frame} = nhttp_h2_frame:headers(1, fin, fin, HeaderBlock),
     Result = nhttp_h2:recv(Conn0, iolist_to_binary(Frame)),
     case Result of
+        {ok, _, _Conn1, OutData} ->
+            {ok, {rst_stream, 1, ErrCode}, _} =
+                nhttp_h2_frame:decode(iolist_to_binary(OutData)),
+            ?assertEqual(protocol_error, ErrCode),
+            ok;
+        {error, {connection_error, _, _}} = Err ->
+            ct:fail("Expected stream error but got connection error: ~p", [Err])
+    end.
+
+%% A literal field line with incremental indexing and a new name (RFC 7541
+%% Section 6.2.1). Every name and value here is short enough for the one octet
+%% length prefix.
+literal_indexed(Name, Value) ->
+    <<16#40, (byte_size(Name)), Name/binary, (byte_size(Value)), Value/binary>>.
+
+%% A literal field line without indexing and a new name (RFC 7541 Section
+%% 6.2.2).
+literal_plain(Name, Value) ->
+    <<16#00, (byte_size(Name)), Name/binary, (byte_size(Value)), Value/binary>>.
+
+%% The three static table pseudo-header fields of a minimal request, followed by
+%% the field lines under test.
+request_block(Fields) ->
+    <<16#82, 16#86, 16#84, Fields/binary>>.
+
+assert_field_block_rejected(Fields) ->
+    Conn0 = server_with_preface(),
+    {ok, Frame} = nhttp_h2_frame:headers(1, fin, fin, request_block(Fields)),
+    case nhttp_h2:recv(Conn0, iolist_to_binary(Frame)) of
         {ok, _, _Conn1, OutData} ->
             {ok, {rst_stream, 1, ErrCode}, _} =
                 nhttp_h2_frame:decode(iolist_to_binary(OutData)),

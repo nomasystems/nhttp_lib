@@ -428,12 +428,15 @@ header_name_gen() ->
         end
     ).
 
+%% RFC 9110 Section 5.5: `field-content' neither starts nor ends with SP or
+%% HTAB. RFC 9113 Section 8.2.1 makes a value that does malformed, so the
+%% roundtrip generator must not draw one.
 -spec header_value_gen() -> triq_dom:domain().
 header_value_gen() ->
     ?LET(
         Chars,
         list(header_value_char_gen()),
-        list_to_binary(lists:sublist(Chars, 50))
+        string:trim(list_to_binary(lists:sublist(Chars, 50)), both, [$\s])
     ).
 
 -spec header_value_char_gen() -> triq_dom:domain().

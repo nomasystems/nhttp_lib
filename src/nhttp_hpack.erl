@@ -18,12 +18,43 @@ Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
 
 {ok, DecodedHeaders, DecState1} = nhttp_hpack:decode(HeaderBlock, DecState0).
 ```
+
+## Field validity on decode
+
+Every field name and every field value that arrives as a literal is read
+against the minimal rule of RFC 9113 §8.2.1. A block that carries such a
+field returns `{invalid_field, Reason, NewState}`, which is apart from the
+`{error, Reason}` of an HPACK failure: RFC 9113 §8.1.1 makes a malformed
+field a stream error, where RFC 9113 §4.3 makes a decode failure a
+connection error.
+
+The block runs to its end either way. RFC 9113 §4.3 makes an endpoint
+decompress a field block even when it discards the frames, so `NewState`
+carries every dynamic table update that the block asks for. A decoder that
+skips the update of a refused field falls out of step with the peer encoder,
+and every later block on that connection then decodes to the wrong field.
+
+An entry therefore holds the verdict on its name and the verdict on its
+value, read once at insert. A field that arrives by index carries that
+verdict out again and needs no second read of the octets. The name verdict
+alone travels to a field that reuses the name by index, because such a field
+takes a fresh value from the wire.
 """.
 
 %%%-----------------------------------------------------------------------------
 %% INLINE DIRECTIVES
 %%%-----------------------------------------------------------------------------
--compile({inline, [has_uppercase/1]}).
+-compile(
+    {inline, [
+        check_field/2,
+        check_name/1,
+        check_value/1,
+        fault/2,
+        field_fault/1,
+        first_bad/2,
+        name_fault/1
+    ]}
+).
 
 %%%-----------------------------------------------------------------------------
 %% STATE MANAGEMENT
@@ -49,7 +80,15 @@ Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
 %%%-----------------------------------------------------------------------------
 %% TYPE EXPORTS
 %%%-----------------------------------------------------------------------------
--export_type([decode_error/0, decode_opts/0, encode_opts/0, headers/0, state/0]).
+-export_type([
+    decode_error/0,
+    decode_opts/0,
+    decode_result/0,
+    encode_opts/0,
+    field_error/0,
+    headers/0,
+    state/0
+]).
 
 %%%-----------------------------------------------------------------------------
 %% TYPES
@@ -68,7 +107,43 @@ Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     | invalid_huffman
     | incomplete_header_block
     | header_list_too_large
-    | uppercase_header_name.
+    | field_error().
+
+-doc """
+A field that breaks the minimal rule of RFC 9113 §8.2.1.
+
+`uppercase_header_name` names the case that the RFC lists apart from the
+other invalid name characters.
+""".
+-type field_error() ::
+    uppercase_header_name
+    | invalid_header_name
+    | invalid_header_value.
+
+-doc """
+The outcome of a header block decode.
+
+`{invalid_field, Reason, NewState}` reports a field that breaks RFC 9113
+§8.2.1. The block decompressed, and `NewState` carries every dynamic table
+update that the block asks for, because RFC 9113 §4.3 makes an endpoint
+decompress a field block even when it discards the frames. The caller keeps
+`NewState` and treats the message as malformed, a stream error of type
+PROTOCOL_ERROR (RFC 9113 §8.1.1).
+
+`{error, Reason}` reports a decode failure. The block did not decompress,
+the state is unusable, and RFC 9113 §4.3 makes this a connection error of
+type COMPRESSION_ERROR.
+""".
+-type decode_result() ::
+    {ok, headers(), state()}
+    | {invalid_field, field_error(), state()}
+    | {error, decode_error()}.
+
+%% The verdict of the RFC 9113 Section 8.2.1 read on one field, kept apart for
+%% the name and for the value. An indexed name carries its name verdict into
+%% the field that reuses it, where the value arrives fresh from the wire.
+-type fault_reason() :: ok | field_error().
+-type fault() :: ok | {fault_reason(), fault_reason()}.
 
 %%%-----------------------------------------------------------------------------
 %% CONSTANTS
@@ -84,7 +159,7 @@ Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     configured_max_size = 4096 :: non_neg_integer(),
     next_seq = 0 :: non_neg_integer(),
     oldest_seq = 0 :: non_neg_integer(),
-    entries = #{} :: #{non_neg_integer() => {pos_integer(), {binary(), binary()}}},
+    entries = #{} :: #{non_neg_integer() => {pos_integer(), {binary(), binary()}, fault()}},
     full_index = #{} :: #{{binary(), binary()} => non_neg_integer()},
     name_index = #{} :: #{binary() => non_neg_integer()}
 }).
@@ -124,9 +199,12 @@ table_size(#hpack{size = Size}) ->
 %%%-----------------------------------------------------------------------------
 %% DECODING
 %%%-----------------------------------------------------------------------------
--doc "Decode a header block.".
--spec decode(Data :: binary(), State :: state()) ->
-    {ok, Headers :: headers(), NewState :: state()} | {error, decode_error()}.
+-doc """
+Decode a header block.
+
+See `decode/3` for the `invalid_field` return.
+""".
+-spec decode(Data :: binary(), State :: state()) -> decode_result().
 decode(Data, State) ->
     decode(Data, State, #{}).
 
@@ -135,11 +213,10 @@ Decode a header block, aborting with `{error, header_list_too_large}` once
 the cumulative decoded list size exceeds `max_list_size`. The check matches
 the RFC 9113 §10.5.1 octet count (name + value + 32 per entry).
 """.
--spec decode(Data :: binary(), State :: state(), Opts :: decode_opts()) ->
-    {ok, Headers :: headers(), NewState :: state()} | {error, decode_error()}.
+-spec decode(Data :: binary(), State :: state(), Opts :: decode_opts()) -> decode_result().
 decode(Data, State, Opts) ->
     Limit = maps:get(max_list_size, Opts, infinity),
-    decode_block(Data, State, [], 0, Limit).
+    decode_block(Data, State, [], 0, Limit, ok).
 
 %%%-----------------------------------------------------------------------------
 %% ENCODING
@@ -176,93 +253,112 @@ clear_table(State = #hpack{next_seq = NextSeq}) ->
     state(),
     headers(),
     non_neg_integer(),
-    pos_integer() | infinity
+    pos_integer() | infinity,
+    fault_reason()
 ) ->
-    {ok, headers(), state()} | {error, decode_error()}.
+    decode_result().
 decode_block(
-    <<2#001:3, Rest/bits>>, State = #hpack{configured_max_size = ConfigMax}, Acc, Total, Limit
+    <<2#001:3, Rest/bits>>,
+    State = #hpack{configured_max_size = ConfigMax},
+    Acc,
+    Total,
+    Limit,
+    Bad
 ) ->
     maybe
         {ok, MaxSize, Rest2} ?= map_int_error(nhttp_int:dec5(Rest)),
         case MaxSize =< ConfigMax of
             true ->
                 State2 = update_table_size(MaxSize, State),
-                decode_block(Rest2, State2, Acc, Total, Limit);
+                decode_block(Rest2, State2, Acc, Total, Limit, Bad);
             false ->
                 {error, dynamic_table_size_exceeded}
         end
     end;
-decode_block(Data, State, Acc, Total, Limit) ->
-    decode_headers(Data, State, Acc, Total, Limit).
+decode_block(Data, State, Acc, Total, Limit, Bad) ->
+    decode_headers(Data, State, Acc, Total, Limit, Bad).
 
+%% `Bad' carries the first field that broke RFC 9113 Section 8.2.1. The block
+%% still runs to its end, because RFC 9113 Section 4.3 makes an endpoint
+%% decompress a field block even when it discards the frames, and a skipped
+%% dynamic table update leaves this decoder out of step with the peer encoder.
 -spec decode_headers(
     binary(),
     state(),
     headers(),
     non_neg_integer(),
-    pos_integer() | infinity
+    pos_integer() | infinity,
+    fault_reason()
 ) ->
-    {ok, headers(), state()} | {error, decode_error()}.
-decode_headers(<<>>, State, Acc, _Total, _Limit) ->
+    decode_result().
+decode_headers(<<>>, State, Acc, _Total, _Limit, ok) ->
     {ok, lists:reverse(Acc), State};
-decode_headers(<<2#1:1, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<>>, State, _Acc, _Total, _Limit, Bad) ->
+    {invalid_field, Bad, State};
+decode_headers(<<2#1:1, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Index, Rest2} ?= map_int_error(nhttp_int:dec7(Rest)),
-        {ok, {Name, Value}} ?= lookup(Index, State),
+        {ok, {Name, Value}, Fault} ?= lookup(Index, State),
+        NewBad = first_bad(Bad, field_fault(Fault)),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest2, State, NewAcc, NewTotal, Limit)
+        decode_headers(Rest2, State, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(<<2#01:2, 2#000000:6, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<2#01:2, 2#000000:6, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Name, Rest2} ?= map_str_error(nhttp_str:decode(Rest)),
-        ok ?= validate_name_no_uppercase(Name),
         {ok, Value, Rest3} ?= map_str_error(nhttp_str:decode(Rest2)),
-        State2 = insert({Name, Value}, State),
+        Fault = fault(check_name(Name), check_value(Value)),
+        State2 = insert({Name, Value}, Fault, State),
+        NewBad = first_bad(Bad, field_fault(Fault)),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest3, State2, NewAcc, NewTotal, Limit)
+        decode_headers(Rest3, State2, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(<<2#01:2, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<2#01:2, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Index, Rest2} ?= map_int_error(nhttp_int:dec6(Rest)),
-        {ok, {Name, _}} ?= lookup(Index, State),
+        {ok, {Name, _}, NameFault} ?= lookup(Index, State),
         {ok, Value, Rest3} ?= map_str_error(nhttp_str:decode(Rest2)),
-        State2 = insert({Name, Value}, State),
+        Fault = fault(name_fault(NameFault), check_value(Value)),
+        State2 = insert({Name, Value}, Fault, State),
+        NewBad = first_bad(Bad, field_fault(Fault)),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest3, State2, NewAcc, NewTotal, Limit)
+        decode_headers(Rest3, State2, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(<<2#0000:4, 2#0000:4, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<2#0000:4, 2#0000:4, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Name, Rest2} ?= map_str_error(nhttp_str:decode(Rest)),
-        ok ?= validate_name_no_uppercase(Name),
         {ok, Value, Rest3} ?= map_str_error(nhttp_str:decode(Rest2)),
+        NewBad = first_bad(Bad, check_field(Name, Value)),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest3, State, NewAcc, NewTotal, Limit)
+        decode_headers(Rest3, State, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(<<2#0000:4, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<2#0000:4, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Index, Rest2} ?= map_int_error(nhttp_int:dec4(Rest)),
-        {ok, {Name, _}} ?= lookup(Index, State),
+        {ok, {Name, _}, NameFault} ?= lookup(Index, State),
         {ok, Value, Rest3} ?= map_str_error(nhttp_str:decode(Rest2)),
+        NewBad = first_bad(Bad, first_bad(name_fault(NameFault), check_value(Value))),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest3, State, NewAcc, NewTotal, Limit)
+        decode_headers(Rest3, State, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(<<2#0001:4, 2#0000:4, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<2#0001:4, 2#0000:4, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Name, Rest2} ?= map_str_error(nhttp_str:decode(Rest)),
-        ok ?= validate_name_no_uppercase(Name),
         {ok, Value, Rest3} ?= map_str_error(nhttp_str:decode(Rest2)),
+        NewBad = first_bad(Bad, check_field(Name, Value)),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest3, State, NewAcc, NewTotal, Limit)
+        decode_headers(Rest3, State, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(<<2#0001:4, Rest/bits>>, State, Acc, Total, Limit) ->
+decode_headers(<<2#0001:4, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
     maybe
         {ok, Index, Rest2} ?= map_int_error(nhttp_int:dec4(Rest)),
-        {ok, {Name, _}} ?= lookup(Index, State),
+        {ok, {Name, _}, NameFault} ?= lookup(Index, State),
         {ok, Value, Rest3} ?= map_str_error(nhttp_str:decode(Rest2)),
+        NewBad = first_bad(Bad, first_bad(name_fault(NameFault), check_value(Value))),
         {ok, NewAcc, NewTotal} ?= push_header({Name, Value}, Acc, Total, Limit),
-        decode_headers(Rest3, State, NewAcc, NewTotal, Limit)
+        decode_headers(Rest3, State, NewAcc, NewTotal, Limit, NewBad)
     end;
-decode_headers(_, _, _, _, _) ->
+decode_headers(_, _, _, _, _, _) ->
     {error, incomplete_header_block}.
 
 encode_headers([], State, _, Acc) ->
@@ -300,7 +396,7 @@ evict_to_size(
     case maps:get(OldestSeq, Entries, undefined) of
         undefined ->
             State;
-        {EntrySize, _Header} ->
+        {EntrySize, _Header, _Fault} ->
             NewState = State#hpack{
                 size = Size - EntrySize,
                 oldest_seq = OldestSeq + 1,
@@ -448,13 +544,12 @@ find_dyn({Name, _Value} = Header, #hpack{
             end
     end.
 
--spec has_uppercase(binary()) -> boolean().
-has_uppercase(<<>>) -> false;
-has_uppercase(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
-has_uppercase(<<_, Rest/binary>>) -> has_uppercase(Rest).
-
 -spec insert({binary(), binary()}, state()) -> state().
-insert({Name, Value}, State = #hpack{max_size = MaxSize, next_seq = NextSeq}) ->
+insert(Header, State) ->
+    insert(Header, ok, State).
+
+-spec insert({binary(), binary()}, fault(), state()) -> state().
+insert({Name, Value}, Fault, State = #hpack{max_size = MaxSize, next_seq = NextSeq}) ->
     EntrySize = byte_size(Name) + byte_size(Value) + ?ENTRY_OVERHEAD,
     case EntrySize > MaxSize of
         true ->
@@ -472,135 +567,136 @@ insert({Name, Value}, State = #hpack{max_size = MaxSize, next_seq = NextSeq}) ->
             State1#hpack{
                 size = Size1 + EntrySize,
                 next_seq = NextSeq + 1,
-                entries = maps:put(NextSeq, {EntrySize, Header}, Entries1),
+                entries = maps:put(NextSeq, {EntrySize, Header, Fault}, Entries1),
                 full_index = maps:put(Header, NextSeq, FullIndex1),
                 name_index = maps:put(Name, NextSeq, NameIndex1)
             }
     end.
 
--spec lookup(pos_integer(), state()) -> {ok, {binary(), binary()}} | {error, decode_error()}.
+-spec lookup(pos_integer(), state()) ->
+    {ok, {binary(), binary()}, fault()} | {error, decode_error()}.
 lookup(1, _) ->
-    {ok, {<<":authority">>, <<>>}};
+    {ok, {<<":authority">>, <<>>}, ok};
 lookup(2, _) ->
-    {ok, {<<":method">>, <<"GET">>}};
+    {ok, {<<":method">>, <<"GET">>}, ok};
 lookup(3, _) ->
-    {ok, {<<":method">>, <<"POST">>}};
+    {ok, {<<":method">>, <<"POST">>}, ok};
 lookup(4, _) ->
-    {ok, {<<":path">>, <<"/">>}};
+    {ok, {<<":path">>, <<"/">>}, ok};
 lookup(5, _) ->
-    {ok, {<<":path">>, <<"/index.html">>}};
+    {ok, {<<":path">>, <<"/index.html">>}, ok};
 lookup(6, _) ->
-    {ok, {<<":scheme">>, <<"http">>}};
+    {ok, {<<":scheme">>, <<"http">>}, ok};
 lookup(7, _) ->
-    {ok, {<<":scheme">>, <<"https">>}};
+    {ok, {<<":scheme">>, <<"https">>}, ok};
 lookup(8, _) ->
-    {ok, {<<":status">>, <<"200">>}};
+    {ok, {<<":status">>, <<"200">>}, ok};
 lookup(9, _) ->
-    {ok, {<<":status">>, <<"204">>}};
+    {ok, {<<":status">>, <<"204">>}, ok};
 lookup(10, _) ->
-    {ok, {<<":status">>, <<"206">>}};
+    {ok, {<<":status">>, <<"206">>}, ok};
 lookup(11, _) ->
-    {ok, {<<":status">>, <<"304">>}};
+    {ok, {<<":status">>, <<"304">>}, ok};
 lookup(12, _) ->
-    {ok, {<<":status">>, <<"400">>}};
+    {ok, {<<":status">>, <<"400">>}, ok};
 lookup(13, _) ->
-    {ok, {<<":status">>, <<"404">>}};
+    {ok, {<<":status">>, <<"404">>}, ok};
 lookup(14, _) ->
-    {ok, {<<":status">>, <<"500">>}};
+    {ok, {<<":status">>, <<"500">>}, ok};
 lookup(15, _) ->
-    {ok, {<<"accept-charset">>, <<>>}};
+    {ok, {<<"accept-charset">>, <<>>}, ok};
 lookup(16, _) ->
-    {ok, {<<"accept-encoding">>, <<"gzip, deflate">>}};
+    {ok, {<<"accept-encoding">>, <<"gzip, deflate">>}, ok};
 lookup(17, _) ->
-    {ok, {<<"accept-language">>, <<>>}};
+    {ok, {<<"accept-language">>, <<>>}, ok};
 lookup(18, _) ->
-    {ok, {<<"accept-ranges">>, <<>>}};
+    {ok, {<<"accept-ranges">>, <<>>}, ok};
 lookup(19, _) ->
-    {ok, {<<"accept">>, <<>>}};
+    {ok, {<<"accept">>, <<>>}, ok};
 lookup(20, _) ->
-    {ok, {<<"access-control-allow-origin">>, <<>>}};
+    {ok, {<<"access-control-allow-origin">>, <<>>}, ok};
 lookup(21, _) ->
-    {ok, {<<"age">>, <<>>}};
+    {ok, {<<"age">>, <<>>}, ok};
 lookup(22, _) ->
-    {ok, {<<"allow">>, <<>>}};
+    {ok, {<<"allow">>, <<>>}, ok};
 lookup(23, _) ->
-    {ok, {<<"authorization">>, <<>>}};
+    {ok, {<<"authorization">>, <<>>}, ok};
 lookup(24, _) ->
-    {ok, {<<"cache-control">>, <<>>}};
+    {ok, {<<"cache-control">>, <<>>}, ok};
 lookup(25, _) ->
-    {ok, {<<"content-disposition">>, <<>>}};
+    {ok, {<<"content-disposition">>, <<>>}, ok};
 lookup(26, _) ->
-    {ok, {<<"content-encoding">>, <<>>}};
+    {ok, {<<"content-encoding">>, <<>>}, ok};
 lookup(27, _) ->
-    {ok, {<<"content-language">>, <<>>}};
+    {ok, {<<"content-language">>, <<>>}, ok};
 lookup(28, _) ->
-    {ok, {<<"content-length">>, <<>>}};
+    {ok, {<<"content-length">>, <<>>}, ok};
 lookup(29, _) ->
-    {ok, {<<"content-location">>, <<>>}};
+    {ok, {<<"content-location">>, <<>>}, ok};
 lookup(30, _) ->
-    {ok, {<<"content-range">>, <<>>}};
+    {ok, {<<"content-range">>, <<>>}, ok};
 lookup(31, _) ->
-    {ok, {<<"content-type">>, <<>>}};
+    {ok, {<<"content-type">>, <<>>}, ok};
 lookup(32, _) ->
-    {ok, {<<"cookie">>, <<>>}};
+    {ok, {<<"cookie">>, <<>>}, ok};
 lookup(33, _) ->
-    {ok, {<<"date">>, <<>>}};
+    {ok, {<<"date">>, <<>>}, ok};
 lookup(34, _) ->
-    {ok, {<<"etag">>, <<>>}};
+    {ok, {<<"etag">>, <<>>}, ok};
 lookup(35, _) ->
-    {ok, {<<"expect">>, <<>>}};
+    {ok, {<<"expect">>, <<>>}, ok};
 lookup(36, _) ->
-    {ok, {<<"expires">>, <<>>}};
+    {ok, {<<"expires">>, <<>>}, ok};
 lookup(37, _) ->
-    {ok, {<<"from">>, <<>>}};
+    {ok, {<<"from">>, <<>>}, ok};
 lookup(38, _) ->
-    {ok, {<<"host">>, <<>>}};
+    {ok, {<<"host">>, <<>>}, ok};
 lookup(39, _) ->
-    {ok, {<<"if-match">>, <<>>}};
+    {ok, {<<"if-match">>, <<>>}, ok};
 lookup(40, _) ->
-    {ok, {<<"if-modified-since">>, <<>>}};
+    {ok, {<<"if-modified-since">>, <<>>}, ok};
 lookup(41, _) ->
-    {ok, {<<"if-none-match">>, <<>>}};
+    {ok, {<<"if-none-match">>, <<>>}, ok};
 lookup(42, _) ->
-    {ok, {<<"if-range">>, <<>>}};
+    {ok, {<<"if-range">>, <<>>}, ok};
 lookup(43, _) ->
-    {ok, {<<"if-unmodified-since">>, <<>>}};
+    {ok, {<<"if-unmodified-since">>, <<>>}, ok};
 lookup(44, _) ->
-    {ok, {<<"last-modified">>, <<>>}};
+    {ok, {<<"last-modified">>, <<>>}, ok};
 lookup(45, _) ->
-    {ok, {<<"link">>, <<>>}};
+    {ok, {<<"link">>, <<>>}, ok};
 lookup(46, _) ->
-    {ok, {<<"location">>, <<>>}};
+    {ok, {<<"location">>, <<>>}, ok};
 lookup(47, _) ->
-    {ok, {<<"max-forwards">>, <<>>}};
+    {ok, {<<"max-forwards">>, <<>>}, ok};
 lookup(48, _) ->
-    {ok, {<<"proxy-authenticate">>, <<>>}};
+    {ok, {<<"proxy-authenticate">>, <<>>}, ok};
 lookup(49, _) ->
-    {ok, {<<"proxy-authorization">>, <<>>}};
+    {ok, {<<"proxy-authorization">>, <<>>}, ok};
 lookup(50, _) ->
-    {ok, {<<"range">>, <<>>}};
+    {ok, {<<"range">>, <<>>}, ok};
 lookup(51, _) ->
-    {ok, {<<"referer">>, <<>>}};
+    {ok, {<<"referer">>, <<>>}, ok};
 lookup(52, _) ->
-    {ok, {<<"refresh">>, <<>>}};
+    {ok, {<<"refresh">>, <<>>}, ok};
 lookup(53, _) ->
-    {ok, {<<"retry-after">>, <<>>}};
+    {ok, {<<"retry-after">>, <<>>}, ok};
 lookup(54, _) ->
-    {ok, {<<"server">>, <<>>}};
+    {ok, {<<"server">>, <<>>}, ok};
 lookup(55, _) ->
-    {ok, {<<"set-cookie">>, <<>>}};
+    {ok, {<<"set-cookie">>, <<>>}, ok};
 lookup(56, _) ->
-    {ok, {<<"strict-transport-security">>, <<>>}};
+    {ok, {<<"strict-transport-security">>, <<>>}, ok};
 lookup(57, _) ->
-    {ok, {<<"transfer-encoding">>, <<>>}};
+    {ok, {<<"transfer-encoding">>, <<>>}, ok};
 lookup(58, _) ->
-    {ok, {<<"user-agent">>, <<>>}};
+    {ok, {<<"user-agent">>, <<>>}, ok};
 lookup(59, _) ->
-    {ok, {<<"vary">>, <<>>}};
+    {ok, {<<"vary">>, <<>>}, ok};
 lookup(60, _) ->
-    {ok, {<<"via">>, <<>>}};
+    {ok, {<<"via">>, <<>>}, ok};
 lookup(61, _) ->
-    {ok, {<<"www-authenticate">>, <<>>}};
+    {ok, {<<"www-authenticate">>, <<>>}, ok};
 lookup(Index, #hpack{next_seq = NextSeq, oldest_seq = OldestSeq, entries = Entries}) when
     Index > 61
 ->
@@ -608,7 +704,7 @@ lookup(Index, #hpack{next_seq = NextSeq, oldest_seq = OldestSeq, entries = Entri
     case Seq >= OldestSeq andalso Seq < NextSeq of
         true ->
             case maps:get(Seq, Entries, undefined) of
-                {_, Header} -> {ok, Header};
+                {_, Header, Fault} -> {ok, Header, Fault};
                 undefined -> {error, invalid_table_index}
             end;
         false ->
@@ -661,9 +757,40 @@ update_table_size(MaxSize, State) ->
     State1 = evict_to_size(MaxSize, State),
     State1#hpack{max_size = MaxSize}.
 
--spec validate_name_no_uppercase(binary()) -> ok | {error, decode_error()}.
-validate_name_no_uppercase(Name) ->
-    case has_uppercase(Name) of
-        true -> {error, uppercase_header_name};
-        false -> ok
+-spec check_field(binary(), binary()) -> fault_reason().
+check_field(Name, Value) ->
+    first_bad(check_name(Name), check_value(Value)).
+
+-spec check_name(binary()) -> fault_reason().
+check_name(Name) ->
+    case nhttp_headers:validate_field_name(Name) of
+        ok -> ok;
+        {error, uppercase_field_name} -> uppercase_header_name;
+        {error, _} -> invalid_header_name
     end.
+
+-spec check_value(binary()) -> fault_reason().
+check_value(Value) ->
+    case nhttp_headers:validate_field_value(Value) of
+        ok -> ok;
+        {error, _} -> invalid_header_value
+    end.
+
+-spec first_bad(fault_reason(), fault_reason()) -> fault_reason().
+first_bad(ok, Second) -> Second;
+first_bad(First, _) -> First.
+
+-spec fault(fault_reason(), fault_reason()) -> fault().
+fault(ok, ok) -> ok;
+fault(NameFault, ValueFault) -> {NameFault, ValueFault}.
+
+%% The verdict on a name that a later field reuses by index. The value of that
+%% entry does not travel with the name, so its verdict stays behind.
+-spec name_fault(fault()) -> fault_reason().
+name_fault(ok) -> ok;
+name_fault({NameFault, _}) -> NameFault.
+
+-spec field_fault(fault()) -> fault_reason().
+field_fault(ok) -> ok;
+field_fault({ok, ValueFault}) -> ValueFault;
+field_fault({NameFault, _}) -> NameFault.

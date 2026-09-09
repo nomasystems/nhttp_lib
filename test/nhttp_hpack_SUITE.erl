@@ -530,7 +530,7 @@ error_incomplete_integer(_Config) ->
 error_uppercase_header_name(_Config) ->
     InvalidName = <<16#40, 7, "X-Upper", 5, "value">>,
     {ok, State} = nhttp_hpack:new(),
-    ?assertEqual({error, uppercase_header_name}, nhttp_hpack:decode(InvalidName, State)).
+    ?assertMatch({invalid_field, uppercase_header_name, _}, nhttp_hpack:decode(InvalidName, State)).
 
 error_invalid_huffman(_Config) ->
     InvalidHuffman = <<16#40, 16#82, 16#00, 16#00, 16#01, "v">>,

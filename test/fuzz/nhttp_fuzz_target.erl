@@ -46,7 +46,7 @@ artefact readable in a diff.
 
 -export_type([target/0, outcome/0, finding/0]).
 
--type target() :: h1 | h2_frame | h3_frame | qpack | ws_frame.
+-type target() :: h1 | h2_frame | h3_frame | hpack | qpack | ws_frame.
 
 -doc """
 Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
@@ -82,13 +82,18 @@ Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
 %% table, the eviction path and the blocked stream path are all reachable.
 -define(QPACK_CONFIG, #{max_table_capacity => 4096, max_blocked_streams => 8}).
 
+%% RFC 9113 Section 6.5.2 default table size, and a decoded list bound that
+%% keeps the `header_list_too_large` path reachable from a short input.
+-define(HPACK_TABLE_SIZE, 4096).
+-define(HPACK_DECODE_OPTS, #{max_list_size => 65536}).
+
 %%%-----------------------------------------------------------------------------
 %%% TARGETS
 %%%-----------------------------------------------------------------------------
 -doc "Every target the harness drives, in the order the task file lists them.".
 -spec all() -> [target(), ...].
 all() ->
-    [h1, h2_frame, h3_frame, qpack, ws_frame].
+    [h1, h2_frame, h3_frame, hpack, qpack, ws_frame].
 
 -doc """
 Drive one target with `Bin` and check every return against its `-spec`.
@@ -123,6 +128,8 @@ check(h2_frame, Bin) ->
     );
 check(h3_frame, Bin) ->
     rest_result(fun() -> nhttp_h3_frame:decode(Bin) end, Bin, infinity, fun is_h3_frame/1);
+check(hpack, Bin) ->
+    hpack_block(Bin);
 check(qpack, Bin) ->
     maybe
         {ok, Dec} ?= qpack_feed_encoder(Bin),
@@ -233,6 +240,46 @@ qpack_feed_encoder(Bin) ->
             end;
         {error, _Reason} ->
             {ok, Dec0};
+        Other ->
+            {error, {undeclared_return, Other}}
+    catch
+        Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
+    end.
+
+-doc """
+Check `nhttp_hpack:decode/3`, which declares
+`{ok, Headers, State} | {invalid_field, Reason, State} | {error, Reason}`.
+
+`{invalid_field, _, _}` is a refusal that still carries a usable state, the
+shape that RFC 9113 Section 4.3 asks for. The state it returns must decode a
+following block, so the check drives the same input twice.
+""".
+-spec hpack_block(binary()) -> result().
+hpack_block(Bin) ->
+    {ok, State0} = nhttp_hpack:new(?HPACK_TABLE_SIZE),
+    maybe
+        {ok, State1, _} ?= hpack_decode(State0, Bin),
+        {ok, _State2, Outcome} ?= hpack_decode(State1, Bin),
+        {ok, Outcome}
+    end.
+
+-spec hpack_decode(nhttp_hpack:state(), binary()) ->
+    {ok, nhttp_hpack:state(), outcome()} | {error, finding()}.
+hpack_decode(State, Bin) ->
+    try nhttp_hpack:decode(Bin, State, ?HPACK_DECODE_OPTS) of
+        {ok, Headers, NewState} ->
+            case is_field_lines(Headers) of
+                true -> {ok, NewState, parsed};
+                false -> {error, {bad_value_shape, Headers}}
+            end;
+        {invalid_field, Reason, NewState} when
+            Reason =:= uppercase_header_name;
+            Reason =:= invalid_header_name;
+            Reason =:= invalid_header_value
+        ->
+            {ok, NewState, refused};
+        {error, _Reason} ->
+            {ok, State, refused};
         Other ->
             {error, {undeclared_return, Other}}
     catch

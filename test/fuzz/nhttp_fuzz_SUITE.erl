@@ -52,6 +52,7 @@ groups() ->
             corpus_h1,
             corpus_h2_frame,
             corpus_h3_frame,
+            corpus_hpack,
             corpus_qpack,
             corpus_ws_frame
         ]},
@@ -59,6 +60,7 @@ groups() ->
             mutate_h1,
             mutate_h2_frame,
             mutate_h3_frame,
+            mutate_hpack,
             mutate_qpack,
             mutate_ws_frame
         ]},
@@ -66,6 +68,7 @@ groups() ->
             structured_h1,
             structured_h2_frame,
             structured_h3_frame,
+            structured_hpack,
             structured_qpack,
             structured_ws_frame
         ]},
@@ -158,6 +161,7 @@ corpus_covers_every_target(_Config) ->
 corpus_h1(_Config) -> replay(h1).
 corpus_h2_frame(_Config) -> replay(h2_frame).
 corpus_h3_frame(_Config) -> replay(h3_frame).
+corpus_hpack(_Config) -> replay(hpack).
 corpus_qpack(_Config) -> replay(qpack).
 corpus_ws_frame(_Config) -> replay(ws_frame).
 
@@ -167,6 +171,7 @@ corpus_ws_frame(_Config) -> replay(ws_frame).
 mutate_h1(_Config) -> mutation_run(h1).
 mutate_h2_frame(_Config) -> mutation_run(h2_frame).
 mutate_h3_frame(_Config) -> mutation_run(h3_frame).
+mutate_hpack(_Config) -> mutation_run(hpack).
 mutate_qpack(_Config) -> mutation_run(qpack).
 mutate_ws_frame(_Config) -> mutation_run(ws_frame).
 
@@ -176,6 +181,7 @@ mutate_ws_frame(_Config) -> mutation_run(ws_frame).
 structured_h1(_Config) -> structured_run(h1).
 structured_h2_frame(_Config) -> structured_run(h2_frame).
 structured_h3_frame(_Config) -> structured_run(h3_frame).
+structured_hpack(_Config) -> structured_run(hpack).
 structured_qpack(_Config) -> structured_run(qpack).
 structured_ws_frame(_Config) -> structured_run(ws_frame).
 
@@ -243,8 +249,13 @@ structured_run(Target) ->
 
 -doc """
 A generator that never gets past the first octet exercises nothing, so a run
-must reach all three declared shapes. This guards the harness against silent
-decay as the parsers change.
+must reach every shape its target declares. This guards the harness against
+silent decay as the parsers change.
+
+`incomplete` belongs to a parser that reads a prefix of a stream and asks for
+more octets. `nhttp_hpack:decode/3` reads one whole field block, which
+RFC 9113 Section 4.3 calls a discrete unit, so it declares no `{more, _}` and
+answers a truncated block with an error that ends the connection.
 """.
 -spec assert_reaches_every_outcome(nhttp_fuzz_target:target(), map()) -> ok.
 assert_reaches_every_outcome(Target, Tally) ->
@@ -252,8 +263,16 @@ assert_reaches_every_outcome(Target, Tally) ->
         fun(Outcome) ->
             ?assert(maps:get(Outcome, Tally, 0) > 0, {Target, Outcome, Tally})
         end,
-        [parsed, incomplete, refused]
+        declared_outcomes(Target)
     ).
+
+-spec declared_outcomes(nhttp_fuzz_target:target()) -> [nhttp_fuzz_target:outcome(), ...].
+declared_outcomes(hpack) -> [parsed, refused];
+declared_outcomes(h1) -> [parsed, incomplete, refused];
+declared_outcomes(h2_frame) -> [parsed, incomplete, refused];
+declared_outcomes(h3_frame) -> [parsed, incomplete, refused];
+declared_outcomes(qpack) -> [parsed, incomplete, refused];
+declared_outcomes(ws_frame) -> [parsed, incomplete, refused].
 
 -spec seeds(nhttp_fuzz_target:target()) -> [binary()].
 seeds(Target) ->

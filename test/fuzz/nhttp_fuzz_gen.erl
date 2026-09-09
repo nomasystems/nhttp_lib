@@ -182,6 +182,8 @@ structured(h3_frame, S0) ->
     h3_frame(S0);
 structured(qpack, S0) ->
     qpack_section(S0);
+structured(hpack, S0) ->
+    hpack_block(S0);
 structured(h1, S0) ->
     h1_message(S0).
 
@@ -358,6 +360,68 @@ qpack_value(S) ->
 qpack_string(Value) ->
     <<0:1, (byte_size(Value)):7, Value/binary>>.
 
+%%%-----------------------------------------------------------------------------
+
+%%%-----------------------------------------------------------------------------
+%%% HPACK FIELD BLOCK (RFC 7541 SECTION 6)
+%%%
+%%% The six representations of RFC 7541 Section 6, with the name and value pools
+%%% of `qpack_name/1' and `qpack_value/1', which mix conformant octets with the
+%%% ones that RFC 9113 Section 8.2.1 refuses.
+%%%-----------------------------------------------------------------------------
+-spec hpack_block(state()) -> {binary(), state()}.
+hpack_block(S0) ->
+    {Count, S1} = uniform0(5, S0),
+    {Reps, S2} = hpack_reps(Count, S1, []),
+    {iolist_to_binary(Reps), S2}.
+
+-spec hpack_reps(non_neg_integer(), state(), [binary()]) -> {[binary()], state()}.
+hpack_reps(0, S, Acc) ->
+    {lists:reverse(Acc), S};
+hpack_reps(N, S0, Acc) ->
+    {Rep, S1} = hpack_rep(S0),
+    hpack_reps(N - 1, S1, [Rep | Acc]).
+
+-spec hpack_rep(state()) -> {binary(), state()}.
+hpack_rep(S0) ->
+    {Kind, S1} = pick(
+        [indexed, indexed_incremental, literal_incremental, indexed_plain, literal_plain,
+            table_size],
+        S0
+    ),
+    hpack_rep(Kind, S1).
+
+-spec hpack_rep(atom(), state()) -> {binary(), state()}.
+hpack_rep(indexed, S0) ->
+    {Index, S1} = pick([0, 1, 2, 61, 62, 63, 126], S0),
+    {<<2#1:1, Index:7>>, S1};
+hpack_rep(indexed_incremental, S0) ->
+    {Index, S1} = pick([1, 2, 33, 62, 63], S0),
+    {Value, S2} = qpack_value(S1),
+    {<<2#01:2, Index:6, (hpack_string(Value))/binary>>, S2};
+hpack_rep(literal_incremental, S0) ->
+    {Name, S1} = qpack_name(S0),
+    {Value, S2} = qpack_value(S1),
+    {<<2#01:2, 0:6, (hpack_string(Name))/binary, (hpack_string(Value))/binary>>, S2};
+hpack_rep(indexed_plain, S0) ->
+    {Never, S1} = uniform0(2, S0),
+    {Index, S2} = pick([1, 2, 14, 15], S1),
+    {Value, S3} = qpack_value(S2),
+    {<<2#000:3, Never:1, Index:4, (hpack_string(Value))/binary>>, S3};
+hpack_rep(literal_plain, S0) ->
+    {Never, S1} = uniform0(2, S0),
+    {Name, S2} = qpack_name(S1),
+    {Value, S3} = qpack_value(S2),
+    {<<2#000:3, Never:1, 0:4, (hpack_string(Name))/binary, (hpack_string(Value))/binary>>, S3};
+hpack_rep(table_size, S0) ->
+    {Size, S1} = pick([0, 1, 30, 31], S0),
+    {<<2#001:3, Size:5>>, S1}.
+
+%% A string literal with the Huffman bit clear and a 7 bit prefixed length
+%% (RFC 7541 Section 5.2). Every drawn name and value is below 127 octets.
+-spec hpack_string(binary()) -> binary().
+hpack_string(Value) ->
+    <<0:1, (byte_size(Value)):7, Value/binary>>.
 %%%-----------------------------------------------------------------------------
 %%% HTTP/1.1 MESSAGE (RFC 9112 SECTION 2.1)
 %%%-----------------------------------------------------------------------------
