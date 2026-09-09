@@ -31,6 +31,7 @@ all() ->
         {group, reconcile},
         {group, error_paths},
         {group, decoder_coverage},
+        {group, encode_lowercase},
         {group, field_validity}
     ].
 
@@ -78,6 +79,13 @@ groups() ->
             decoder_literal_name_ref_fields,
             decoder_post_base_fields,
             decoder_empty_encoder_stream
+        ]},
+        {encode_lowercase, [parallel], [
+            mixed_case_name_encodes_as_lowercase,
+            mixed_case_name_hits_the_static_entry,
+            mixed_case_name_round_trips_lowercase,
+            mixed_case_name_enters_the_table_lowercase,
+            mixed_case_name_lowercases_the_insert_instruction
         ]},
         {field_validity, [parallel], [
             literal_uppercase_name_is_invalid_field,
@@ -819,8 +827,86 @@ refused_insert_leaves_the_dynamic_table_unchanged(_Config) ->
     ?assertMatch({blocked, _Dec}, nhttp_qpack:decode_field_section(Dec1, 4, TwoEntries)).
 
 %%%-----------------------------------------------------------------------------
+%%% ENCODE LOWERCASE TESTS (RFC 9114 Section 4.2)
+%%%-----------------------------------------------------------------------------
+
+mixed_case_name_encodes_as_lowercase(_Config) ->
+    Value = <<"text/html">>,
+    ?assertEqual(
+        encode_fresh([{<<"content-type">>, Value}]),
+        encode_fresh([{<<"Content-Type">>, Value}])
+    ),
+    ?assertEqual(
+        encode_fresh([{<<"x-custom-field">>, Value}]),
+        encode_fresh([{<<"X-Custom-Field">>, Value}])
+    ).
+
+%% Static entry 31 is `accept-encoding: gzip, deflate, br'. The whole section
+%% is a two octet prefix and one indexed representation, so the length answers
+%% whether the mixed case name reached the entry or took a literal.
+mixed_case_name_hits_the_static_entry(_Config) ->
+    {ok, Enc} = nhttp_qpack:new_encoder(#{}),
+    Header = {<<"Accept-Encoding">>, <<"gzip, deflate, br">>},
+    {ok, _Enc1, EncStream, FieldData} =
+        nhttp_qpack:encode_field_section(Enc, 0, [Header]),
+    ?assertEqual(<<>>, iolist_to_binary(EncStream)),
+    ?assertEqual(<<0, 0, 2#11:2, 31:6>>, iolist_to_binary(FieldData)).
+
+mixed_case_name_round_trips_lowercase(_Config) ->
+    {ok, Enc} = nhttp_qpack:new_encoder(#{}),
+    {ok, Dec} = nhttp_qpack:new_decoder(#{}),
+    Headers = [{<<"X-Request-Id">>, <<"abc">>}, {<<"Content-Type">>, <<"text/html">>}],
+    {ok, _Enc1, _EncStream, FieldData} =
+        nhttp_qpack:encode_field_section(Enc, 0, Headers),
+    {ok, _Dec1, _DecStream, Decoded} =
+        nhttp_qpack:decode_field_section(Dec, 0, iolist_to_binary(FieldData)),
+    ?assertEqual(
+        [{<<"x-request-id">>, <<"abc">>}, {<<"content-type">>, <<"text/html">>}],
+        Decoded
+    ).
+
+%% The decoder holds the entry the insert instruction named. It resolves the
+%% index of the second section to that entry, so the lowercase name it returns
+%% is the name the encoder put in both tables.
+mixed_case_name_enters_the_table_lowercase(_Config) ->
+    {ok, Enc0} = nhttp_qpack:new_encoder(?TABLE_CONFIG),
+    {ok, Dec0} = nhttp_qpack:new_decoder(?TABLE_CONFIG),
+    {ok, Enc1, EncStream1, FD1} =
+        nhttp_qpack:encode_field_section(Enc0, 0, [{<<"X-Custom">>, <<"v">>}]),
+    {ok, Dec1, []} = nhttp_qpack:feed_encoder_stream(Dec0, iolist_to_binary(EncStream1)),
+    {ok, Dec2, DecStream1, Decoded1} =
+        nhttp_qpack:decode_field_section(Dec1, 0, iolist_to_binary(FD1)),
+    ?assertEqual([{<<"x-custom">>, <<"v">>}], Decoded1),
+    {ok, Enc2} = nhttp_qpack:feed_decoder_stream(Enc1, iolist_to_binary(DecStream1)),
+    {ok, _Enc3, EncStream2, FD2} =
+        nhttp_qpack:encode_field_section(Enc2, 4, [{<<"x-custom">>, <<"v">>}]),
+    ?assertEqual(<<>>, iolist_to_binary(EncStream2)),
+    {ok, _Dec3, _DecStream2, Decoded2} =
+        nhttp_qpack:decode_field_section(Dec2, 4, iolist_to_binary(FD2)),
+    ?assertEqual([{<<"x-custom">>, <<"v">>}], Decoded2).
+
+mixed_case_name_lowercases_the_insert_instruction(_Config) ->
+    {ok, Enc} = nhttp_qpack:new_encoder(?TABLE_CONFIG),
+    {ok, _Enc1, EncStream, _FieldData} =
+        nhttp_qpack:encode_field_section(Enc, 0, [{<<"X-Custom">>, <<"v">>}]),
+    Bin = iolist_to_binary(EncStream),
+    {ok, {set_capacity, ?TABLE_CAPACITY}, Rest} =
+        nhttp_qpack_encoder_instruction:decode(Bin),
+    ?assertEqual(
+        {ok, {insert_literal_name, <<"x-custom">>, <<"v">>}, <<>>},
+        nhttp_qpack_encoder_instruction:decode(Rest)
+    ).
+
+%%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
+
+-spec encode_fresh([{binary(), binary()}]) -> binary().
+encode_fresh(Headers) ->
+    {ok, Enc} = nhttp_qpack:new_encoder(#{}),
+    {ok, _Enc1, _EncStream, FieldData} =
+        nhttp_qpack:encode_field_section(Enc, 0, Headers),
+    iolist_to_binary(FieldData).
 
 -spec decode_literal(binary(), binary()) -> term().
 decode_literal(Name, Value) ->

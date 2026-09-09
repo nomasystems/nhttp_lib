@@ -19,6 +19,19 @@ Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
 {ok, DecodedHeaders, DecState1} = nhttp_hpack:decode(HeaderBlock, DecState0).
 ```
 
+## Field names on encode
+
+`encode/2` and `encode/3` write every field name in lowercase. RFC 9113 §8.2
+requires that a field name is converted to lowercase when an HTTP/2 message is
+constructed, and RFC 9113 §8.2.1 makes an uppercase name on the wire malformed.
+The conversion is silent: the return type does not change, and the caller reads
+no report of it.
+
+A name that already holds no octet in `0x41-0x5A` costs one scan and no
+allocation. The lowercase name is what the static table lookup reads, what the
+literal representation writes and what the dynamic table holds, so the octets in
+the table and the octets on the wire agree.
+
 ## Field validity on decode
 
 Every field name and every field value that arrives as a literal is read
@@ -361,10 +374,16 @@ decode_headers(<<2#0001:4, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
 decode_headers(_, _, _, _, _, _) ->
     {error, incomplete_header_block}.
 
+%% RFC 9113 Section 8.2: a field name is converted to lowercase when an
+%% HTTP/2 message is constructed. The lowercased name feeds the table lookup,
+%% the literal representation and the dynamic table insert, so the octets on
+%% the wire and the octets in the table agree.
+-spec encode_headers(headers(), state(), boolean(), [iodata()]) ->
+    {[iodata()], state()}.
 encode_headers([], State, _, Acc) ->
     {lists:reverse(Acc), State};
-encode_headers([{Name, Value} | Tail], State, UseHuffman, Acc) ->
-    Header = {Name, Value},
+encode_headers([{Name0, Value} = Header0 | Tail], State, UseHuffman, Acc) ->
+    {Name, _} = Header = lower_name(Header0, Name0, Value),
     case find(Header, State) of
         {field, Index} ->
             Encoded = nhttp_int:enc7(Index, 2#1),
@@ -380,6 +399,16 @@ encode_headers([{Name, Value} | Tail], State, UseHuffman, Acc) ->
                 | [nhttp_str:encode(Name, UseHuffman) | nhttp_str:encode(Value, UseHuffman)]
             ],
             encode_headers(Tail, State2, UseHuffman, [Encoded | Acc])
+    end.
+
+%% `lower_field_name/1' hands back the very binary it read when the name holds
+%% no uppercase octet, so the tuple the caller wrote survives the common path
+%% and the encoder allocates nothing for a name that is already on the wire form.
+-spec lower_name({binary(), binary()}, binary(), binary()) -> {binary(), binary()}.
+lower_name(Header, Name, Value) ->
+    case nhttp_headers:lower_field_name(Name) of
+        Name -> Header;
+        Lower -> {Lower, Value}
     end.
 
 -spec evict_to_size(non_neg_integer(), state()) -> state().

@@ -52,6 +52,7 @@ groups() ->
             trailers_with_pseudo_forbidden,
             trailers_delivered_as_event,
             content_length_mismatch_is_stream_error,
+            sender_lowercases_field_names,
             request_uppercase_field_name_is_stream_error,
             response_uppercase_field_name_is_stream_error,
             trailers_uppercase_field_name_is_stream_error,
@@ -301,6 +302,21 @@ content_length_mismatch_is_stream_error(_Config) ->
 %% RFC9114-4.1.2-2: an uppercase field name, an invalid character in a field
 %% name, and an invalid character in a field value are malformed, and a
 %% malformed request or response is a stream error of type H3_MESSAGE_ERROR.
+
+%% The sender half of the same rule. The encoder writes the lowercase name, so
+%% the request this library builds passes the receive check that
+%% `request_uppercase_field_name_is_stream_error' asserts on raw octets.
+sender_lowercases_field_names(_Config) ->
+    Client = client_with_peer_streams(),
+    Headers = minimal_request_headers() ++ [{<<"X-Custom">>, <<"v">>}],
+    {ok, _Client1, Actions} = nhttp_h3:send_headers(Client, 0, Headers, fin),
+    [{send_fin, 0, Data}] = Actions,
+    Server = server_with_peer_streams(),
+    {ok, Events, _Server1, _} = nhttp_h3:recv(Server, 0, iolist_to_binary(Data), fin),
+    ?assertMatch(
+        [{request, 0, #{headers := [{<<"x-custom">>, <<"v">>}]}, fin}],
+        Events
+    ).
 
 request_uppercase_field_name_is_stream_error(_Config) ->
     assert_raw_request_stream_error(

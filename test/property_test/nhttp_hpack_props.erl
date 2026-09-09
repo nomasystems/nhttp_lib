@@ -130,6 +130,36 @@ prop_huffman_compression() ->
     ).
 
 
+%% RFC 9113 Section 8.2: a field name is converted to lowercase when an HTTP/2
+%% message is constructed, so the case a caller writes never reaches the wire.
+-spec prop_encode_lowercases_names() -> triq:property().
+prop_encode_lowercases_names() ->
+    ?FORALL(
+        {Headers, Mask},
+        {headers_gen(), list(bool())},
+        begin
+            Mixed = recase_names(Headers, Mask),
+            encode_octets(Mixed) =:= encode_octets(Headers)
+        end
+    ).
+
+-spec encode_octets([{binary(), binary()}]) -> binary().
+encode_octets(Headers) ->
+    {ok, State} = nhttp_hpack:new(),
+    {ok, Encoded, _State2} = nhttp_hpack:encode(Headers, State),
+    iolist_to_binary(Encoded).
+
+%% The mask runs out on a long list, and the tail then keeps its own case.
+-spec recase_names([{binary(), binary()}], [boolean()]) -> [{binary(), binary()}].
+recase_names([], _Mask) ->
+    [];
+recase_names(Headers, []) ->
+    Headers;
+recase_names([{Name, Value} | Tail], [true | Mask]) ->
+    [{string:uppercase(Name), Value} | recase_names(Tail, Mask)];
+recase_names([Header | Tail], [false | Mask]) ->
+    [Header | recase_names(Tail, Mask)].
+
 -spec headers_gen() -> triq_dom:domain().
 headers_gen() ->
     ?LET(

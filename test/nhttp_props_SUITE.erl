@@ -79,7 +79,8 @@ groups() ->
             hpack_random_binary_no_crash,
             hpack_huffman_random_no_crash,
             hpack_malformed_index_no_crash,
-            hpack_bounded_after_error
+            hpack_bounded_after_error,
+            hpack_encode_lowercases_names
         ]},
         {h1_props, [parallel], [
             h1_request_roundtrip,
@@ -121,7 +122,8 @@ groups() ->
             qpack_decode_no_crash,
             qpack_encoder_stream_no_crash,
             qpack_field_section_before_encoder_stream,
-            qpack_multi_stream_acknowledgement
+            qpack_multi_stream_acknowledgement,
+            qpack_encode_lowercases_names
         ]},
         {h3_frame_props, [parallel], [
             h3_frame_data_roundtrip,
@@ -315,6 +317,9 @@ hpack_malformed_index_no_crash(Config) ->
 hpack_bounded_after_error(Config) ->
     run_property(nhttp_hpack_props, prop_hpack_bounded_after_error, Config).
 
+hpack_encode_lowercases_names(Config) ->
+    run_property(nhttp_hpack_props, prop_encode_lowercases_names, Config).
+
 %%%-----------------------------------------------------------------------------
 %%% HTTP/1.1 PROPERTY TESTS
 %%%-----------------------------------------------------------------------------
@@ -434,6 +439,9 @@ qpack_field_section_before_encoder_stream(Config) ->
 
 qpack_multi_stream_acknowledgement(Config) ->
     run_property(nhttp_qpack_props, prop_multi_stream_acknowledgement, Config).
+
+qpack_encode_lowercases_names(Config) ->
+    run_property(nhttp_qpack_props, prop_encode_lowercases_names, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% H3 FRAME PROPERTY TESTS

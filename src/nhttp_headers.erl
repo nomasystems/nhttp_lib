@@ -83,6 +83,7 @@ lowercasing of `lower_field_name/1`.
 %%%-----------------------------------------------------------------------------
 -define(PT_NON_TCHAR, {?MODULE, non_tchar_pattern}).
 -define(PT_FIELD_VALUE_BAD, {?MODULE, field_value_bad_pattern}).
+-define(PT_UPPER_ALPHA, {?MODULE, upper_alpha_pattern}).
 
 -on_load(init_patterns/0).
 
@@ -92,11 +93,18 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_FIELD_VALUE_BAD, binary:compile_pattern(field_value_bad_bytes())
     ),
+    ok = persistent_term:put(
+        ?PT_UPPER_ALPHA, binary:compile_pattern(upper_alpha_bytes())
+    ),
     ok.
 
 -spec non_tchar_bytes() -> [binary(), ...].
 non_tchar_bytes() ->
     [<<C>> || C <- lists:seq(0, 255), not is_tchar(C)].
+
+-spec upper_alpha_bytes() -> [binary(), ...].
+upper_alpha_bytes() ->
+    [<<C>> || C <- lists:seq($A, $Z)].
 
 -spec field_value_bad_bytes() -> [binary(), ...].
 field_value_bad_bytes() ->
@@ -465,10 +473,14 @@ byte_name_eq(C, D) -> to_lower_byte(C) =:= to_lower_byte(D).
 to_lower_byte(C) when C >= $A, C =< $Z -> C + 32;
 to_lower_byte(C) -> C.
 
+%% A scan in bit syntax charges a match context, 5 heap words, on every call.
+%% The encode path of HTTP/2 and of HTTP/3 reads every field name of every
+%% message, so that context is an allocation per field line. `binary:match/2'
+%% over a compiled pattern reads the same octets and allocates nothing when it
+%% answers `nomatch', which is the answer for a name that is already lowercase.
 -spec has_upper_octet(binary()) -> boolean().
-has_upper_octet(<<>>) -> false;
-has_upper_octet(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
-has_upper_octet(<<_, Rest/binary>>) -> has_upper_octet(Rest).
+has_upper_octet(Name) ->
+    binary:match(Name, persistent_term:get(?PT_UPPER_ALPHA)) =/= nomatch.
 
 %% The accepted octets of RFC 9113 Section 8.2.1 spelled as three ranges:
 %% 0x21 to 0x39, 0x3B to 0x40 and 0x5B to 0x7E. The ranges omit 0x3A, so a

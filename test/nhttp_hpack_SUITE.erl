@@ -22,6 +22,7 @@ all() ->
         {group, dynamic_table},
         {group, integer_encoding},
         {group, error_handling},
+        {group, encode_lowercase},
         {group, coverage_edge_cases}
     ].
 
@@ -78,6 +79,13 @@ groups() ->
             error_incomplete_block,
             error_header_list_too_large,
             decode_with_unlimited_max_list_size
+        ]},
+        {encode_lowercase, [parallel], [
+            mixed_case_name_encodes_as_lowercase,
+            mixed_case_name_hits_the_static_entry,
+            mixed_case_name_round_trips_lowercase,
+            mixed_case_name_enters_the_table_lowercase,
+            mixed_case_name_hits_the_static_name_entry
         ]},
         {coverage_edge_cases, [parallel], [
             table_size_update_encoding,
@@ -801,8 +809,64 @@ static_table_name_matches(_Config) ->
     roundtrip(Headers9).
 
 %%%-----------------------------------------------------------------------------
+%%% ENCODE LOWERCASE TESTS (RFC 9113 Section 8.2)
+%%%-----------------------------------------------------------------------------
+
+mixed_case_name_encodes_as_lowercase(_Config) ->
+    Value = <<"text/html">>,
+    ?assertEqual(
+        encode_fresh([{<<"content-type">>, Value}]),
+        encode_fresh([{<<"Content-Type">>, Value}])
+    ),
+    ?assertEqual(
+        encode_fresh([{<<"x-custom-field">>, Value}]),
+        encode_fresh([{<<"X-Custom-Field">>, Value}])
+    ).
+
+mixed_case_name_hits_the_static_entry(_Config) ->
+    {ok, State} = nhttp_hpack:new(),
+    Header = {<<"Accept-Encoding">>, <<"gzip, deflate">>},
+    {ok, Encoded, State2} = nhttp_hpack:encode([Header], State),
+    ?assertEqual(<<2#1:1, 16:7>>, iolist_to_binary(Encoded)),
+    ?assertEqual(0, nhttp_hpack:table_size(State2)).
+
+mixed_case_name_hits_the_static_name_entry(_Config) ->
+    {ok, State} = nhttp_hpack:new(),
+    Header = {<<"Accept-Encoding">>, <<"br">>},
+    {ok, Encoded, _State2} = nhttp_hpack:encode([Header], State),
+    ?assertEqual(
+        <<2#01:2, 16:6, 0:1, 2:7, "br">>,
+        iolist_to_binary(Encoded)
+    ).
+
+mixed_case_name_round_trips_lowercase(_Config) ->
+    {ok, EncState} = nhttp_hpack:new(),
+    {ok, DecState} = nhttp_hpack:new(),
+    Headers = [{<<"X-Request-Id">>, <<"abc">>}, {<<"Content-Type">>, <<"text/html">>}],
+    {ok, Encoded, _EncState2} = nhttp_hpack:encode(Headers, EncState),
+    {ok, Decoded, _DecState2} = nhttp_hpack:decode(iolist_to_binary(Encoded), DecState),
+    ?assertEqual(
+        [{<<"x-request-id">>, <<"abc">>}, {<<"content-type">>, <<"text/html">>}],
+        Decoded
+    ).
+
+%% The second encode reaches the entry the first one inserted only when the
+%% table holds the lowercase name, so the one byte answers what the table holds.
+mixed_case_name_enters_the_table_lowercase(_Config) ->
+    {ok, State} = nhttp_hpack:new(),
+    {ok, _Encoded, State2} = nhttp_hpack:encode([{<<"X-Custom">>, <<"v">>}], State),
+    ?assert(nhttp_hpack:table_size(State2) > 0),
+    {ok, Again, _State3} = nhttp_hpack:encode([{<<"x-custom">>, <<"v">>}], State2),
+    ?assertEqual(<<2#1:1, 62:7>>, iolist_to_binary(Again)).
+
+%%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
+
+encode_fresh(Headers) ->
+    {ok, State} = nhttp_hpack:new(),
+    {ok, Encoded, _State2} = nhttp_hpack:encode(Headers, State),
+    iolist_to_binary(Encoded).
 
 roundtrip(Headers) ->
     {ok, EncState} = nhttp_hpack:new(),

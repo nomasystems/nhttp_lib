@@ -86,6 +86,7 @@ groups() ->
             upgrade_header_forbidden,
             te_trailers_allowed,
             te_non_trailers_forbidden,
+            sender_lowercases_field_names,
             uppercase_header_name_is_stream_error,
             invalid_field_name_char_is_stream_error,
             interior_colon_in_field_name_is_stream_error,
@@ -476,6 +477,21 @@ te_trailers_allowed(_Config) ->
 
 te_non_trailers_forbidden(_Config) ->
     assert_request_rejected(minimal_request_headers() ++ [{<<"te">>, <<"gzip">>}]).
+
+%% RFC9113-8.2-1: field names are converted to lowercase when an HTTP/2
+%% message is constructed. The rule is the sender half of
+%% `uppercase_header_name_is_stream_error', so a message this library writes
+%% never trips the receive check of a conformant peer.
+sender_lowercases_field_names(_Config) ->
+    Client = client_with_server_preface(),
+    Headers = minimal_request_headers() ++ [{<<"X-Trace-Id">>, <<"abc">>}],
+    {ok, _Client1, OutData} = nhttp_h2:send_headers(Client, 1, Headers, fin),
+    Server = server_with_preface(),
+    {ok, Events, _Server1} = nhttp_h2:recv(Server, iolist_to_binary(OutData)),
+    ?assertMatch(
+        [{request, 1, #{headers := [{<<"x-trace-id">>, <<"abc">>}]}, fin}],
+        Events
+    ).
 
 uppercase_header_name_is_stream_error(_Config) ->
     UppercaseLiteral = <<16#40, 10, "X-Bad-Name", 3, "foo">>,
