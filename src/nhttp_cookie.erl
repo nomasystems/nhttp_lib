@@ -72,6 +72,8 @@ direction: `decode_set_cookie/1` drops every attribute it does not name,
 so a re-encode also discards the rest.
 """.
 
+-include("nhttp_ascii.hrl").
+
 -on_load(init_patterns/0).
 
 %%%-----------------------------------------------------------------------------
@@ -163,7 +165,10 @@ init_patterns() ->
     ),
     ok = persistent_term:put(
         ?PT_ENCODE_PATTERNS,
-        {nhttp_headers:non_tchar_pattern(), binary:compile_pattern(non_cookie_octet_bytes())}
+        {
+            binary:compile_pattern(?NHTTP_NON_TCHAR_BYTES),
+            binary:compile_pattern(non_cookie_octet_bytes())
+        }
     ),
     ok.
 

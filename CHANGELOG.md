@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1]
+
+### Fixed
+
+- A release started with `-mode embedded` failed to boot. The `-on_load`
+  functions of `nhttp_cookie` and `nhttp_h1` called `nhttp_headers`, which
+  the boot loader reaches later in alphabetical order, so the call raised
+  `undef` and `kernel` did not start. Both modules now compile their own
+  patterns from the octet sets in `src/nhttp_ascii.hrl` and call nothing
+  outside kernel and stdlib
+
+### Added
+
+- `test/nhttp_load_SUITE` holds the module load contract: no `-on_load`
+  function of this application calls another module of this application
+
 ## [1.1.0] - 2026-09-10
 
 ### Added

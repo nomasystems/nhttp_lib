@@ -103,6 +103,8 @@ a trailer section closes with `encode_trailers/1` in place of
     ]}
 ).
 
+-include("nhttp_ascii.hrl").
+
 -on_load(init_patterns/0).
 
 %%%-----------------------------------------------------------------------------
@@ -311,11 +313,11 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_URI_DELIMS, binary:compile_pattern([<<"/">>, <<"?">>, <<"#">>])
     ),
-    ValueBad = nhttp_headers:field_value_bad_pattern(),
+    ValueBad = binary:compile_pattern(?NHTTP_FIELD_VALUE_BAD_BYTES),
     ok = persistent_term:put(?PT_FIELD_VALUE_BAD, ValueBad),
     ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
     ok = persistent_term:put(
-        ?PT_ENCODE_PATTERNS, {nhttp_headers:non_tchar_pattern(), ValueBad}
+        ?PT_ENCODE_PATTERNS, {binary:compile_pattern(?NHTTP_NON_TCHAR_BYTES), ValueBad}
     ),
     ok.
 
