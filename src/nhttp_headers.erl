@@ -28,6 +28,8 @@ lowercasing of `lower_field_name/1`.
     {inline, [to_lower/1, is_tchar/1, lower_field_name/1, validate_field_name/1]}
 ).
 
+-include("nhttp_ascii.hrl").
+
 -on_load(init_patterns/0).
 
 %%%-----------------------------------------------------------------------------
@@ -81,7 +83,7 @@ lowercasing of `lower_field_name/1`.
 
 -spec field_value_bad_bytes() -> [binary(), ...].
 field_value_bad_bytes() ->
-    [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
+    ?NHTTP_FIELD_VALUE_BAD_BYTES.
 
 -spec init_patterns() -> ok.
 init_patterns() ->
@@ -96,7 +98,7 @@ init_patterns() ->
 
 -spec non_tchar_bytes() -> [binary(), ...].
 non_tchar_bytes() ->
-    [<<C>> || C <- lists:seq(0, 255), not is_tchar(C)].
+    ?NHTTP_NON_TCHAR_BYTES.
 
 -spec upper_alpha_bytes() -> [binary(), ...].
 upper_alpha_bytes() ->
