@@ -14,6 +14,7 @@ This suite runs all property tests defined in:
 - nhttp_h3_props
 - nhttp_ws_props
 - nhttp_cookie_props
+- nhttp_headers_props
 """.
 
 -include_lib("common_test/include/ct.hrl").
@@ -37,7 +38,8 @@ all() ->
         {group, ws_props},
         {group, cookie_props},
         {group, msg_props},
-        {group, compress_props}
+        {group, compress_props},
+        {group, headers_props}
     ].
 
 groups() ->
@@ -77,7 +79,8 @@ groups() ->
             hpack_random_binary_no_crash,
             hpack_huffman_random_no_crash,
             hpack_malformed_index_no_crash,
-            hpack_bounded_after_error
+            hpack_bounded_after_error,
+            hpack_encode_lowercases_names
         ]},
         {h1_props, [parallel], [
             h1_request_roundtrip,
@@ -119,7 +122,8 @@ groups() ->
             qpack_decode_no_crash,
             qpack_encoder_stream_no_crash,
             qpack_field_section_before_encoder_stream,
-            qpack_multi_stream_acknowledgement
+            qpack_multi_stream_acknowledgement,
+            qpack_encode_lowercases_names
         ]},
         {h3_frame_props, [parallel], [
             h3_frame_data_roundtrip,
@@ -179,6 +183,12 @@ groups() ->
             compress_decompress_random_binary_no_crash,
             compress_decompress_respects_max,
             compress_decompress_rejects_trailing_bytes
+        ]},
+        {headers_props, [parallel], [
+            headers_field_name_accepts_only_the_rfc_octets,
+            headers_field_value_agrees_with_the_octet_set,
+            headers_lower_field_name_matches_byte_wise_lowercase,
+            headers_lower_field_name_does_not_copy_a_lowercase_name
         ]}
     ].
 
@@ -307,6 +317,9 @@ hpack_malformed_index_no_crash(Config) ->
 hpack_bounded_after_error(Config) ->
     run_property(nhttp_hpack_props, prop_hpack_bounded_after_error, Config).
 
+hpack_encode_lowercases_names(Config) ->
+    run_property(nhttp_hpack_props, prop_encode_lowercases_names, Config).
+
 %%%-----------------------------------------------------------------------------
 %%% HTTP/1.1 PROPERTY TESTS
 %%%-----------------------------------------------------------------------------
@@ -426,6 +439,9 @@ qpack_field_section_before_encoder_stream(Config) ->
 
 qpack_multi_stream_acknowledgement(Config) ->
     run_property(nhttp_qpack_props, prop_multi_stream_acknowledgement, Config).
+
+qpack_encode_lowercases_names(Config) ->
+    run_property(nhttp_qpack_props, prop_encode_lowercases_names, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% H3 FRAME PROPERTY TESTS
@@ -601,3 +617,27 @@ compress_decompress_rejects_trailing_bytes(Config) ->
 -spec run_property(module(), atom(), list()) -> ok.
 run_property(Module, Property, Config) ->
     ct_property_test:quickcheck(Module:Property(), Config).
+
+%%%-----------------------------------------------------------------------------
+%%% HEADERS PROPERTY TESTS
+%%%-----------------------------------------------------------------------------
+
+headers_field_name_accepts_only_the_rfc_octets(Config) ->
+    run_property(
+        nhttp_headers_props, prop_validate_field_name_accepts_only_the_rfc_octets, Config
+    ).
+
+headers_field_value_agrees_with_the_octet_set(Config) ->
+    run_property(
+        nhttp_headers_props, prop_validate_field_value_agrees_with_the_octet_set, Config
+    ).
+
+headers_lower_field_name_matches_byte_wise_lowercase(Config) ->
+    run_property(
+        nhttp_headers_props, prop_lower_field_name_matches_byte_wise_lowercase, Config
+    ).
+
+headers_lower_field_name_does_not_copy_a_lowercase_name(Config) ->
+    run_property(
+        nhttp_headers_props, prop_lower_field_name_does_not_copy_a_lowercase_name, Config
+    ).

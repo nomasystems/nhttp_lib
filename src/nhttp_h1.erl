@@ -293,16 +293,8 @@ encoder never repairs the value and never strips a byte from it.
 
 %% The field value scan below this length runs on `binary:match/2`, and at
 %% this length and above it runs on the word scan of
-%% `has_forbidden_value_octet/1`. Two unrolled strides of that loop.
+%% `nhttp_headers:has_forbidden_value_octet/1`.
 -define(VALUE_WORD_SCAN_MIN, 112).
-
-%% Seven octet words for the field value scan. `bnot` and `band` on a 56 bit
-%% word stay inside a small integer, and 64 bits would allocate a bignum.
--define(W_LOW7, 16#7F7F7F7F7F7F7F).
--define(W_TAB7, 16#09090909090909).
--define(W_SUB32, 16#60606060606060).
--define(W_ONE7, 16#01010101010101).
--define(W_HIGH7, 16#80808080808080).
 
 %%%-----------------------------------------------------------------------------
 %% COMPILED PATTERNS
@@ -323,17 +315,13 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_URI_DELIMS, binary:compile_pattern([<<"/">>, <<"?">>, <<"#">>])
     ),
-    ValueBad = binary:compile_pattern(field_value_bad_bytes()),
+    ValueBad = nhttp_headers:field_value_bad_pattern(),
     ok = persistent_term:put(?PT_FIELD_VALUE_BAD, ValueBad),
     ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
     ok = persistent_term:put(
         ?PT_ENCODE_PATTERNS, {nhttp_headers:non_tchar_pattern(), ValueBad}
     ),
     ok.
-
--spec field_value_bad_bytes() -> [binary(), ...].
-field_value_bad_bytes() ->
-    [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
 
 -spec target_bad_bytes() -> [binary(), ...].
 target_bad_bytes() ->
@@ -1587,7 +1575,7 @@ validate_field_value(Value, ValuePat) when byte_size(Value) < ?VALUE_WORD_SCAN_M
         _ -> {error, {invalid_field_value, Value}}
     end;
 validate_field_value(Value, _ValuePat) ->
-    case has_forbidden_value_octet(Value) of
+    case nhttp_headers:has_forbidden_value_octet(Value) of
         false -> ok;
         true -> {error, {invalid_field_value, Value}}
     end.
@@ -1626,51 +1614,6 @@ has_invalid_char(Bin) ->
 -spec has_invalid_char(binary(), binary:cp()) -> boolean().
 has_invalid_char(Bin, ValuePat) ->
     binary:match(Bin, ValuePat) =/= nomatch.
-
-%% The field value octet set of RFC 9110 Section 5.5, read seven octets at a
-%% time. Every clause reuses the match context, so the loop allocates one
-%% context for the whole value and charges one reduction per call.
-%%
-%% `forbidden_in_word/1` holds the octet set as three carry free word tests.
-%% `U` clears the high bit of every octet, and `V` maps 0x09 to 0x00, which
-%% turns "below 0x20 and not 0x09" into "between 0x01 and 0x1F". Every
-%% addend keeps each octet under 0x100, so no carry crosses an octet and
-%% every test is exact per octet rather than only for the word.
--spec has_forbidden_value_octet(binary()) -> boolean().
-has_forbidden_value_octet(
-    <<A:56, B:56, C:56, D:56, E:56, F:56, G:56, H:56, Rest/binary>>
-) ->
-    case
-        forbidden_in_word(A) orelse forbidden_in_word(B) orelse
-            forbidden_in_word(C) orelse forbidden_in_word(D) orelse
-            forbidden_in_word(E) orelse forbidden_in_word(F) orelse
-            forbidden_in_word(G) orelse forbidden_in_word(H)
-    of
-        true -> true;
-        false -> has_forbidden_value_octet(Rest)
-    end;
-has_forbidden_value_octet(<<A:56, Rest/binary>>) ->
-    case forbidden_in_word(A) of
-        true -> true;
-        false -> has_forbidden_value_octet(Rest)
-    end;
-has_forbidden_value_octet(<<C, Rest/binary>>) when C > 16#1F, C =/= 16#7F ->
-    has_forbidden_value_octet(Rest);
-has_forbidden_value_octet(<<16#09, Rest/binary>>) ->
-    has_forbidden_value_octet(Rest);
-has_forbidden_value_octet(<<_, _/binary>>) ->
-    true;
-has_forbidden_value_octet(<<>>) ->
-    false.
-
--compile({inline, [forbidden_in_word/1]}).
-
--spec forbidden_in_word(non_neg_integer()) -> boolean().
-forbidden_in_word(W) ->
-    U = W band ?W_LOW7,
-    V = U bxor ?W_TAB7,
-    Low = (V + ?W_LOW7) band (bnot (V + ?W_SUB32)),
-    (((Low bor (U + ?W_ONE7)) band (bnot W)) band ?W_HIGH7) =/= 0.
 
 -spec is_chunked_framing([binary()]) -> boolean().
 is_chunked_framing(Codings) ->

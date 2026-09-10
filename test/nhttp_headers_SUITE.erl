@@ -19,7 +19,10 @@ all() ->
         {group, mutation},
         {group, filter},
         {group, to_lower},
-        {group, token}
+        {group, token},
+        {group, field_name_validity},
+        {group, field_value_validity},
+        {group, lower_field_name}
     ].
 
 groups() ->
@@ -75,6 +78,37 @@ groups() ->
             is_token_rejects_empty,
             is_token_accepts_field_names,
             is_token_rejects_non_tchar_octets
+        ]},
+        {field_name_validity, [parallel], [
+            name_rejects_empty,
+            name_rejects_bare_colon,
+            name_rejects_interior_colon,
+            name_rejects_uppercase,
+            name_rejects_space_and_controls,
+            name_rejects_high_octets,
+            name_accepts_pseudo_header,
+            name_accepts_visible_boundaries,
+            name_every_octet_matches_the_rule,
+            name_every_leading_octet_matches_the_rule
+        ]},
+        {field_value_validity, [parallel], [
+            value_accepts_empty,
+            value_rejects_nul_lf_cr,
+            value_rejects_del_and_other_controls,
+            value_rejects_leading_whitespace,
+            value_rejects_trailing_whitespace,
+            value_accepts_interior_whitespace,
+            value_accepts_obs_text,
+            value_every_octet_matches_the_rule,
+            value_word_scan_agrees_with_the_pattern,
+            forbidden_value_octet_matches_the_octet_set
+        ]},
+        {lower_field_name, [parallel], [
+            lower_field_name_returns_the_input_binary,
+            lower_field_name_copies_when_uppercase,
+            lower_field_name_preserves_non_ascii_upper_bytes,
+            lower_field_name_empty,
+            lower_field_name_agrees_with_to_lower
         ]}
     ].
 
@@ -412,3 +446,366 @@ tchars() ->
 -spec separators() -> [byte()].
 separators() ->
     [$(, $), $<, $>, $@, $,, $;, $:, $\\, $", $/, $[, $], $?, $=, ${, $}].
+
+%%%-----------------------------------------------------------------------------
+%%% FIELD NAME VALIDITY
+%%%
+%%% RFC 9113 Section 8.2.1: a field name must not hold an octet in 0x00-0x20,
+%%% 0x41-0x5A or 0x7F-0xFF, and must not hold a colon except the single
+%%% leading colon of a pseudo-header field. RFC 9114 Section 4.1.2 lists the
+%%% same conditions for HTTP/3 and names the uppercase case apart.
+%%%-----------------------------------------------------------------------------
+
+name_rejects_empty(_Config) ->
+    ?assertEqual({error, empty_field_name}, nhttp_headers:validate_field_name(<<>>)).
+
+%% A bare colon starts with a single colon but names no pseudo-header field.
+name_rejects_bare_colon(_Config) ->
+    ?assertEqual({error, empty_field_name}, nhttp_headers:validate_field_name(<<":">>)).
+
+name_rejects_interior_colon(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assertEqual(
+                {error, invalid_field_name_char},
+                nhttp_headers:validate_field_name(Name),
+                {name, Name}
+            )
+        end,
+        [<<"a:b">>, <<"::method">>, <<":method:">>, <<"content-length:">>, <<"::">>]
+    ).
+
+name_rejects_uppercase(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assertEqual(
+                {error, uppercase_field_name},
+                nhttp_headers:validate_field_name(Name),
+                {name, Name}
+            )
+        end,
+        [<<"Content-Length">>, <<"ETag">>, <<"x-vendoR">>, <<"A">>, <<":Method">>]
+    ).
+
+name_rejects_space_and_controls(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assertEqual(
+                {error, invalid_field_name_char},
+                nhttp_headers:validate_field_name(Name),
+                {name, Name}
+            )
+        end,
+        [
+            <<"a b">>,
+            <<" a">>,
+            <<"a ">>,
+            <<"a", 0, "b">>,
+            <<"a\tb">>,
+            <<"a\rb">>,
+            <<"a\nb">>,
+            <<"a", 16#7F, "b">>
+        ]
+    ).
+
+name_rejects_high_octets(_Config) ->
+    lists:foreach(
+        fun(C) ->
+            Name = <<"a", C, "b">>,
+            ?assertEqual(
+                {error, invalid_field_name_char},
+                nhttp_headers:validate_field_name(Name),
+                {octet, C}
+            )
+        end,
+        lists:seq(16#80, 16#FF)
+    ).
+
+name_accepts_pseudo_header(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assertEqual(ok, nhttp_headers:validate_field_name(Name), {name, Name})
+        end,
+        [<<":method">>, <<":path">>, <<":scheme">>, <<":authority">>, <<":status">>, <<":a">>]
+    ).
+
+name_accepts_visible_boundaries(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assertEqual(ok, nhttp_headers:validate_field_name(Name), {name, Name})
+        end,
+        [<<16#21>>, <<16#7E>>, <<16#21, 16#7E>>, <<"!#$%&'*+-.^_`|~">>, <<"a{b}c">>]
+    ).
+
+name_every_octet_matches_the_rule(_Config) ->
+    Allowed = allowed_name_octets(),
+    lists:foreach(
+        fun(C) ->
+            Name = <<$x, C>>,
+            case nhttp_headers:validate_field_name(Name) of
+                ok ->
+                    ?assert(lists:member(C, Allowed), {accepted, C});
+                {error, uppercase_field_name} ->
+                    ?assert(C >= $A andalso C =< $Z, {uppercase, C});
+                {error, invalid_field_name_char} ->
+                    ?assertNot(lists:member(C, Allowed), {refused, C}),
+                    ?assertNot(C >= $A andalso C =< $Z, {uppercase, C})
+            end
+        end,
+        lists:seq(0, 255)
+    ).
+
+name_every_leading_octet_matches_the_rule(_Config) ->
+    Allowed = allowed_name_octets(),
+    lists:foreach(
+        fun(C) ->
+            Name = <<C, $x>>,
+            Ok = lists:member(C, Allowed) orelse C =:= $:,
+            case nhttp_headers:validate_field_name(Name) of
+                ok ->
+                    ?assert(Ok, {accepted, C});
+                {error, uppercase_field_name} ->
+                    ?assert(C >= $A andalso C =< $Z, {uppercase, C});
+                {error, invalid_field_name_char} ->
+                    ?assertNot(Ok, {refused, C})
+            end
+        end,
+        lists:seq(0, 255)
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% FIELD VALUE VALIDITY
+%%%
+%%% RFC 9110 Section 5.5 forbids 0x00-0x1F except 0x09, and 0x7F. RFC 9113
+%%% Section 8.2.1 forbids a leading or trailing SP or HTAB.
+%%%-----------------------------------------------------------------------------
+
+value_accepts_empty(_Config) ->
+    ?assertEqual(ok, nhttp_headers:validate_field_value(<<>>)).
+
+value_rejects_nul_lf_cr(_Config) ->
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(
+                {error, invalid_field_value_char},
+                nhttp_headers:validate_field_value(Value),
+                {value, Value}
+            )
+        end,
+        [
+            <<"a", 0, "b">>,
+            <<"a\nb">>,
+            <<"a\rb">>,
+            <<"a\r\nb">>,
+            <<0>>,
+            <<"text/html\r\nx-injected: 1">>
+        ]
+    ).
+
+value_rejects_del_and_other_controls(_Config) ->
+    lists:foreach(
+        fun(C) ->
+            Value = <<"a", C, "b">>,
+            ?assertEqual(
+                {error, invalid_field_value_char},
+                nhttp_headers:validate_field_value(Value),
+                {octet, C}
+            )
+        end,
+        [C || C <- lists:seq(16#00, 16#1F), C =/= 16#09] ++ [16#7F]
+    ).
+
+value_rejects_leading_whitespace(_Config) ->
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(
+                {error, field_value_edge_whitespace},
+                nhttp_headers:validate_field_value(Value),
+                {value, Value}
+            )
+        end,
+        [<<" a">>, <<"\ta">>, <<" ">>, <<"\t">>, <<"  a  ">>]
+    ).
+
+value_rejects_trailing_whitespace(_Config) ->
+    Long = binary:copy(<<"long-">>, 40),
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(
+                {error, field_value_edge_whitespace},
+                nhttp_headers:validate_field_value(Value),
+                {value, Value}
+            )
+        end,
+        [<<"a ">>, <<"a\t">>, <<"a b ">>, <<Long/binary, " ">>, <<Long/binary, "\t">>]
+    ).
+
+value_accepts_interior_whitespace(_Config) ->
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(ok, nhttp_headers:validate_field_value(Value), {value, Value})
+        end,
+        [<<"a b">>, <<"a\tb">>, <<"a \t b">>, <<"text/html; charset=utf-8">>]
+    ).
+
+value_accepts_obs_text(_Config) ->
+    lists:foreach(
+        fun(C) ->
+            Value = <<"a", C, "b">>,
+            ?assertEqual(ok, nhttp_headers:validate_field_value(Value), {octet, C})
+        end,
+        lists:seq(16#80, 16#FF)
+    ).
+
+value_every_octet_matches_the_rule(_Config) ->
+    Forbidden = forbidden_value_octets(),
+    lists:foreach(
+        fun(C) ->
+            Value = <<$v, C, $v>>,
+            Expected =
+                case lists:member(C, Forbidden) of
+                    false -> ok;
+                    true -> {error, invalid_field_value_char}
+                end,
+            ?assertEqual(
+                Expected, nhttp_headers:validate_field_value(Value), {octet, C}
+            )
+        end,
+        lists:seq(0, 255)
+    ).
+
+%% The length switch inside the value scan picks `binary:match/2' below 112
+%% octets and the word scan at that length and above. Both instruments must
+%% report the same refusal at every offset.
+value_word_scan_agrees_with_the_pattern(_Config) ->
+    lists:foreach(
+        fun(Len) ->
+            Clean = binary:copy(<<$v>>, Len),
+            ?assertEqual(ok, nhttp_headers:validate_field_value(Clean), {clean, Len}),
+            lists:foreach(
+                fun(Pos) ->
+                    Bad = set_octet(Clean, Pos, 0),
+                    ?assertEqual(
+                        {error, invalid_field_value_char},
+                        nhttp_headers:validate_field_value(Bad),
+                        {Len, Pos}
+                    )
+                end,
+                lists:seq(0, Len - 1)
+            )
+        end,
+        [1, 8, 56, 111, 112, 113, 224, 449]
+    ).
+
+forbidden_value_octet_matches_the_octet_set(_Config) ->
+    Forbidden = forbidden_value_octets(),
+    lists:foreach(
+        fun(Len) ->
+            Clean = binary:copy(<<$v>>, Len),
+            ?assertNot(nhttp_headers:has_forbidden_value_octet(Clean), {clean, Len}),
+            lists:foreach(
+                fun(C) ->
+                    Bin = <<Clean/binary, C>>,
+                    ?assertEqual(
+                        lists:member(C, Forbidden),
+                        nhttp_headers:has_forbidden_value_octet(Bin),
+                        {Len, C}
+                    )
+                end,
+                lists:seq(0, 255)
+            )
+        end,
+        lists:seq(0, 60)
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% LOWER FIELD NAME
+%%%
+%%% RFC 9114 Section 4.2: characters in field names are converted to lowercase
+%%% before their encoding.
+%%%-----------------------------------------------------------------------------
+
+%% The conformant path must not allocate, so a name that holds no uppercase
+%% octet comes back as the very binary that the caller passed in.
+lower_field_name_returns_the_input_binary(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assert(
+                erts_debug:same(Name, nhttp_headers:lower_field_name(Name)),
+                {copied, Name}
+            )
+        end,
+        [
+            <<"content-length">>,
+            <<":method">>,
+            <<"x-vendor-trace-id">>,
+            <<"a">>,
+            <<>>,
+            <<"x-", 16#80, "-y">>,
+            binary:copy(<<"x-long-vendor-name-">>, 20)
+        ]
+    ).
+
+lower_field_name_copies_when_uppercase(_Config) ->
+    ?assertEqual(<<"content-length">>, nhttp_headers:lower_field_name(<<"Content-Length">>)),
+    ?assertEqual(<<"etag">>, nhttp_headers:lower_field_name(<<"ETag">>)),
+    ?assertEqual(<<"x-a">>, nhttp_headers:lower_field_name(<<"X-A">>)),
+    ?assertEqual(<<"a">>, nhttp_headers:lower_field_name(<<"A">>)),
+    Mixed = <<"X-Vendor-Trace-Id">>,
+    ?assertNot(erts_debug:same(Mixed, nhttp_headers:lower_field_name(Mixed))).
+
+lower_field_name_preserves_non_ascii_upper_bytes(_Config) ->
+    ?assertEqual(
+        <<"x-foo-", 16#80, "-bar">>,
+        nhttp_headers:lower_field_name(<<"X-Foo-", 16#80, "-Bar">>)
+    ).
+
+lower_field_name_empty(_Config) ->
+    ?assertEqual(<<>>, nhttp_headers:lower_field_name(<<>>)).
+
+lower_field_name_agrees_with_to_lower(_Config) ->
+    lists:foreach(
+        fun(Name) ->
+            ?assertEqual(
+                nhttp_headers:to_lower(Name),
+                nhttp_headers:lower_field_name(Name),
+                {name, Name}
+            )
+        end,
+        [
+            <<"Content-Length">>,
+            <<"content-length">>,
+            <<"ETag">>,
+            <<"X-Custom-Header">>,
+            <<":Method">>,
+            <<>>,
+            <<"UPPER">>,
+            <<"x-", 16#80, 16#C0, "-y">>,
+            <<"a{B}c">>
+        ]
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% HELPERS
+%%%-----------------------------------------------------------------------------
+
+%% Written from the prose of RFC 9113 Section 8.2.1 rather than from the
+%% ranges that the implementation matches on.
+-spec allowed_name_octets() -> [byte()].
+allowed_name_octets() ->
+    Forbidden = forbidden_name_octets(),
+    [C || C <- lists:seq(0, 255), not lists:member(C, Forbidden), C =/= $:].
+
+-spec forbidden_name_octets() -> [byte()].
+forbidden_name_octets() ->
+    lists:seq(16#00, 16#20) ++ lists:seq(16#41, 16#5A) ++ lists:seq(16#7F, 16#FF).
+
+-spec forbidden_value_octets() -> [byte()].
+forbidden_value_octets() ->
+    [C || C <- lists:seq(16#00, 16#1F), C =/= 16#09] ++ [16#7F].
+
+-spec set_octet(binary(), non_neg_integer(), byte()) -> binary().
+set_octet(Bin, Pos, Octet) ->
+    Tail = byte_size(Bin) - Pos - 1,
+    <<Head:Pos/binary, _, Rest:Tail/binary>> = Bin,
+    <<Head/binary, Octet, Rest/binary>>.

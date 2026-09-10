@@ -8,6 +8,19 @@ header compression format for HTTP/3. The encoder maintains a dynamic
 table, generates encoder stream instructions for table modifications,
 and produces encoded field section data for request streams.
 
+## Field names
+
+`encode_field_section/3` writes every field name in lowercase. RFC 9114 §4.2
+requires that characters in field names are converted to lowercase before their
+encoding, and RFC 9114 §4.1.2 makes an uppercase name malformed. The conversion
+is silent: the return type does not change, and the caller reads no report of
+it.
+
+A name that already holds no octet in `0x41-0x5A` costs one scan and no
+allocation. The lowercase name is what the static table lookup reads, what the
+literal representation writes, what the encoder stream instruction carries and
+what the dynamic table holds. All four name the same octets.
+
 The implementation uses a conservative encoding strategy following
 Appendix C of RFC 9204: static table lookups are always preferred,
 dynamic table entries are only referenced when safely below the Known
@@ -309,8 +322,9 @@ do_insert_name_ref(Table, NameIndex, Name, Value, Acc) ->
 ) -> #enc_acc{}.
 encode_headers([], Acc) ->
     Acc;
-encode_headers([{Name, Value} | Rest], Acc) ->
-    Acc1 = encode_one_header(Name, Value, Acc),
+encode_headers([{Name0, Value} | Rest], Acc) ->
+    %% RFC 9114 Section 4.2: field name characters are lowercased before encoding.
+    Acc1 = encode_one_header(nhttp_headers:lower_field_name(Name0), Value, Acc),
     encode_headers(Rest, Acc1).
 
 -spec encode_one_header(binary(), binary(), #enc_acc{}) ->

@@ -109,12 +109,15 @@ header_name_gen() ->
         list_to_binary([<<"x-">>, Chars])
     ).
 
+%% RFC 9110 Section 5.5: `field-content' neither starts nor ends with SP or
+%% HTAB. RFC 9114 Section 4.1.2 makes a value that does malformed, so the
+%% roundtrip generator must not draw one.
 -spec header_value_gen() -> triq:gen(binary()).
 header_value_gen() ->
     ?LET(
-        Chars,
-        non_empty(list(oneof(lists:seq(32, 126)))),
-        list_to_binary(Chars)
+        {First, Rest},
+        {oneof(lists:seq(33, 126)), list(oneof(lists:seq(32, 126)))},
+        string:trim(list_to_binary([First | Rest]), trailing, [$\s])
     ).
 
 -spec h3_settings_gen() -> triq_dom:domain().
