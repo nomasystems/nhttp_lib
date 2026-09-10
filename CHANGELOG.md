@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-10
+
+### Added
+
+- `nhttp_h1:prepare_headers/1` validates a header list once and returns a
+  block that `encode_request/2` and `encode_response/2` reuse
+- `nhttp_h1:encode_trailers/1` and `nhttp_h1:encode_response_head/4`
+- `nhttp_h2:stream_stats/1` reports the active, peer-opened, and peer-reset
+  stream counts
+- `max_reset_streams` and `max_continuation_frames` in `t:nhttp_h2:settings/0`.
+  Both are local bounds and go on no wire. `max_continuation_frames` defaults
+  to a value derived from `max_header_list_size`
+- `t:nhttp_ws_frame:frame_limits/0` and the capped arities
+  `nhttp_ws_frame:decode/2`, `decode_raw/3`, and `decode_unmasked/2`
+- `nhttp_headers:validate_field_name/1`, `validate_field_value/1`,
+  `lower_field_name/1`, `name_eq/2`, `is_token/1`, and `is_tchar/1`
+
+### Changed
+
+- `nhttp_h1:encode_request/1,2` and `nhttp_h1:encode_response/1,2` return
+  `{ok, iolist()} | {error, t:nhttp_h1:encode_error/0}`. They returned
+  `iolist()` before
+- `nhttp_cookie:encode_cookie/1` and `nhttp_cookie:encode_set_cookie/1` return
+  `{ok, binary()} | {error, _}`, and the error names the class of the
+  violation
+- `nhttp_msg:build_response/2` returns
+  `{ok, response()} | {error, invalid_status | missing_status}`
+- `nhttp_hpack:decode/2,3` answers `{invalid_field, Reason, State}`, a shape
+  apart from the `{error, Reason}` of a decompression failure. `State` carries
+  every dynamic table update that the block asks for (RFC 9113 Section 4.3)
+- `nhttp_h1` and `nhttp_cookie` scan with patterns that `-on_load` compiles
+  into `persistent_term`, and the encode and parse paths build no intermediate
+  binary
+
+### Security
+
+- Refuse a field name that is not a token, and a field value that carries CR,
+  LF, NUL, another control byte, or `0x7F`, at the HTTP/1.1 encoder. The
+  message is refused whole (RFC 9110 Sections 5.5 and 5.6.2, RFC 9112 Section
+  11.1). Response splitting and request smuggling (CVE-2020-11709,
+  CVE-2023-26130, CVE-2025-0825, CVE-2026-21428, CVE-2026-45372)
+- Validate a cookie name, a cookie value, a `Path`, and a `Domain` against the
+  RFC 6265 Section 4.1.1 grammar on encode. No value is stripped, quoted, or
+  truncated (CVE-2020-11709, CVE-2023-26130, CVE-2025-0825, CVE-2026-21428,
+  CVE-2026-45372)
+- Read every literal field name and every literal field value in the HPACK and
+  the QPACK decoder. An uppercase name, an invalid octet, an interior colon, or
+  a value with leading or trailing whitespace is a stream error of type
+  PROTOCOL_ERROR on HTTP/2 and H3_MESSAGE_ERROR on HTTP/3 (RFC 9113 Section
+  8.2.1, RFC 9114 Section 4.1.2)
+- Combine every `Transfer-Encoding` field line into one coding list, and accept
+  the message only when that list holds `chunked` once, as the final coding
+  (RFC 9112 Sections 6.1 and 6.3). Refuse a chunk that does not end with CRLF
+  as `incomplete_chunk`, and refuse a `Content-Length` value that is not a run
+  of digits (CVE-2026-34441, CVE-2026-45352, CVE-2026-46527)
+- Refuse a declared WebSocket payload length above `max_frame_size` as
+  `{error, {frame_too_large, DeclaredLength}}`, before the payload is buffered
+  (RFC 6455 Section 10.4). `nhttp_ws` caps at its maximum message size
+  (CVE-2025-46728, CVE-2025-53629)
+- Refuse a byte that follows a complete gzip or deflate stream as
+  `{error, trailing_data}` (CVE-2026-22776, CVE-2026-28435)
+- Count the streams that the peer opens and resets, and fail the connection
+  with ENHANCE_YOUR_CALM above `max_reset_streams` (CVE-2023-44487). Bound the
+  number of CONTINUATION frames in one field block (CVE-2026-29076)
+- `nhttp_msg:build_response/2` never raises on peer input. A missing or
+  malformed `:status` is a stream error (CVE-2026-31870)
+
 ## [1.0.5] - 2026-08-21
 
 ### Added
