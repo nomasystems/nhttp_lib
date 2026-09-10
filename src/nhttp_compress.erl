@@ -92,14 +92,12 @@ decompress(Data, Encoding) ->
 Decompress data with an explicit cap on the inflated output. Returns
 `{error, max_output_exceeded}` if decoding would produce more than `Max`
 bytes; pass `infinity` to disable the cap.
-
 `Data` must hold exactly one complete compressed stream and nothing else.
 Any byte after the end of that stream gives `{error, trailing_data}`. This
 refuses a gzip file that holds more than one member, which RFC 1952
 Section 2.2 permits. The rule is deliberate. A decoder that drops the bytes
 after the first stream derives a different body from the same octets than a
 decoder that reads them all.
-
 `identity` applies `Max` to the input itself, because the input is the
 output.
 """.
@@ -201,34 +199,6 @@ compress_deflate(Data, Level) ->
 compress_gzip(Data, Level) ->
     with_zlib_stream(fun(Z) -> do_compress_gzip(Z, Data, Level) end).
 
--spec inflate_exact(binary(), pos_integer() | infinity, pos_integer()) ->
-    {ok, binary()} | {error, zlib_error()}.
-inflate_exact(Data, Max, WindowBits) ->
-    case with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, error) end) of
-        {error, data_error} -> inflate_failure(Data, Max, WindowBits);
-        Result -> Result
-    end.
-
--spec inflate_failure(binary(), pos_integer() | infinity, pos_integer()) ->
-    {error, zlib_error()}.
-inflate_failure(Data, Max, WindowBits) ->
-    case with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, cut) end) of
-        {ok, _Prefix} -> {error, trailing_data};
-        {error, _} = Error -> Error
-    end.
-
--spec do_inflate(
-    zlib:zstream(), binary(), pos_integer() | infinity, pos_integer(), error | cut
-) ->
-    {ok, binary()} | {error, zlib_error()}.
-do_inflate(Z, Data, Max, WindowBits, EndOfStream) ->
-    maybe
-        ok ?= zlib_inflate_init(Z, WindowBits, EndOfStream),
-        {ok, Decompressed} ?= zlib_safe_inflate(Z, Data, Max),
-        ok ?= zlib_inflate_end(Z),
-        {ok, iolist_to_binary(Decompressed)}
-    end.
-
 -spec do_compress_deflate(zlib:zstream(), iodata(), 1..9) ->
     {ok, binary()} | {error, zlib_error()}.
 do_compress_deflate(Z, Data, Level) ->
@@ -249,6 +219,18 @@ do_compress_gzip(Z, Data, Level) ->
         {ok, iolist_to_binary(Compressed)}
     end.
 
+-spec do_inflate(
+    zlib:zstream(), binary(), pos_integer() | infinity, pos_integer(), error | cut
+) ->
+    {ok, binary()} | {error, zlib_error()}.
+do_inflate(Z, Data, Max, WindowBits, EndOfStream) ->
+    maybe
+        ok ?= zlib_inflate_init(Z, WindowBits, EndOfStream),
+        {ok, Decompressed} ?= zlib_safe_inflate(Z, Data, Max),
+        ok ?= zlib_inflate_end(Z),
+        {ok, iolist_to_binary(Decompressed)}
+    end.
+
 -spec encoding_to_atom(binary()) -> encoding().
 encoding_to_atom(<<"gzip">>) -> gzip;
 encoding_to_atom(<<"x-gzip">>) -> gzip;
@@ -261,6 +243,22 @@ extract_base_mime(ContentType) ->
     case binary:split(ContentType, <<";">>) of
         [BaseMime | _] -> string:trim(BaseMime);
         [] -> ContentType
+    end.
+
+-spec inflate_exact(binary(), pos_integer() | infinity, pos_integer()) ->
+    {ok, binary()} | {error, zlib_error()}.
+inflate_exact(Data, Max, WindowBits) ->
+    case with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, error) end) of
+        {error, data_error} -> inflate_failure(Data, Max, WindowBits);
+        Result -> Result
+    end.
+
+-spec inflate_failure(binary(), pos_integer() | infinity, pos_integer()) ->
+    {error, zlib_error()}.
+inflate_failure(Data, Max, WindowBits) ->
+    case with_zlib_stream(fun(Z) -> do_inflate(Z, Data, Max, WindowBits, cut) end) of
+        {ok, _Prefix} -> {error, trailing_data};
+        {error, _} = Error -> Error
     end.
 
 -spec is_compressible_type(binary(), [binary()]) -> boolean().

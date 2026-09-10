@@ -180,6 +180,11 @@ CONTINUATION frames that carry the larger field section.
     | {ok, [event()], conn(), iodata()}
     | {error, nhttp_h2_frame:decode_error()}.
 
+-type frame_result() ::
+    {ok, conn(), [event()], iodata()}
+    | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
+    | {error, nhttp_h2_frame:decode_error()}.
+
 -type send_error() ::
     connection_closing
     | {unknown_stream, nhttp_lib:stream_id()}
@@ -443,19 +448,16 @@ open_stream(
 
 -doc """
 Return the stream counters for this connection.
-
 `active` is the number of streams in the "open" state or in either
 "half-closed" state, the set that `SETTINGS_MAX_CONCURRENT_STREAMS` bounds
 (RFC 9113 Section 5.1.2). `peer_opened` is the total number of streams that
 the peer opened. `peer_reset` is the number of streams that the peer
 terminated with RST_STREAM.
-
 `SETTINGS_MAX_CONCURRENT_STREAMS` bounds the streams that are open at one
 instant. It does not bound stream turnover. A peer that alternates HEADERS
 and RST_STREAM holds `active` at a low value and drives `peer_opened` and
 `peer_reset` without limit. RFC 9113 Section 10.5 tells an implementation to
 track such use and to set a limit on it.
-
 This library holds no clock, so it counts events only. The caller reads these
 counters to apply a rate per unit of time. To let the connection refuse the
 peer on its own, set `max_reset_streams` in the local settings. The
@@ -547,8 +549,7 @@ continuation_flood_error() ->
             "SETTINGS_MAX_CONTINUATION_FRAMES (RFC 9113 Section 10.5)"
         >>}}.
 
--spec decode_and_emit_headers(conn(), nhttp_lib:stream_id(), fin(), binary()) ->
-    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+-spec decode_and_emit_headers(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
 decode_and_emit_headers(
     #h2_conn{hpack_dec = HpackDec, streams = Streams} = Conn, StreamId, EndStream, HeaderBlock
 ) ->
@@ -573,8 +574,7 @@ decode_and_emit_headers(
             end
     end.
 
--spec decode_headers_internal(conn(), nhttp_lib:stream_id(), fin(), binary()) ->
-    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+-spec decode_headers_internal(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
 decode_headers_internal(
     #h2_conn{role = Role, hpack_dec = HpackDec, streams = Streams} = Conn,
     StreamId,
@@ -668,10 +668,9 @@ decode_headers_internal(
                             end
                     end
             end;
-        {error, uppercase_header_name} ->
-            {error,
-                {stream_error, StreamId, protocol_error,
-                    <<"Uppercase header name (RFC 9113 Section 8.2)">>}};
+        {invalid_field, Reason, NewHpackDec} ->
+            {stream_error, Conn#h2_conn{hpack_dec = NewHpackDec}, StreamId, protocol_error,
+                invalid_field_reason(Reason)};
         {error, header_list_too_large} ->
             {error,
                 {connection_error, enhance_your_calm, <<
@@ -810,6 +809,14 @@ hpack_decode_opts(#h2_conn{local_settings = Settings}) ->
 initial_stream_id(client) -> 1;
 initial_stream_id(server) -> 2.
 
+-spec invalid_field_reason(nhttp_hpack:field_error()) -> binary().
+invalid_field_reason(uppercase_header_name) ->
+    <<"Uppercase header name (RFC 9113 Section 8.2.1, Section 8.1.1)">>;
+invalid_field_reason(invalid_header_name) ->
+    <<"Invalid header field name (RFC 9113 Section 8.2.1, Section 8.1.1)">>;
+invalid_field_reason(invalid_header_value) ->
+    <<"Invalid header field value (RFC 9113 Section 8.2.1, Section 8.1.1)">>.
+
 -spec invalid_preface_error() -> {error, nhttp_h2_frame:decode_error()}.
 invalid_preface_error() ->
     {error,
@@ -825,8 +832,7 @@ is_active_state(_) -> false.
 is_peer_initiated(server, StreamId) -> StreamId band 1 =:= 1;
 is_peer_initiated(client, StreamId) -> StreamId band 1 =:= 0.
 
--spec process_continuation(conn(), nhttp_lib:stream_id(), fin(), binary()) ->
-    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+-spec process_continuation(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
 process_continuation(
     #h2_conn{continuation_stream = undefined}, StreamId, _EndHeaders, _HeaderBlock
 ) ->
@@ -929,8 +935,7 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload) -
             end
     end.
 
--spec process_frame(conn(), nhttp_h2_frame:t()) ->
-    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+-spec process_frame(conn(), nhttp_h2_frame:t()) -> frame_result().
 process_frame(#h2_conn{continuation_stream = ExpectedId}, Frame) when
     ExpectedId =/= undefined,
     not (is_tuple(Frame) andalso
@@ -1041,8 +1046,7 @@ process_frame(#h2_conn{} = Conn, {push_promise, _StreamId, _EndHeaders, Promised
 process_frame(#h2_conn{} = Conn, {unknown, _Type}) ->
     {ok, Conn, [], []}.
 
--spec process_headers(conn(), nhttp_lib:stream_id(), fin(), fin(), binary()) ->
-    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+-spec process_headers(conn(), nhttp_lib:stream_id(), fin(), fin(), binary()) -> frame_result().
 process_headers(
     #h2_conn{continuation_stream = undefined} = Conn, StreamId, EndStream, EndHeaders, HeaderBlock
 ) ->
@@ -1176,6 +1180,10 @@ recv_loop(Conn, Data, EventsAcc, ToSend) ->
                     recv_loop(NewConn, Rest, EventsAcc, [ToSend, FramesToSend]);
                 {ok, NewConn, NewEvents, FramesToSend} ->
                     recv_loop(NewConn, Rest, [NewEvents | EventsAcc], [ToSend, FramesToSend]);
+                {stream_error, StreamConn, StreamId, ErrorCode, _Reason} ->
+                    {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
+                    NewConn = close_stream(StreamConn, StreamId),
+                    recv_loop(NewConn, Rest, EventsAcc, [ToSend, RstFrame]);
                 {error, {stream_error, StreamId, ErrorCode, _Reason}} ->
                     {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
                     NewConn = close_stream(Conn, StreamId),

@@ -216,6 +216,40 @@ prop_interop_roundtrip() ->
         end
     ).
 
+%% RFC 9114 Section 4.2: characters in field names are converted to lowercase
+%% before their encoding, so the case a caller writes never reaches the wire.
+-spec prop_encode_lowercases_names() -> triq:property().
+prop_encode_lowercases_names() ->
+    ?FORALL(
+        {Headers, Mask},
+        {mixed_headers_gen(), list(bool())},
+        begin
+            Mixed = recase_names(Headers, Mask),
+            encode_octets(Mixed) =:= encode_octets(Headers)
+        end
+    ).
+
+-spec encode_octets([{binary(), binary()}]) -> {binary(), binary()}.
+encode_octets(Headers) ->
+    {ok, Enc} = nhttp_qpack:new_encoder(#{
+        max_table_capacity => 4096,
+        max_blocked_streams => 100
+    }),
+    {ok, _Enc1, EncStream, FieldData} =
+        nhttp_qpack:encode_field_section(Enc, 0, Headers),
+    {iolist_to_binary(EncStream), iolist_to_binary(FieldData)}.
+
+%% The mask runs out on a long list, and the tail then keeps its own case.
+-spec recase_names([{binary(), binary()}], [boolean()]) -> [{binary(), binary()}].
+recase_names([], _Mask) ->
+    [];
+recase_names(Headers, []) ->
+    Headers;
+recase_names([{Name, Value} | Tail], [true | Mask]) ->
+    [{string:uppercase(Name), Value} | recase_names(Tail, Mask)];
+recase_names([Header | Tail], [false | Mask]) ->
+    [Header | recase_names(Tail, Mask)].
+
 %%%-----------------------------------------------------------------------------
 %%% GENERATORS
 %%%-----------------------------------------------------------------------------
@@ -266,12 +300,15 @@ header_name_gen() ->
         list_to_binary(Chars)
     ).
 
+%% RFC 9110 Section 5.5: `field-content' neither starts nor ends with SP or
+%% HTAB. RFC 9114 Section 4.1.2 makes a value that does malformed, so the
+%% roundtrip generator must not draw one.
 -spec header_value_gen() -> triq:gen(binary()).
 header_value_gen() ->
     ?LET(
-        Chars,
-        non_empty(list(oneof(lists:seq(32, 126)))),
-        list_to_binary(Chars)
+        {First, Rest},
+        {oneof(lists:seq(33, 126)), list(oneof(lists:seq(32, 126)))},
+        string:trim(list_to_binary([First | Rest]), trailing, [$\s])
     ).
 
 %%%-----------------------------------------------------------------------------

@@ -103,6 +103,8 @@ a trailer section closes with `encode_trailers/1` in place of
     ]}
 ).
 
+-on_load(init_patterns/0).
+
 %%%-----------------------------------------------------------------------------
 %% PARSING
 %%%-----------------------------------------------------------------------------
@@ -211,20 +213,6 @@ derived field there follows the body length.
     prepared => prepared()
 }.
 
--record(prepared, {
-    block = <<>> :: binary(),
-    framed = false :: boolean()
-}).
-
--doc """
-A field block that `prepare_headers/1` validated once.
-
-The value holds the field lines as one binary and the answer to the framing
-question: whether one of those lines is `Content-Length` or
-`Transfer-Encoding`.
-""".
--opaque prepared() :: #prepared{}.
-
 -type enc_pats() :: {NameBad :: binary:cp(), ValueBad :: binary:cp()}.
 
 -doc """
@@ -273,17 +261,6 @@ encoder never repairs the value and never strips a byte from it.
     {ok, T, BytesConsumed :: pos_integer()}
     | {more, MinBytes :: pos_integer()}
     | {error, parse_error()}.
--record(chunked_st, {
-    phase = size :: size | {data, non_neg_integer()} | trailers,
-    trailers_acc = [] :: nhttp_lib:headers(),
-    headers_size = 0 :: non_neg_integer(),
-    max_header_size = infinity :: header_limit(),
-    max_headers_count = infinity :: header_limit(),
-    max_body_size = infinity :: header_limit(),
-    body_size = 0 :: non_neg_integer()
-}).
-
--opaque chunked_st() :: #chunked_st{}.
 
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS
@@ -291,18 +268,7 @@ encoder never repairs the value and never strips a byte from it.
 -define(REQUEST_LINE_ALLOWANCE, 8192).
 -define(MAX_CHUNK_SIZE_LINE, 1024).
 
-%% The field value scan below this length runs on `binary:match/2`, and at
-%% this length and above it runs on the word scan of
-%% `has_forbidden_value_octet/1`. Two unrolled strides of that loop.
 -define(VALUE_WORD_SCAN_MIN, 112).
-
-%% Seven octet words for the field value scan. `bnot` and `band` on a 56 bit
-%% word stay inside a small integer, and 64 bits would allocate a bignum.
--define(W_LOW7, 16#7F7F7F7F7F7F7F).
--define(W_TAB7, 16#09090909090909).
--define(W_SUB32, 16#60606060606060).
--define(W_ONE7, 16#01010101010101).
--define(W_HIGH7, 16#80808080808080).
 
 %%%-----------------------------------------------------------------------------
 %% COMPILED PATTERNS
@@ -313,8 +279,30 @@ encoder never repairs the value and never strips a byte from it.
 -define(PT_URI_DELIMS, {?MODULE, uri_delims_pattern}).
 -define(PT_FIELD_VALUE_BAD, {?MODULE, field_value_bad_pattern}).
 -define(PT_TARGET_BAD, {?MODULE, target_bad_pattern}).
+-record(prepared, {
+    block = <<>> :: binary(),
+    framed = false :: boolean()
+}).
 
--on_load(init_patterns/0).
+-record(chunked_st, {
+    phase = size :: size | {data, non_neg_integer()} | trailers,
+    trailers_acc = [] :: nhttp_lib:headers(),
+    headers_size = 0 :: non_neg_integer(),
+    max_header_size = infinity :: header_limit(),
+    max_headers_count = infinity :: header_limit(),
+    max_body_size = infinity :: header_limit(),
+    body_size = 0 :: non_neg_integer()
+}).
+-doc """
+A field block that `prepare_headers/1` validated once.
+
+The value holds the field lines as one binary and the answer to the framing
+question: whether one of those lines is `Content-Length` or
+`Transfer-Encoding`.
+""".
+-opaque prepared() :: #prepared{}.
+
+-opaque chunked_st() :: #chunked_st{}.
 
 -spec init_patterns() -> ok.
 init_patterns() ->
@@ -323,17 +311,13 @@ init_patterns() ->
     ok = persistent_term:put(
         ?PT_URI_DELIMS, binary:compile_pattern([<<"/">>, <<"?">>, <<"#">>])
     ),
-    ValueBad = binary:compile_pattern(field_value_bad_bytes()),
+    ValueBad = nhttp_headers:field_value_bad_pattern(),
     ok = persistent_term:put(?PT_FIELD_VALUE_BAD, ValueBad),
     ok = persistent_term:put(?PT_TARGET_BAD, binary:compile_pattern(target_bad_bytes())),
     ok = persistent_term:put(
         ?PT_ENCODE_PATTERNS, {nhttp_headers:non_tchar_pattern(), ValueBad}
     ),
     ok.
-
--spec field_value_bad_bytes() -> [binary(), ...].
-field_value_bad_bytes() ->
-    [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
 
 -spec target_bad_bytes() -> [binary(), ...].
 target_bad_bytes() ->
@@ -345,13 +329,10 @@ target_bad_bytes() ->
 -doc """
 Compute the response body framing mode from the request method, response
 status, and response headers (RFC 9112 §6.3).
-
 Pure helper: pass the values parsed by `parse_response_headers/1,2` plus
 the method of the matching request. The returned `body_stream()` is fed
 into `parse_response_body/2`.
-
 Framing rules in order:
-
 - `HEAD` request → `none` (HEAD responses never have a body).
 - 1xx, 204, 304 status → `none`.
 - `Transfer-Encoding` with `chunked` as the single final coding →
@@ -361,7 +342,6 @@ Framing rules in order:
   (RFC 9112 §6.3 #4).
 - `Content-Length: N` → `{length, N}`.
 - otherwise → `until_close` (RFC 9112 §6.3 #7).
-
 The chunked / length walkers do not enforce header or body size limits in
 this entry point. Callers reading from untrusted peers should validate
 sizes at the recv site or wrap the stream.
@@ -500,7 +480,6 @@ The body framing mode is encoded in `BodyStream`:
   into `parse_request_body/2`.
 The returned request map carries `body => streaming` instead of buffered
 bytes. Use `parse_request_body/2` to drive the body stream.
-
 Every `Transfer-Encoding` field line contributes to one coding list, in
 order of receipt (RFC 9110 §5.3). The parser returns
 `{error, unsupported_transfer_encoding}` unless that list holds `chunked`
@@ -612,6 +591,38 @@ parse_response_body(<<Bin/binary>>, until_close) ->
     Size = byte_size(Bin),
     {ok, [{data, Bin}], until_close, Size}.
 
+-doc #{equiv => parse_response_head / 2}.
+-spec parse_response_head(binary()) ->
+    {ok, nhttp_lib:status(), binary(), version(), nhttp_lib:headers(), binary()}
+    | {more, pos_integer()}
+    | {error, parse_error()}.
+parse_response_head(<<Bin/binary>>) ->
+    parse_response_head(Bin, #{}).
+
+-doc """
+Parse HTTP/1.1 response headers only, like `parse_response_headers/2`, but
+also return the reason phrase and protocol version from the status line.
+Returns `{ok, Status, Reason, Version, Headers, Rest}` where `Rest` is the
+binary after the headers. Used by streaming callers that must preserve the
+full response head (status, reason, version) while reading the body
+separately via `parse_response_body/2`.
+""".
+-spec parse_response_head(binary(), opts()) ->
+    {ok, nhttp_lib:status(), binary(), version(), nhttp_lib:headers(), binary()}
+    | {more, pos_integer()}
+    | {error, parse_error()}.
+parse_response_head(<<>>, _Opts) ->
+    {more, 1};
+parse_response_head(<<Bin/binary>>, Opts) ->
+    MaxHeaderSize = maps:get(max_header_size, Opts, infinity),
+    MaxHeadersCount = maps:get(max_headers_count, Opts, infinity),
+    maybe
+        {ok, Status, Reason, Version, Rest} ?= parse_status_line(Bin),
+        {ok, Headers, BodyRest} ?=
+            parse_headers_acc(Rest, [], 0, MaxHeaderSize, MaxHeadersCount),
+        {ok, Status, Reason, Version, Headers, BodyRest}
+    end.
+
 -doc """
 > #### Warning {: .warning}
 > This zero-arg variant enforces **no** size or count limits on the input
@@ -652,38 +663,6 @@ parse_response_headers(<<Bin/binary>>, Opts) ->
         {ok, Status, Headers, BodyRest}
     end.
 
--doc #{equiv => parse_response_head / 2}.
--spec parse_response_head(binary()) ->
-    {ok, nhttp_lib:status(), binary(), version(), nhttp_lib:headers(), binary()}
-    | {more, pos_integer()}
-    | {error, parse_error()}.
-parse_response_head(<<Bin/binary>>) ->
-    parse_response_head(Bin, #{}).
-
--doc """
-Parse HTTP/1.1 response headers only, like `parse_response_headers/2`, but
-also return the reason phrase and protocol version from the status line.
-Returns `{ok, Status, Reason, Version, Headers, Rest}` where `Rest` is the
-binary after the headers. Used by streaming callers that must preserve the
-full response head (status, reason, version) while reading the body
-separately via `parse_response_body/2`.
-""".
--spec parse_response_head(binary(), opts()) ->
-    {ok, nhttp_lib:status(), binary(), version(), nhttp_lib:headers(), binary()}
-    | {more, pos_integer()}
-    | {error, parse_error()}.
-parse_response_head(<<>>, _Opts) ->
-    {more, 1};
-parse_response_head(<<Bin/binary>>, Opts) ->
-    MaxHeaderSize = maps:get(max_header_size, Opts, infinity),
-    MaxHeadersCount = maps:get(max_headers_count, Opts, infinity),
-    maybe
-        {ok, Status, Reason, Version, Rest} ?= parse_status_line(Bin),
-        {ok, Headers, BodyRest} ?=
-            parse_headers_acc(Rest, [], 0, MaxHeaderSize, MaxHeadersCount),
-        {ok, Status, Reason, Version, Headers, BodyRest}
-    end.
-
 %%%-----------------------------------------------------------------------------
 %% ENCODING
 %%%-----------------------------------------------------------------------------
@@ -703,7 +682,6 @@ encode_last_chunk() ->
 
 -doc """
 Encode an HTTP/1.1 request to iolist.
-
 The encoder refuses a message that cannot be framed unambiguously on the
 wire. It returns `{error, {invalid_request_target, Target}}` for a target
 that is empty or that carries a byte at or below `0x20` or the byte `0x7F`,
@@ -711,7 +689,6 @@ that is empty or that carries a byte at or below `0x20` or the byte `0x7F`,
 (RFC 9110 Section 5.6.2), and `{error, {invalid_field_value, Value}}` for a
 field value that carries CR, LF, NUL, another control byte, or `0x7F`
 (RFC 9110 Section 5.5).
-
 RFC 9112 Section 2.2 forbids a sender to generate a bare CR in any protocol
 element other than the content, and Section 11.1 names this filtering as the
 mitigation for request smuggling and response splitting. No value is
@@ -723,12 +700,10 @@ encode_request(Req) ->
 
 -doc """
 Encode an HTTP/1.1 request to iolist under the given encoder options.
-
 See `encode_request/1` for the framing rules and the rejected byte classes.
 The request path reads the `prepared` key of `t:enc_opts/0` only. A request
 carries a derived `Content-Length` when its body is not empty, so
 `content_length` has no meaning here.
-
 ```erlang
 {ok, Static} = nhttp_h1:prepare_headers([{<<"User-Agent">>, <<"acme/1.0">>}]),
 {ok, Io} = nhttp_h1:encode_request(Req, #{prepared => Static}).
@@ -742,21 +717,17 @@ encode_request(Req, _EncOpts) ->
 
 -doc """
 Encode an HTTP/1.1 response to iolist.
-
 Equivalent to `encode_response(Resp, #{})`. The encoder adds
 `Content-Length` when the header list carries neither `content-length` nor
 `transfer-encoding`, including a `Content-Length: 0` on an empty body.
-
 The encoder adds no `Content-Length` at a 1xx, 204, or 304 status. RFC 9110
 Section 8.6 forbids the field at 1xx and 204. It permits the field at 304
 only at the length that a 200 response would have carried, which this
 encoder cannot compute, so a caller that knows the value supplies it in the
 header list.
-
 A 2xx response to a `CONNECT` request also carries no `Content-Length`. The
 response map holds no request method, so that case needs
 `encode_response/2` with `#{content_length => omit}`.
-
 The encoder refuses a message that cannot be framed unambiguously on the
 wire. It returns `{error, {invalid_reason_phrase, Reason}}` for a reason
 phrase outside `1*( HTAB / SP / VCHAR / obs-text )` (RFC 9112 Section 4.1),
@@ -765,7 +736,6 @@ phrase outside `1*( HTAB / SP / VCHAR / obs-text )` (RFC 9112 Section 4.1),
 field value that carries CR, LF, NUL, another control byte, or `0x7F`
 (RFC 9110 Section 5.5). An empty reason phrase stays legal, because the
 status-line grammar makes the element optional.
-
 RFC 9112 Section 2.2 forbids a sender to generate a bare CR in any protocol
 element other than the content, and Section 11.1 names this filtering as the
 mitigation for response splitting. No value is repaired and no byte is
@@ -777,10 +747,8 @@ encode_response(Resp) ->
 
 -doc """
 Encode an HTTP/1.1 response to iolist under the given encoder options.
-
 See `encode_response/1` for the framing rules, the rejected byte classes,
 and `t:enc_opts/0` for the options.
-
 A `trailers` key that holds a non-empty field list frames the body with the
 chunked transfer coding: the header block, one chunk that carries the whole
 body, then the last chunk, the trailer section and the closing CRLF. The
@@ -791,9 +759,7 @@ Section 7.1.2 names the chunked transfer coding as that mechanism for
 HTTP/1.1. A response framed any other way holds no position for the field
 lines, so the encoder returns
 `{error, {trailers_require_chunked, Trailers}}` rather than drop them.
-
 `encode_trailers/1` states which trailer field names the encoder refuses.
-
 A `prepared` block travels ahead of the field lines of this message. A
 response that carries a trailer section keeps its `Transfer-Encoding` in the
 message header list, because `require_chunked_framing/2` reads that list and
@@ -834,7 +800,6 @@ encode_response(Resp, EncOpts) ->
 
 -doc """
 Encode HTTP/1.x response headers for streaming.
-
 Used when sending chunked responses - sends status line + headers only. The
 reason phrase comes from the status code, so only the header list is subject
 to validation. See `encode_response/1` for the rejected byte classes.
@@ -860,7 +825,6 @@ encode_response_head(Version, Status, Headers) ->
 -doc """
 Encode HTTP/1.x response headers for streaming, under the given encoder
 options.
-
 The head path reads the `prepared` key of `t:enc_opts/0` only. A streaming
 response derives no `Content-Length`, so `content_length` has no meaning
 here. The prepared block travels ahead of the field lines of this message.
@@ -884,67 +848,17 @@ encode_response_head(Version, Status, Headers, EncOpts) ->
     end.
 
 -doc """
-Validate a field list once and return the field lines as one binary.
-
-The encoders read every octet of every field name and every field value on
-every call, because RFC 9112 Section 11.1 names that filtering as the
-mitigation for request smuggling and response splitting. A caller that sends
-the same field lines on many messages pays for the same octets on every
-message. `prepare_headers/1` moves that cost to one call.
-
-```erlang
-{ok, Static} = nhttp_h1:prepare_headers([
-    {<<"Server">>, <<"acme/1.0">>},
-    {<<"Cache-Control">>, <<"no-store">>}
-]),
-{ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Static}).
-```
-
-The value is opaque and this function is the only path that builds one. A
-caller that fabricates the record writes octets that no validator read, and
-the library cannot prevent that any more than it can prevent a call to a
-private function.
-
-`prepare_headers/1` refuses exactly what the encoders refuse, with the same
-values: `{error, {invalid_field_name, Name}}` for a name that is not a token
-(RFC 9110 Section 5.6.2) and `{error, {invalid_field_value, Value}}` for a
-value that carries CR, LF, NUL, another control byte, or `0x7F`
-(RFC 9110 Section 5.5).
-
-The block is for field lines that many messages reuse.
-`iolist_to_binary/1` copies them once here, so a caller that prepares a
-block for a single message pays more than a caller that prepares nothing.
-
-The encoder does not compare a caller supplied `Content-Length` against the
-body length, and a prepared block does not change that.
-""".
--spec prepare_headers(nhttp_lib:headers()) -> {ok, prepared()} | {error, encode_error()}.
-prepare_headers(Headers) ->
-    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
-    case encode_framed_lines(Headers, NamePat, ValuePat) of
-        {error, _} = Err ->
-            Err;
-        {framed, Lines} ->
-            {ok, #prepared{block = iolist_to_binary(Lines), framed = true}};
-        Lines ->
-            {ok, #prepared{block = iolist_to_binary(Lines), framed = false}}
-    end.
-
--doc """
 Encode the terminating sequence of a chunked message, with a trailer section.
-
 The return carries the last chunk, the trailer field lines and the single
 CRLF that ends `chunked-body` (RFC 9112 Section 7.1: `chunked-body = *chunk
 last-chunk trailer-section CRLF`). A caller emits it in place of
 `encode_last_chunk/0`, and `encode_trailers([])` writes exactly what
 `encode_last_chunk/0` writes.
-
 A trailer field is validated as a header field is. The encoder returns
 `{error, {invalid_field_name, Name}}` for a name that is not a token
 (RFC 9110 Section 5.6.2) and `{error, {invalid_field_value, Value}}` for a
 value that carries CR, LF, NUL, another control byte, or `0x7F`
 (RFC 9110 Section 5.5).
-
 The encoder also refuses the names `transfer-encoding`, `content-length`,
 `host` and `trailer` with `{error, {forbidden_trailer_field, Name}}`. RFC 9112
 Section 7.1.3 has a recipient compute the content length and rewrite
@@ -955,7 +869,6 @@ that filtering as the mitigation for request smuggling and response
 splitting. The four names are a defence against a recipient that merges in
 breach of RFC 9110 Section 6.5.1. They are not an RFC enumeration, and the
 list does not grow.
-
 RFC 9110 Section 6.5.1 puts the general rule on the sender: generate a
 trailer field only when the definition of that field name permits trailer
 use. No registry records that permission, so the encoder cannot check it and
@@ -970,6 +883,47 @@ encode_trailers(Trailers) ->
     case encode_trailer_lines(Trailers, NamePat, ValuePat) of
         {error, _} = Err -> Err;
         Lines -> {ok, [<<"0\r\n">>, Lines, <<"\r\n">>]}
+    end.
+
+-doc """
+Validate a field list once and return the field lines as one binary.
+The encoders read every octet of every field name and every field value on
+every call, because RFC 9112 Section 11.1 names that filtering as the
+mitigation for request smuggling and response splitting. A caller that sends
+the same field lines on many messages pays for the same octets on every
+message. `prepare_headers/1` moves that cost to one call.
+```erlang
+{ok, Static} = nhttp_h1:prepare_headers([
+    {<<"Server">>, <<"acme/1.0">>},
+    {<<"Cache-Control">>, <<"no-store">>}
+]),
+{ok, Io} = nhttp_h1:encode_response(Resp, #{prepared => Static}).
+```
+The value is opaque and this function is the only path that builds one. A
+caller that fabricates the record writes octets that no validator read, and
+the library cannot prevent that any more than it can prevent a call to a
+private function.
+`prepare_headers/1` refuses exactly what the encoders refuse, with the same
+values: `{error, {invalid_field_name, Name}}` for a name that is not a token
+(RFC 9110 Section 5.6.2) and `{error, {invalid_field_value, Value}}` for a
+value that carries CR, LF, NUL, another control byte, or `0x7F`
+(RFC 9110 Section 5.5).
+The block is for field lines that many messages reuse.
+`iolist_to_binary/1` copies them once here, so a caller that prepares a
+block for a single message pays more than a caller that prepares nothing.
+The encoder does not compare a caller supplied `Content-Length` against the
+body length, and a prepared block does not change that.
+""".
+-spec prepare_headers(nhttp_lib:headers()) -> {ok, prepared()} | {error, encode_error()}.
+prepare_headers(Headers) ->
+    {NamePat, ValuePat} = persistent_term:get(?PT_ENCODE_PATTERNS),
+    case encode_framed_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err ->
+            Err;
+        {framed, Lines} ->
+            {ok, #prepared{block = iolist_to_binary(Lines), framed = true}};
+        Lines ->
+            {ok, #prepared{block = iolist_to_binary(Lines), framed = false}}
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -1069,25 +1023,24 @@ chunked_framing(Headers) ->
         Codings -> is_chunked_framing(Codings)
     end.
 
--spec transfer_encoding_values(nhttp_lib:headers(), [binary()]) -> [binary()].
-transfer_encoding_values([], Acc) ->
-    lists:reverse(Acc);
-transfer_encoding_values([{Name, Value} | Rest], Acc) when
-    byte_size(Name) =:= byte_size(<<"transfer-encoding">>)
-->
-    case nhttp_headers:name_eq(Name, <<"transfer-encoding">>) of
-        true -> transfer_encoding_values(Rest, [Value | Acc]);
-        false -> transfer_encoding_values(Rest, Acc)
-    end;
-transfer_encoding_values([_Field | Rest], Acc) ->
-    transfer_encoding_values(Rest, Acc).
-
--spec require_chunked_framing(nhttp_lib:headers(), nhttp_lib:headers()) ->
-    ok | {error, encode_error()}.
-require_chunked_framing(Headers, Trailers) ->
-    case chunked_framing(Headers) of
-        true -> ok;
-        false -> {error, {trailers_require_chunked, Trailers}}
+-spec consume_chunk_trailing_crlf(binary(), non_neg_integer(), [body_chunk()], chunked_st()) ->
+    {ok, [body_chunk()], body_stream(), non_neg_integer()}
+    | {more, pos_integer(), body_stream()}
+    | {error, parse_error()}.
+consume_chunk_trailing_crlf(Bin, Consumed, Acc, St) ->
+    case Bin of
+        <<_:Consumed/binary, "\r\n", _/binary>> ->
+            parse_chunked_stream(Bin, Consumed + 2, Acc, St#chunked_st{phase = size});
+        <<_:Consumed/binary, "\r">> ->
+            %% Only the CR has arrived; wait for the LF rather than erroring.
+            finish_chunked_step(Acc, St, Consumed, 1);
+        <<_:Consumed/binary, C, _/binary>> when C =/= $\r ->
+            {error, incomplete_chunk};
+        <<_:Consumed/binary, $\r, C, _/binary>> when C =/= $\n ->
+            {error, incomplete_chunk};
+        _ ->
+            Available = byte_size(Bin) - Consumed,
+            finish_chunked_step(Acc, St, Consumed, 2 - Available)
     end.
 
 -spec content_length_body_mode([binary()]) ->
@@ -1117,26 +1070,6 @@ content_length_mode(LenBin) ->
         {ok, 0} -> undefined;
         {ok, Len} -> {content_length, Len};
         {error, _} -> {error, invalid_content_length}
-    end.
-
--spec consume_chunk_trailing_crlf(binary(), non_neg_integer(), [body_chunk()], chunked_st()) ->
-    {ok, [body_chunk()], body_stream(), non_neg_integer()}
-    | {more, pos_integer(), body_stream()}
-    | {error, parse_error()}.
-consume_chunk_trailing_crlf(Bin, Consumed, Acc, St) ->
-    case Bin of
-        <<_:Consumed/binary, "\r\n", _/binary>> ->
-            parse_chunked_stream(Bin, Consumed + 2, Acc, St#chunked_st{phase = size});
-        <<_:Consumed/binary, "\r">> ->
-            %% Only the CR has arrived; wait for the LF rather than erroring.
-            finish_chunked_step(Acc, St, Consumed, 1);
-        <<_:Consumed/binary, C, _/binary>> when C =/= $\r ->
-            {error, incomplete_chunk};
-        <<_:Consumed/binary, $\r, C, _/binary>> when C =/= $\n ->
-            {error, incomplete_chunk};
-        _ ->
-            Available = byte_size(Bin) - Consumed,
-            finish_chunked_step(Acc, St, Consumed, 2 - Available)
     end.
 
 -spec derive_authority(binary(), nhttp_lib:headers()) -> nhttp_lib:authority().
@@ -1175,7 +1108,107 @@ encode_body_chunk(Body) ->
         _ -> encode_chunk(Body)
     end.
 
+-spec require_chunked_framing(nhttp_lib:headers(), nhttp_lib:headers()) ->
+    ok | {error, encode_error()}.
+require_chunked_framing(Headers, Trailers) ->
+    case chunked_framing(Headers) of
+        true -> ok;
+        false -> {error, {trailers_require_chunked, Trailers}}
+    end.
+
+-spec transfer_encoding_values(nhttp_lib:headers(), [binary()]) -> [binary()].
+transfer_encoding_values([], Acc) ->
+    lists:reverse(Acc);
+transfer_encoding_values([{Name, Value} | Rest], Acc) when
+    byte_size(Name) =:= byte_size(<<"transfer-encoding">>)
+->
+    case nhttp_headers:name_eq(Name, <<"transfer-encoding">>) of
+        true -> transfer_encoding_values(Rest, [Value | Acc]);
+        false -> transfer_encoding_values(Rest, Acc)
+    end;
+transfer_encoding_values([_Field | Rest], Acc) ->
+    transfer_encoding_values(Rest, Acc).
+
 -compile({inline, [encode_request_1/2, encode_response_1/3, header_block/5]}).
+-spec encode_framed_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
+    iolist() | {framed, iolist()} | {error, encode_error()}.
+encode_framed_lines([], _NamePat, _ValuePat) ->
+    [];
+encode_framed_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
+    maybe
+        ok ?= validate_field_name(Name, NamePat),
+        ok ?= validate_field_value(Value, ValuePat),
+        case encode_framed_lines(Rest, NamePat, ValuePat) of
+            {error, _} = Err ->
+                Err;
+            {framed, Tail} ->
+                {framed, [Name, <<": ">>, Value, <<"\r\n">> | Tail]};
+            Tail ->
+                Line = [Name, <<": ">>, Value, <<"\r\n">> | Tail],
+                case is_framing_name(Name) of
+                    true -> {framed, Line};
+                    false -> Line
+                end
+        end
+    end.
+
+-spec encode_header_block(nhttp_lib:headers(), non_neg_integer(), boolean(), enc_pats()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_header_block(Headers, _Len, false, Pats) ->
+    encode_headers(Headers, Pats);
+encode_header_block(Headers, Len, true, {NamePat, ValuePat}) ->
+    case encode_framed_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err ->
+            Err;
+        {framed, Lines} ->
+            {ok, Lines};
+        Lines ->
+            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
+            {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">> | Lines]}
+    end.
+
+-spec encode_headers(nhttp_lib:headers(), enc_pats()) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_headers(Headers, {NamePat, ValuePat}) ->
+    case encode_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err -> Err;
+        Lines -> {ok, Lines}
+    end.
+
+-spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
+    iolist() | {error, encode_error()}.
+encode_lines([], _NamePat, _ValuePat) ->
+    [];
+encode_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
+    maybe
+        ok ?= validate_field_name(Name, NamePat),
+        ok ?= validate_field_value(Value, ValuePat),
+        case encode_lines(Rest, NamePat, ValuePat) of
+            {error, _} = Err -> Err;
+            Tail -> [Name, <<": ">>, Value, <<"\r\n">> | Tail]
+        end
+    end.
+
+-spec encode_prepared_block(
+    nhttp_lib:headers(), non_neg_integer(), boolean(), prepared(), enc_pats()
+) ->
+    {ok, iolist()} | {error, encode_error()}.
+encode_prepared_block(Headers, _Len, false, #prepared{block = Block}, Pats) ->
+    prepend_block(Block, encode_headers(Headers, Pats));
+encode_prepared_block(Headers, _Len, true, #prepared{block = Block, framed = true}, Pats) ->
+    prepend_block(Block, encode_headers(Headers, Pats));
+encode_prepared_block(
+    Headers, Len, true, #prepared{block = Block, framed = false}, {NamePat, ValuePat}
+) ->
+    case encode_framed_lines(Headers, NamePat, ValuePat) of
+        {error, _} = Err ->
+            Err;
+        {framed, Lines} ->
+            {ok, [Block | Lines]};
+        Lines ->
+            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
+            {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">>, Block | Lines]}
+    end.
 
 -spec encode_request_1(req(), prepared() | none) -> {ok, iolist()} | {error, encode_error()}.
 encode_request_1(#{method := Method, path := Path} = Req, Prepared) when
@@ -1251,106 +1284,12 @@ encode_response_1(#{status := Status} = Resp, EncOpts, Prepared) ->
         ]}
     end.
 
--spec header_block(
-    nhttp_lib:headers(), non_neg_integer(), boolean(), prepared() | none, enc_pats()
-) ->
-    {ok, iolist()} | {error, encode_error()}.
-header_block(Headers, Len, Allows, none, Pats) ->
-    encode_header_block(Headers, Len, Allows, Pats);
-header_block(Headers, Len, Allows, Prepared, Pats) ->
-    encode_prepared_block(Headers, Len, Allows, Prepared, Pats).
-
--spec encode_prepared_block(
-    nhttp_lib:headers(), non_neg_integer(), boolean(), prepared(), enc_pats()
-) ->
-    {ok, iolist()} | {error, encode_error()}.
-encode_prepared_block(Headers, _Len, false, #prepared{block = Block}, Pats) ->
-    prepend_block(Block, encode_headers(Headers, Pats));
-encode_prepared_block(Headers, _Len, true, #prepared{block = Block, framed = true}, Pats) ->
-    prepend_block(Block, encode_headers(Headers, Pats));
-encode_prepared_block(
-    Headers, Len, true, #prepared{block = Block, framed = false}, {NamePat, ValuePat}
-) ->
-    case encode_framed_lines(Headers, NamePat, ValuePat) of
-        {error, _} = Err ->
-            Err;
-        {framed, Lines} ->
-            {ok, [Block | Lines]};
-        Lines ->
-            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
-            {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">>, Block | Lines]}
-    end.
-
 -spec encode_static_headers(nhttp_lib:headers(), enc_opts(), enc_pats()) ->
     {ok, iolist()} | {error, encode_error()}.
 encode_static_headers(Headers, #{prepared := #prepared{block = Block}}, Pats) ->
     prepend_block(Block, encode_headers(Headers, Pats));
 encode_static_headers(Headers, _EncOpts, Pats) ->
     encode_headers(Headers, Pats).
-
--spec prepend_block(binary(), {ok, iolist()} | {error, encode_error()}) ->
-    {ok, iolist()} | {error, encode_error()}.
-prepend_block(Block, {ok, Lines}) -> {ok, [Block | Lines]};
-prepend_block(_Block, {error, _} = Err) -> Err.
-
--spec encode_header_block(nhttp_lib:headers(), non_neg_integer(), boolean(), enc_pats()) ->
-    {ok, iolist()} | {error, encode_error()}.
-encode_header_block(Headers, _Len, false, Pats) ->
-    encode_headers(Headers, Pats);
-encode_header_block(Headers, Len, true, {NamePat, ValuePat}) ->
-    case encode_framed_lines(Headers, NamePat, ValuePat) of
-        {error, _} = Err ->
-            Err;
-        {framed, Lines} ->
-            {ok, Lines};
-        Lines ->
-            %% integer_to_binary/1 wrote these octets, so no field value scan is owed.
-            {ok, [<<"content-length: ">>, integer_to_binary(Len), <<"\r\n">> | Lines]}
-    end.
-
--spec encode_headers(nhttp_lib:headers(), enc_pats()) ->
-    {ok, iolist()} | {error, encode_error()}.
-encode_headers(Headers, {NamePat, ValuePat}) ->
-    case encode_lines(Headers, NamePat, ValuePat) of
-        {error, _} = Err -> Err;
-        Lines -> {ok, Lines}
-    end.
-
--spec encode_framed_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
-    iolist() | {framed, iolist()} | {error, encode_error()}.
-encode_framed_lines([], _NamePat, _ValuePat) ->
-    [];
-encode_framed_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
-    maybe
-        ok ?= validate_field_name(Name, NamePat),
-        ok ?= validate_field_value(Value, ValuePat),
-        case encode_framed_lines(Rest, NamePat, ValuePat) of
-            {error, _} = Err ->
-                Err;
-            {framed, Tail} ->
-                {framed, [Name, <<": ">>, Value, <<"\r\n">> | Tail]};
-            Tail ->
-                Line = [Name, <<": ">>, Value, <<"\r\n">> | Tail],
-                case is_framing_name(Name) of
-                    true -> {framed, Line};
-                    false -> Line
-                end
-        end
-    end.
-
--spec encode_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
-    iolist() | {error, encode_error()}.
-encode_lines([], _NamePat, _ValuePat) ->
-    [];
-encode_lines([{Name, Value} | Rest], NamePat, ValuePat) ->
-    maybe
-        ok ?= validate_field_name(Name, NamePat),
-        ok ?= validate_field_value(Value, ValuePat),
-        case encode_lines(Rest, NamePat, ValuePat) of
-            {error, _} = Err -> Err;
-            Tail -> [Name, <<": ">>, Value, <<"\r\n">> | Tail]
-        end
-    end.
 
 -spec encode_trailer_lines(nhttp_lib:headers(), binary:cp(), binary:cp()) ->
     iolist() | {error, encode_error()}.
@@ -1436,16 +1375,20 @@ find_path_version(<<Bin/binary>>, Method) ->
             find_path_version_cold(Bin)
     end.
 
--spec scan_request_target(binary(), non_neg_integer(), boolean()) ->
-    {ok, non_neg_integer(), boolean()} | nomatch.
-scan_request_target(<<" HTTP/1.", _/binary>>, Pos, Bad) ->
-    {ok, Pos, Bad};
-scan_request_target(<<C, Rest/binary>>, Pos, _Bad) when C =< 16#20; C =:= 16#7F ->
-    scan_request_target(Rest, Pos + 1, true);
-scan_request_target(<<_C, Rest/binary>>, Pos, Bad) ->
-    scan_request_target(Rest, Pos + 1, Bad);
-scan_request_target(<<>>, _Pos, _Bad) ->
-    nomatch.
+-spec find_path_version_cold(binary()) ->
+    {more, pos_integer()} | {error, parse_error()}.
+find_path_version_cold(Bin) ->
+    case binary:match(Bin, <<"\r\n">>) of
+        nomatch when byte_size(Bin) < 12 ->
+            {more, 12 - byte_size(Bin)};
+        nomatch ->
+            {more, 1};
+        _ ->
+            case binary:match(Bin, <<" HTTP/">>) of
+                nomatch -> {error, bad_request_line};
+                _ -> {error, invalid_version}
+            end
+    end.
 
 -spec find_version(binary(), nhttp_lib:method(), binary(), boolean()) ->
     {ok, nhttp_lib:method(), binary(), version(), binary()}
@@ -1471,21 +1414,6 @@ find_version(<<>>, _Method, _Path, _Bad) ->
     {more, 3};
 find_version(_Tail, _Method, _Path, _Bad) ->
     {error, invalid_version}.
-
--spec find_path_version_cold(binary()) ->
-    {more, pos_integer()} | {error, parse_error()}.
-find_path_version_cold(Bin) ->
-    case binary:match(Bin, <<"\r\n">>) of
-        nomatch when byte_size(Bin) < 12 ->
-            {more, 12 - byte_size(Bin)};
-        nomatch ->
-            {more, 1};
-        _ ->
-            case binary:match(Bin, <<" HTTP/">>) of
-                nomatch -> {error, bad_request_line};
-                _ -> {error, invalid_version}
-            end
-    end.
 
 -spec finish_chunked_step(
     [body_chunk()], chunked_st(), non_neg_integer(), pos_integer()
@@ -1563,8 +1491,32 @@ framing_field_values([{Name, Value} | Rest], TeValues, Lengths) when
 framing_field_values([_Field | Rest], TeValues, Lengths) ->
     framing_field_values(Rest, TeValues, Lengths).
 
--compile({inline, [validate_field_name/2, validate_field_value/2]}).
+-spec header_block(
+    nhttp_lib:headers(), non_neg_integer(), boolean(), prepared() | none, enc_pats()
+) ->
+    {ok, iolist()} | {error, encode_error()}.
+header_block(Headers, Len, Allows, none, Pats) ->
+    encode_header_block(Headers, Len, Allows, Pats);
+header_block(Headers, Len, Allows, Prepared, Pats) ->
+    encode_prepared_block(Headers, Len, Allows, Prepared, Pats).
 
+-spec prepend_block(binary(), {ok, iolist()} | {error, encode_error()}) ->
+    {ok, iolist()} | {error, encode_error()}.
+prepend_block(Block, {ok, Lines}) -> {ok, [Block | Lines]};
+prepend_block(_Block, {error, _} = Err) -> Err.
+
+-spec scan_request_target(binary(), non_neg_integer(), boolean()) ->
+    {ok, non_neg_integer(), boolean()} | nomatch.
+scan_request_target(<<" HTTP/1.", _/binary>>, Pos, Bad) ->
+    {ok, Pos, Bad};
+scan_request_target(<<C, Rest/binary>>, Pos, _Bad) when C =< 16#20; C =:= 16#7F ->
+    scan_request_target(Rest, Pos + 1, true);
+scan_request_target(<<_C, Rest/binary>>, Pos, Bad) ->
+    scan_request_target(Rest, Pos + 1, Bad);
+scan_request_target(<<>>, _Pos, _Bad) ->
+    nomatch.
+
+-compile({inline, [validate_field_name/2, validate_field_value/2]}).
 -spec validate_field_name(binary(), binary:cp()) -> ok | {error, encode_error()}.
 validate_field_name(<<>>, _NamePat) ->
     {error, {invalid_field_name, <<>>}};
@@ -1574,12 +1526,6 @@ validate_field_name(Name, NamePat) ->
         _ -> {error, {invalid_field_name, Name}}
     end.
 
-%% RFC 9110 Section 5.5 forbids 0x00 to 0x1F except 0x09, and 0x7F. Two
-%% instruments read the same octet set, and the length picks between them.
-%% `binary:match/2` charges one reduction per ten octets up to its trap and
-%% stops counting above it, so a long value goes to the word scan, which
-%% charges one reduction per call at every length. re:run/3 charges PCRE2
-%% backtrack loops and not octets, so it hides a scan of any length.
 -spec validate_field_value(binary(), binary:cp()) -> ok | {error, encode_error()}.
 validate_field_value(Value, ValuePat) when byte_size(Value) < ?VALUE_WORD_SCAN_MIN ->
     case binary:match(Value, ValuePat) of
@@ -1587,7 +1533,7 @@ validate_field_value(Value, ValuePat) when byte_size(Value) < ?VALUE_WORD_SCAN_M
         _ -> {error, {invalid_field_value, Value}}
     end;
 validate_field_value(Value, _ValuePat) ->
-    case has_forbidden_value_octet(Value) of
+    case nhttp_headers:has_forbidden_value_octet(Value) of
         false -> ok;
         true -> {error, {invalid_field_value, Value}}
     end.
@@ -1616,9 +1562,6 @@ validate_trailer_name(Name) ->
     end.
 
 -compile({inline, [has_invalid_char/1, has_invalid_char/2]}).
-
-%% Spelled out rather than delegated to the arity two form: the inliner folds
-%% one level, and the parse path calls this once per field line.
 -spec has_invalid_char(binary()) -> boolean().
 has_invalid_char(Bin) ->
     binary:match(Bin, persistent_term:get(?PT_FIELD_VALUE_BAD)) =/= nomatch.
@@ -1626,51 +1569,6 @@ has_invalid_char(Bin) ->
 -spec has_invalid_char(binary(), binary:cp()) -> boolean().
 has_invalid_char(Bin, ValuePat) ->
     binary:match(Bin, ValuePat) =/= nomatch.
-
-%% The field value octet set of RFC 9110 Section 5.5, read seven octets at a
-%% time. Every clause reuses the match context, so the loop allocates one
-%% context for the whole value and charges one reduction per call.
-%%
-%% `forbidden_in_word/1` holds the octet set as three carry free word tests.
-%% `U` clears the high bit of every octet, and `V` maps 0x09 to 0x00, which
-%% turns "below 0x20 and not 0x09" into "between 0x01 and 0x1F". Every
-%% addend keeps each octet under 0x100, so no carry crosses an octet and
-%% every test is exact per octet rather than only for the word.
--spec has_forbidden_value_octet(binary()) -> boolean().
-has_forbidden_value_octet(
-    <<A:56, B:56, C:56, D:56, E:56, F:56, G:56, H:56, Rest/binary>>
-) ->
-    case
-        forbidden_in_word(A) orelse forbidden_in_word(B) orelse
-            forbidden_in_word(C) orelse forbidden_in_word(D) orelse
-            forbidden_in_word(E) orelse forbidden_in_word(F) orelse
-            forbidden_in_word(G) orelse forbidden_in_word(H)
-    of
-        true -> true;
-        false -> has_forbidden_value_octet(Rest)
-    end;
-has_forbidden_value_octet(<<A:56, Rest/binary>>) ->
-    case forbidden_in_word(A) of
-        true -> true;
-        false -> has_forbidden_value_octet(Rest)
-    end;
-has_forbidden_value_octet(<<C, Rest/binary>>) when C > 16#1F, C =/= 16#7F ->
-    has_forbidden_value_octet(Rest);
-has_forbidden_value_octet(<<16#09, Rest/binary>>) ->
-    has_forbidden_value_octet(Rest);
-has_forbidden_value_octet(<<_, _/binary>>) ->
-    true;
-has_forbidden_value_octet(<<>>) ->
-    false.
-
--compile({inline, [forbidden_in_word/1]}).
-
--spec forbidden_in_word(non_neg_integer()) -> boolean().
-forbidden_in_word(W) ->
-    U = W band ?W_LOW7,
-    V = U bxor ?W_TAB7,
-    Low = (V + ?W_LOW7) band (bnot (V + ?W_SUB32)),
-    (((Low bor (U + ?W_ONE7)) band (bnot W)) band ?W_HIGH7) =/= 0.
 
 -spec is_chunked_framing([binary()]) -> boolean().
 is_chunked_framing(Codings) ->
@@ -1696,19 +1594,6 @@ is_forbidden_trailer_name(_Name) ->
     false.
 
 -compile({inline, [is_framing_name/1]}).
-
--spec is_framing_name(binary()) -> boolean().
-is_framing_name(Name) when byte_size(Name) =:= byte_size(<<"content-length">>) ->
-    nhttp_headers:name_eq(Name, <<"content-length">>);
-is_framing_name(Name) when byte_size(Name) =:= byte_size(<<"transfer-encoding">>) ->
-    nhttp_headers:name_eq(Name, <<"transfer-encoding">>);
-is_framing_name(_Name) ->
-    false.
-
--spec is_valid_chunk_ext_tail(binary()) -> boolean().
-is_valid_chunk_ext_tail(<<>>) -> true;
-is_valid_chunk_ext_tail(Bin) -> skip_bws_to_semi(Bin).
-
 -spec allows_content_length(nhttp_lib:status(), enc_opts()) -> boolean().
 allows_content_length(Status, EncOpts) ->
     case maps:get(content_length, EncOpts, auto) of
@@ -1721,6 +1606,18 @@ forbids_content_length(Status) when Status >= 100, Status =< 199 -> true;
 forbids_content_length(204) -> true;
 forbids_content_length(304) -> true;
 forbids_content_length(_Status) -> false.
+
+-spec is_framing_name(binary()) -> boolean().
+is_framing_name(Name) when byte_size(Name) =:= byte_size(<<"content-length">>) ->
+    nhttp_headers:name_eq(Name, <<"content-length">>);
+is_framing_name(Name) when byte_size(Name) =:= byte_size(<<"transfer-encoding">>) ->
+    nhttp_headers:name_eq(Name, <<"transfer-encoding">>);
+is_framing_name(_Name) ->
+    false.
+
+-spec is_valid_chunk_ext_tail(binary()) -> boolean().
+is_valid_chunk_ext_tail(<<>>) -> true;
+is_valid_chunk_ext_tail(Bin) -> skip_bws_to_semi(Bin).
 
 -spec parse_chunk_body_after_size(binary(), non_neg_integer(), non_neg_integer(), binary()) ->
     {ok, binary(), pos_integer()}
@@ -1963,31 +1860,6 @@ parse_header_value_direct(Name, PrefixLen, <<Rest/binary>>, Acc, Count, Size, Ma
         more ->
             {more, 2}
     end.
-
--spec scan_header_value(
-    binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()
-) ->
-    {ok, non_neg_integer(), non_neg_integer(), non_neg_integer()}
-    | {error, bad_header}
-    | more.
-scan_header_value(<<"\r\n", _/binary>>, _Pos, _Skip, _Drop, true) ->
-    {error, bad_header};
-scan_header_value(<<"\r\n", _/binary>>, Pos, Skip, Drop, false) ->
-    {ok, Skip, Pos - Skip - Drop, Drop};
-scan_header_value(<<$\s, Rest/binary>>, Pos, Skip, Drop, Bad) when Pos =:= Skip ->
-    scan_header_value(Rest, Pos + 1, Skip + 1, Drop, Bad);
-scan_header_value(<<$\t, Rest/binary>>, Pos, Skip, Drop, Bad) when Pos =:= Skip ->
-    scan_header_value(Rest, Pos + 1, Skip + 1, Drop, Bad);
-scan_header_value(<<$\s, Rest/binary>>, Pos, Skip, Drop, Bad) ->
-    scan_header_value(Rest, Pos + 1, Skip, Drop + 1, Bad);
-scan_header_value(<<$\t, Rest/binary>>, Pos, Skip, Drop, Bad) ->
-    scan_header_value(Rest, Pos + 1, Skip, Drop + 1, Bad);
-scan_header_value(<<C, Rest/binary>>, Pos, Skip, _Drop, _Bad) when C =< 16#1F; C =:= 16#7F ->
-    scan_header_value(Rest, Pos + 1, Skip, 0, true);
-scan_header_value(<<_C, Rest/binary>>, Pos, Skip, _Drop, Bad) ->
-    scan_header_value(Rest, Pos + 1, Skip, 0, Bad);
-scan_header_value(<<>>, _Pos, _Skip, _Drop, _Bad) ->
-    more.
 
 -spec parse_headers_acc(
     binary(), nhttp_lib:headers(), non_neg_integer(), header_limit(), header_limit()
@@ -2603,6 +2475,13 @@ parse_request_line(<<C, _/binary>> = Bin) ->
 parse_request_line(<<>>) ->
     {more, 16}.
 
+-spec parse_request_line_cold(binary()) ->
+    {more, pos_integer()} | {error, parse_error()}.
+parse_request_line_cold(Bin) when byte_size(Bin) < 16 ->
+    {more, 16 - byte_size(Bin)};
+parse_request_line_cold(_) ->
+    {error, bad_request_line}.
+
 -spec parse_request_line_token(binary()) ->
     {ok, nhttp_lib:method(), binary(), version(), binary()}
     | {more, pos_integer()}
@@ -2622,13 +2501,6 @@ parse_request_line_token(Bin) ->
         _ ->
             {error, bad_request_line}
     end.
-
--spec parse_request_line_cold(binary()) ->
-    {more, pos_integer()} | {error, parse_error()}.
-parse_request_line_cold(Bin) when byte_size(Bin) < 16 ->
-    {more, 16 - byte_size(Bin)};
-parse_request_line_cold(_) ->
-    {error, bad_request_line}.
 
 -spec parse_status_line(binary()) ->
     {ok, nhttp_lib:status(), binary(), version(), binary()}
@@ -2730,6 +2602,31 @@ scan_chunk_size_line(Bin, Skip, SizeLen) ->
         _ ->
             {more, 1}
     end.
+
+-spec scan_header_value(
+    binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()
+) ->
+    {ok, non_neg_integer(), non_neg_integer(), non_neg_integer()}
+    | {error, bad_header}
+    | more.
+scan_header_value(<<"\r\n", _/binary>>, _Pos, _Skip, _Drop, true) ->
+    {error, bad_header};
+scan_header_value(<<"\r\n", _/binary>>, Pos, Skip, Drop, false) ->
+    {ok, Skip, Pos - Skip - Drop, Drop};
+scan_header_value(<<$\s, Rest/binary>>, Pos, Skip, Drop, Bad) when Pos =:= Skip ->
+    scan_header_value(Rest, Pos + 1, Skip + 1, Drop, Bad);
+scan_header_value(<<$\t, Rest/binary>>, Pos, Skip, Drop, Bad) when Pos =:= Skip ->
+    scan_header_value(Rest, Pos + 1, Skip + 1, Drop, Bad);
+scan_header_value(<<$\s, Rest/binary>>, Pos, Skip, Drop, Bad) ->
+    scan_header_value(Rest, Pos + 1, Skip, Drop + 1, Bad);
+scan_header_value(<<$\t, Rest/binary>>, Pos, Skip, Drop, Bad) ->
+    scan_header_value(Rest, Pos + 1, Skip, Drop + 1, Bad);
+scan_header_value(<<C, Rest/binary>>, Pos, Skip, _Drop, _Bad) when C =< 16#1F; C =:= 16#7F ->
+    scan_header_value(Rest, Pos + 1, Skip, 0, true);
+scan_header_value(<<_C, Rest/binary>>, Pos, Skip, _Drop, Bad) ->
+    scan_header_value(Rest, Pos + 1, Skip, 0, Bad);
+scan_header_value(<<>>, _Pos, _Skip, _Drop, _Bad) ->
+    more.
 
 -spec skip_bws_to_semi(binary()) -> boolean().
 skip_bws_to_semi(<<";", _/binary>>) -> true;

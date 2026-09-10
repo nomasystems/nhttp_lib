@@ -130,6 +130,9 @@ body + END_STREAM" when the body is already a single `iodata()`.
 -define(UNI_QPACK_ENCODER, 16#02).
 -define(UNI_QPACK_DECODER, 16#03).
 
+%% Octets of a peer supplied field name that a diagnostic repeats.
+-define(H3_DIAGNOSTIC_NAME_MAX, 64).
+
 %%%-----------------------------------------------------------------------------
 %% RECORDS
 %%%-----------------------------------------------------------------------------
@@ -784,6 +787,12 @@ register_uni_stream(Conn, StreamId, _Type, _Rest, _Fin) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: HEADER DECODE / VALIDATE
 %%%-----------------------------------------------------------------------------
+-spec clip_name(binary()) -> binary().
+clip_name(Name) when byte_size(Name) > ?H3_DIAGNOSTIC_NAME_MAX ->
+    <<(binary:part(Name, 0, ?H3_DIAGNOSTIC_NAME_MAX))/binary, "...">>;
+clip_name(Name) ->
+    Name.
+
 -spec decode_headers(conn(), nhttp_lib:stream_id(), #h3_stream{}, binary(), boolean()) ->
     {ok, conn(), [event()], [action()]} | {error, h3_error()}.
 decode_headers(
@@ -838,11 +847,7 @@ decode_headers(
             NewConn = Conn#h3_conn{qpack_dec = NewDec},
             {ok, NewConn, [], []};
         {error, Reason} ->
-            {error,
-                {connection_error, qpack_decompression_failed,
-                    iolist_to_binary(
-                        io_lib:format("QPACK decode error: ~p", [Reason])
-                    )}}
+            {error, qpack_decode_error(StreamId, Reason, <<"QPACK decode error">>)}
     end.
 
 -spec decode_trailers(conn(), nhttp_lib:stream_id(), #h3_stream{}, binary(), boolean()) ->
@@ -883,20 +888,83 @@ decode_trailers(
             NewConn = Conn#h3_conn{qpack_dec = NewDec},
             {ok, NewConn, [], []};
         {error, Reason} ->
-            {error,
-                {connection_error, qpack_decompression_failed,
-                    iolist_to_binary(
-                        io_lib:format("QPACK decode error: ~p", [Reason])
-                    )}}
+            {error, qpack_decode_error(StreamId, Reason, <<"QPACK decode error">>)}
     end.
 
+-spec field_octet_error
+    (binary(), ok) -> ok;
+    (binary(), {error, nhttp_headers:field_name_error()}) -> {error, binary()};
+    (binary(), {error, nhttp_headers:field_value_error()}) -> {error, binary()}.
+field_octet_error(_Name, ok) ->
+    ok;
+field_octet_error(Name, {error, Reason}) ->
+    {error, invalid_field_message(Reason, Name)}.
+
+-spec invalid_field_message(atom(), binary()) -> binary().
+invalid_field_message(uppercase_field_name, Name) ->
+    iolist_to_binary(
+        io_lib:format(
+            "Malformed field ~p: uppercase field name "
+            "(RFC 9114 Section 4.1.2, Section 4.2)",
+            [clip_name(Name)]
+        )
+    );
+invalid_field_message(Reason, Name) ->
+    iolist_to_binary(
+        io_lib:format(
+            "Malformed field ~p: ~s (RFC 9114 Section 4.1.2)",
+            [clip_name(Name), Reason]
+        )
+    ).
+
+-doc """
+Split a QPACK decode failure by severity.
+A field that breaks the RFC 9114 §4.1.2 rule is malformed, and §4.1.2 makes a
+malformed message a stream error of type H3_MESSAGE_ERROR. Every other
+failure is a decompression failure, which RFC 9204 §2.2 makes a connection
+error, because the dynamic table state no longer tracks the encoder.
+""".
+-spec qpack_decode_error(nhttp_lib:stream_id(), term(), binary()) -> h3_error().
+qpack_decode_error(StreamId, {invalid_field, Reason, Name}, _Context) ->
+    {stream_error, StreamId, h3_message_error, invalid_field_message(Reason, Name)};
+qpack_decode_error(_StreamId, Reason, Context) ->
+    {connection_error, qpack_decompression_failed,
+        iolist_to_binary(io_lib:format("~s: ~p", [Context, Reason]))}.
+
+-spec validate_field_octets(nhttp_lib:headers()) -> ok | {error, binary()}.
+validate_field_octets([]) ->
+    ok;
+validate_field_octets([{Name, Value} | Rest]) ->
+    maybe
+        ok ?= field_octet_error(Name, nhttp_headers:validate_field_name(Name)),
+        ok ?= field_octet_error(Name, nhttp_headers:validate_field_value(Value)),
+        validate_field_octets(Rest)
+    end.
+
+-doc """
+The message level field rules of RFC 9114 §4.1.2: every field of a request, a
+response and a trailer section is read against the octet rule of §4.1.2 and
+the lowercase rule of §4.2, and the section is then read against the
+pseudo-header rules for its role.
+The QPACK layer reads the same octets when the field arrives as a literal.
+This is the message layer, where RFC 9114 §4.1.2 places the rule, and it holds
+for every field of the section whatever representation carried it.
+""".
 -spec validate_headers(role(), nhttp_lib:headers(), boolean(), h3_settings()) ->
     ok | {error, binary()}.
-validate_headers(_, Headers, true, _Settings) ->
+validate_headers(Role, Headers, IsTrailers, Settings) ->
+    maybe
+        ok ?= validate_field_octets(Headers),
+        validate_section(Role, Headers, IsTrailers, Settings)
+    end.
+
+-spec validate_section(role(), nhttp_lib:headers(), boolean(), h3_settings()) ->
+    ok | {error, binary()}.
+validate_section(_, Headers, true, _Settings) ->
     validate_trailers(Headers);
-validate_headers(server, Headers, false, Settings) ->
+validate_section(server, Headers, false, Settings) ->
     validate_request_headers(Headers, Settings);
-validate_headers(client, Headers, false, _Settings) ->
+validate_section(client, Headers, false, _Settings) ->
     validate_response_headers(Headers).
 
 -define(H3_CONNECTION_HEADERS_SET, ?NHTTP_MSG_CONNECTION_HEADERS_SET).
@@ -1092,10 +1160,9 @@ process_push_promise(
             {ok, Conn#h3_conn{qpack_dec = NewDec}, [], []};
         {error, Reason} ->
             {error,
-                {connection_error, qpack_decompression_failed,
-                    iolist_to_binary(
-                        io_lib:format("QPACK decode error in PUSH_PROMISE: ~p", [Reason])
-                    )}}
+                qpack_decode_error(
+                    StreamId, Reason, <<"QPACK decode error in PUSH_PROMISE">>
+                )}
     end.
 
 %%%-----------------------------------------------------------------------------

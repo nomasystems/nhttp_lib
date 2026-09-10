@@ -69,8 +69,10 @@ application protocol was negotiated (e.g., `<<"h2">>` or `<<"http/1.1">>`).
 -export_type([
     connect_opts/0,
     listen_opts/0,
-    t/0,
+
     socket_error/0,
+    t/0,
+
     transport/0
 ]).
 

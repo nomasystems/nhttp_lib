@@ -411,16 +411,13 @@ Decode a frame with fragmentation support.
 Continuation frames are accumulated until FIN=1, then the complete
 message is delivered. Control frames (ping, pong, close) may appear
 between fragments and are delivered immediately.
-
 A successful return has three forms, and each one says what to keep:
-
 - `{ok, Message, Rest, Decoder}`: a frame was consumed and the message
   is complete. Keep `Rest`.
 - `{continue, Rest, Decoder}`: a frame was consumed and buffered as a
   non-final fragment. No message yet. Keep `Rest`.
 - `{more, MinBytes, Decoder}`: nothing was consumed. Keep the input
   buffer and wait for `MinBytes` more bytes.
-
 If you keep the whole buffer after a consumed frame, the next call
 decodes that frame again and fails with `expected_continuation`.
 """.
@@ -449,17 +446,14 @@ decoder_new(Role) ->
 -doc """
 Create a new stateful decoder honouring `max_message_size` from the runtime
 opts. The option defaults to 16 MiB and bounds two different things.
-
 The cumulative payload of a fragmented message, and the payload of a single
 non-control frame, are measured after the bytes arrive. Exceeding the option
 returns `{error, message_too_large}`.
-
 The payload length that a frame header declares is refused before any payload
 is buffered (RFC 6455 §10.4). Exceeding the option returns
 `{error, {frame_too_large, DeclaredLength}}`, and the caller closes with
 status 1009 (§7.4.1). This bound never drops below 125 bytes, the largest
 control frame that §5.5 permits.
-
 Pass `max_message_size => infinity` to remove both bounds.
 """.
 -spec decoder_new(client | server, ws_runtime_opts()) -> ws_decoder().

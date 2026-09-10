@@ -130,6 +130,36 @@ prop_huffman_compression() ->
     ).
 
 
+%% RFC 9113 Section 8.2: a field name is converted to lowercase when an HTTP/2
+%% message is constructed, so the case a caller writes never reaches the wire.
+-spec prop_encode_lowercases_names() -> triq:property().
+prop_encode_lowercases_names() ->
+    ?FORALL(
+        {Headers, Mask},
+        {headers_gen(), list(bool())},
+        begin
+            Mixed = recase_names(Headers, Mask),
+            encode_octets(Mixed) =:= encode_octets(Headers)
+        end
+    ).
+
+-spec encode_octets([{binary(), binary()}]) -> binary().
+encode_octets(Headers) ->
+    {ok, State} = nhttp_hpack:new(),
+    {ok, Encoded, _State2} = nhttp_hpack:encode(Headers, State),
+    iolist_to_binary(Encoded).
+
+%% The mask runs out on a long list, and the tail then keeps its own case.
+-spec recase_names([{binary(), binary()}], [boolean()]) -> [{binary(), binary()}].
+recase_names([], _Mask) ->
+    [];
+recase_names(Headers, []) ->
+    Headers;
+recase_names([{Name, Value} | Tail], [true | Mask]) ->
+    [{string:uppercase(Name), Value} | recase_names(Tail, Mask)];
+recase_names([Header | Tail], [false | Mask]) ->
+    [Header | recase_names(Tail, Mask)].
+
 -spec headers_gen() -> triq_dom:domain().
 headers_gen() ->
     ?LET(
@@ -205,12 +235,15 @@ header_name_char_gen() ->
         {2, $-}
     ]).
 
+%% RFC 9110 Section 5.5: `field-content' neither starts nor ends with SP or
+%% HTAB. RFC 9113 Section 8.2.1 makes a value that does malformed, so the
+%% roundtrip generator must not draw one.
 -spec header_value_gen() -> triq_dom:domain().
 header_value_gen() ->
     ?LET(
         Chars,
         list(header_value_char_gen()),
-        list_to_binary(lists:sublist(Chars, 100))
+        string:trim(list_to_binary(lists:sublist(Chars, 100)), both, [$\s])
     ).
 
 -spec header_value_char_gen() -> triq_dom:domain().
@@ -380,21 +413,31 @@ prop_hpack_bounded_after_error() ->
             SizeBefore = nhttp_hpack:table_size(DecState),
             case nhttp_hpack:decode(BadInput, DecState) of
                 {error, _} ->
-                    %% Original DecState must still parse valid input correctly.
-                    case nhttp_hpack:decode(EncodedBin, DecState) of
-                        {ok, Decoded, NewSt} ->
-                            Decoded =:= Headers andalso
-                                nhttp_hpack:table_size(DecState) =:= SizeBefore andalso
-                                nhttp_hpack:table_size(NewSt) >= SizeBefore;
-                        _ ->
-                            false
-                    end;
+                    still_decodes(EncodedBin, DecState, Headers, SizeBefore);
+                {invalid_field, _, _} ->
+                    still_decodes(EncodedBin, DecState, Headers, SizeBefore);
                 {ok, _, _} ->
                     %% Bad prefix happened to form valid HPACK in concatenation; skip.
                     true
             end
         end
     ).
+
+%% The refused input must leave the caller's state untouched, so the same state
+%% still decodes a good block.
+-spec still_decodes(binary(), nhttp_hpack:state(), nhttp_hpack:headers(), non_neg_integer()) ->
+    boolean().
+still_decodes(EncodedBin, DecState, Headers, SizeBefore) ->
+    case nhttp_hpack:decode(EncodedBin, DecState) of
+        {ok, Decoded, NewSt} ->
+            Decoded =:= Headers andalso
+                nhttp_hpack:table_size(DecState) =:= SizeBefore andalso
+                nhttp_hpack:table_size(NewSt) >= SizeBefore;
+        {invalid_field, _, _} ->
+            false;
+        {error, _} ->
+            false
+    end.
 
 -spec prop_huffman_random_no_crash() -> triq:property().
 prop_huffman_random_no_crash() ->

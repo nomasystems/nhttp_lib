@@ -28,6 +28,8 @@ length legal for every control frame and §5.5.1 uses it for the close
 code and reason.
 """.
 
+-compile({inline, [{decode_complete, 6}, {decode_unmasked_complete, 5}, {effective_cap, 1}]}).
+
 %%%-----------------------------------------------------------------------------
 %% EXPORTS
 %%%-----------------------------------------------------------------------------
@@ -47,7 +49,6 @@ code and reason.
     scan_utf8/2,
     validate_control_frame/3
 ]).
--compile({inline, [{decode_complete, 6}, {decode_unmasked_complete, 5}, {effective_cap, 1}]}).
 
 -export_type([
     close_code/0,
@@ -144,7 +145,6 @@ decode(Data) ->
 Decode a masked WebSocket frame (client-to-server).
 Returns `{ok, Message, Rest}` on success, `{more, MinBytes}` if more
 data is needed, or `{error, Reason}` on protocol violation.
-
 A declared payload length above `max_frame_size` returns
 `{error, {frame_too_large, DeclaredLength}}` before any payload is
 buffered (RFC 6455 §10.4).
@@ -167,7 +167,6 @@ decode_raw(Data, server) ->
 Decode a raw frame, returning Fin, Opcode, Payload, Rest separately.
 Used by the stateful message-level decoder for continuation reassembly.
 The role argument selects masked (server) or unmasked (client) parsing.
-
 A declared payload length above `max_frame_size` returns
 `{error, {frame_too_large, DeclaredLength}}` before any payload is
 buffered (RFC 6455 §10.4).
@@ -189,7 +188,6 @@ decode_unmasked(Data) ->
 -doc """
 Decode an unmasked WebSocket frame (server-to-client).
 RFC 6455 §5.1: a server MUST NOT mask frames sent to clients.
-
 A declared payload length above `max_frame_size` returns
 `{error, {frame_too_large, DeclaredLength}}` before any payload is
 buffered (RFC 6455 §10.4).
@@ -201,49 +199,6 @@ decode_unmasked(Data, Limits) ->
 %%%-----------------------------------------------------------------------------
 %% SHARED HELPERS (USED BY STATEFUL MESSAGE-LEVEL DECODER)
 %%%-----------------------------------------------------------------------------
--doc """
-Scan a run of text for UTF-8 validity (RFC 3629) and return the trailing
-bytes that do not yet form a character.
-
-A fragmented text message can split a character across two frames, so a
-fragment is not valid or invalid on its own: it ends in a carry, which the
-next fragment starts with. The run is refused as soon as no continuation
-can complete it, which puts the refusal on the fragment that breaks rather
-than on the whole reassembled message.
-
-A carry left at the end of a message is a truncated character, so the
-caller must require an empty one on the final fragment.
-""".
--spec scan_utf8(binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
-scan_utf8(<<_/utf8, Rest/binary>>) ->
-    scan_utf8(Rest);
-scan_utf8(<<>>) ->
-    {ok, <<>>};
-scan_utf8(Rest) ->
-    case is_utf8_prefix(Rest) of
-        true -> {ok, Rest};
-        false -> {error, invalid_utf8}
-    end.
-
--doc """
-Scan a run of text that continues an unfinished character.
-
-`Carry` comes from the previous fragment and is at most three bytes. Only
-the bytes needed to finish that character are copied; the rest of the
-payload is scanned where it lies.
-""".
--spec scan_utf8(Carry :: binary(), binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
-scan_utf8(Carry, Payload) when byte_size(Payload) =< 3 ->
-    scan_utf8(<<Carry/binary, Payload/binary>>);
-scan_utf8(Carry, <<Head:3/binary, Rest/binary>>) ->
-    maybe
-        {ok, <<>>} ?= scan_utf8(<<Carry/binary, Head/binary>>),
-        scan_utf8(Rest)
-    else
-        {ok, NewCarry} -> scan_utf8(NewCarry, Rest);
-        {error, _} = Err -> Err
-    end.
-
 -doc """
 Map a complete (FIN=1) frame's opcode and payload to a `ws_message/0`.
 Text payloads are validated as UTF-8 (RFC 6455 §5.6 / §8.1).
@@ -293,6 +248,46 @@ opcode_to_message(1, Opcode, Data) ->
     opcode_to_complete_message(Opcode, Data);
 opcode_to_message(0, _Opcode, _Data) ->
     {error, fragmentation_not_supported}.
+
+-doc """
+Scan a run of text for UTF-8 validity (RFC 3629) and return the trailing
+bytes that do not yet form a character.
+A fragmented text message can split a character across two frames, so a
+fragment is not valid or invalid on its own: it ends in a carry, which the
+next fragment starts with. The run is refused as soon as no continuation
+can complete it, which puts the refusal on the fragment that breaks rather
+than on the whole reassembled message.
+A carry left at the end of a message is a truncated character, so the
+caller must require an empty one on the final fragment.
+""".
+-spec scan_utf8(binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
+scan_utf8(<<_/utf8, Rest/binary>>) ->
+    scan_utf8(Rest);
+scan_utf8(<<>>) ->
+    {ok, <<>>};
+scan_utf8(Rest) ->
+    case is_utf8_prefix(Rest) of
+        true -> {ok, Rest};
+        false -> {error, invalid_utf8}
+    end.
+
+-doc """
+Scan a run of text that continues an unfinished character.
+`Carry` comes from the previous fragment and is at most three bytes. Only
+the bytes needed to finish that character are copied; the rest of the
+payload is scanned where it lies.
+""".
+-spec scan_utf8(Carry :: binary(), binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
+scan_utf8(Carry, Payload) when byte_size(Payload) =< 3 ->
+    scan_utf8(<<Carry/binary, Payload/binary>>);
+scan_utf8(Carry, <<Head:3/binary, Rest/binary>>) ->
+    maybe
+        {ok, <<>>} ?= scan_utf8(<<Carry/binary, Head/binary>>),
+        scan_utf8(Rest)
+    else
+        {ok, NewCarry} -> scan_utf8(NewCarry, Rest);
+        {error, _} = Err -> Err
+    end.
 
 -doc """
 Validate that a control frame is not fragmented and not too large
@@ -589,12 +584,6 @@ effective_cap(Limits) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: VALIDATION
 %%%-----------------------------------------------------------------------------
--spec is_valid_close_code(close_code()) -> boolean().
-is_valid_close_code(Code) when Code >= 1000, Code =< 1003 -> true;
-is_valid_close_code(Code) when Code >= 1007, Code =< 1014 -> true;
-is_valid_close_code(Code) when Code >= 3000, Code =< 4999 -> true;
-is_valid_close_code(_) -> false.
-
 -doc """
 Whether the bytes are a proper prefix of a UTF-8 character, so a
 continuation can still complete them. The constraints on the second byte
@@ -615,6 +604,12 @@ is_utf8_prefix(<<A, B, C>>) when A >= 16#F0, A =< 16#F4, C >= 16#80, C =< 16#BF 
     is_utf8_prefix(<<A, B>>);
 is_utf8_prefix(_) ->
     false.
+
+-spec is_valid_close_code(close_code()) -> boolean().
+is_valid_close_code(Code) when Code >= 1000, Code =< 1003 -> true;
+is_valid_close_code(Code) when Code >= 1007, Code =< 1014 -> true;
+is_valid_close_code(Code) when Code >= 3000, Code =< 4999 -> true;
+is_valid_close_code(_) -> false.
 
 -spec is_valid_utf8(binary()) -> boolean().
 is_valid_utf8(<<_/utf8, Rest/binary>>) -> is_valid_utf8(Rest);

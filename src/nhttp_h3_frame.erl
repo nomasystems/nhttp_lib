@@ -38,8 +38,9 @@ RFC 9114 Section 9.
 -export_type([
     decode_error/0,
     decode_result/0,
-    t/0,
-    h3_settings/0
+
+    h3_settings/0,
+    t/0
 ]).
 
 %%%-----------------------------------------------------------------------------
