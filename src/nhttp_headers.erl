@@ -28,6 +28,8 @@ lowercasing of `lower_field_name/1`.
     {inline, [to_lower/1, is_tchar/1, lower_field_name/1, validate_field_name/1]}
 ).
 
+-on_load(init_patterns/0).
+
 %%%-----------------------------------------------------------------------------
 %% EXPORTS
 %%%-----------------------------------------------------------------------------
@@ -62,16 +64,8 @@ lowercasing of `lower_field_name/1`.
 -type field_value_error() ::
     invalid_field_value_char | field_value_edge_whitespace.
 
-%%%-----------------------------------------------------------------------------
-%% LOCAL MACROS
-%%%-----------------------------------------------------------------------------
-%% The field value scan below this length runs on `binary:match/2', and at
-%% this length and above it runs on the word scan of
-%% `has_forbidden_value_octet/1'. Two unrolled strides of that loop.
 -define(VALUE_WORD_SCAN_MIN, 112).
 
-%% Seven octet words for the field value scan. `bnot' and `band' on a 56 bit
-%% word stay inside a small integer, and 64 bits would allocate a bignum.
 -define(W_LOW7, 16#7F7F7F7F7F7F7F).
 -define(W_TAB7, 16#09090909090909).
 -define(W_SUB32, 16#60606060606060).
@@ -85,7 +79,9 @@ lowercasing of `lower_field_name/1`.
 -define(PT_FIELD_VALUE_BAD, {?MODULE, field_value_bad_pattern}).
 -define(PT_UPPER_ALPHA, {?MODULE, upper_alpha_pattern}).
 
--on_load(init_patterns/0).
+-spec field_value_bad_bytes() -> [binary(), ...].
+field_value_bad_bytes() ->
+    [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
 
 -spec init_patterns() -> ok.
 init_patterns() ->
@@ -106,10 +102,6 @@ non_tchar_bytes() ->
 upper_alpha_bytes() ->
     [<<C>> || C <- lists:seq($A, $Z)].
 
--spec field_value_bad_bytes() -> [binary(), ...].
-field_value_bad_bytes() ->
-    [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>].
-
 %%%-----------------------------------------------------------------------------
 %% PUBLIC API
 %%%-----------------------------------------------------------------------------
@@ -128,10 +120,45 @@ delete(Name, Headers) ->
     Lower = to_lower(Name),
     do_delete(Lower, Headers, []).
 
+-spec do_delete(binary(), nhttp_lib:headers(), nhttp_lib:headers()) -> nhttp_lib:headers().
+do_delete(Name, [{Name, _} | Rest], Acc) ->
+    do_delete(Name, Rest, Acc);
+do_delete(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
+    case name_eq(Stored, Name, byte_size(Name) - 1) of
+        true -> do_delete(Name, Rest, Acc);
+        false -> do_delete(Name, Rest, [Pair | Acc])
+    end;
+do_delete(Name, [Pair | Rest], Acc) ->
+    do_delete(Name, Rest, [Pair | Acc]);
+do_delete(_, [], Acc) ->
+    lists:reverse(Acc).
+
+-spec do_get(binary(), nhttp_lib:headers(), Default) -> binary() | Default.
+do_get(Name, [{Name, Value} | _], _Default) ->
+    Value;
+do_get(Name, [{Stored, Value} | Rest], Default) when byte_size(Stored) =:= byte_size(Name) ->
+    case name_eq(Stored, Name, byte_size(Name) - 1) of
+        true -> Value;
+        false -> do_get(Name, Rest, Default)
+    end;
+do_get(Name, [_ | Rest], Default) ->
+    do_get(Name, Rest, Default);
+do_get(_, [], Default) ->
+    Default.
+
+-spec do_has(binary(), nhttp_lib:headers()) -> boolean().
+do_has(Name, [{Name, _} | _]) ->
+    true;
+do_has(Name, [{Stored, _} | Rest]) when byte_size(Stored) =:= byte_size(Name) ->
+    name_eq(Stored, Name, byte_size(Name) - 1) orelse do_has(Name, Rest);
+do_has(Name, [_ | Rest]) ->
+    do_has(Name, Rest);
+do_has(_, []) ->
+    false.
+
 -doc """
 The compiled pattern that matches every octet that RFC 9110 §5.5 forbids
 in a field value: `0x00-0x1F` except `0x09`, and `0x7F`.
-
 A caller that scans many field values reads the pattern once and passes
 it to `binary:match/2` for each one.
 """.
@@ -168,7 +195,6 @@ has(Name, Headers) ->
 -doc """
 True iff `Value` holds an octet that RFC 9110 §5.5 forbids in a field
 value: `0x00-0x1F` except `0x09`, or `0x7F`.
-
 The scan reads seven octets at a time and charges one reduction per call,
 so it holds a constant cost per octet at every length.
 `field_value_bad_pattern/0` with `binary:match/2` is cheaper below about a
@@ -206,7 +232,6 @@ has_forbidden_value_octet(<<>>) ->
 -doc """
 True iff `C` is a `tchar`, the character set that RFC 9110 §5.6.2 allows
 in a `token`.
-
 RFC 6265 §4.1.1 defines `cookie-name` in terms of the RFC 2616 §2.2
 `token`, which admits the same octets, so cookie names are checked with
 this predicate too.
@@ -245,13 +270,11 @@ is_token(Bin) ->
 -doc """
 Lowercase a field name for the wire, without a copy when the name already
 holds no uppercase octet.
-
 RFC 9114 §4.2 requires that characters in field names are converted to
 lowercase before their encoding, and RFC 9113 §8.2.1 forbids `0x41-0x5A`
 in a field name on the wire. The scan runs before the copy, so a name
 that is already lowercase comes back as the very binary that the caller
 passed in.
-
 Non-ASCII upper-half octets pass through unchanged, as they do in
 `to_lower/1`. This function does not validate the name. Pair it with
 `validate_field_name/1` when the name arrives from a peer.
@@ -267,7 +290,6 @@ lower_field_name(Name) ->
 True iff two field names name the same field. Field names compare
 case-insensitively (RFC 9110 §5.1), so `<<"Content-Length">>` and
 `<<"content-length">>` name the same field.
-
 A caller that asks about a fixed set of names walks the list once and
 compares each stored name with this function.
 """.
@@ -281,7 +303,6 @@ name_eq(_Name, _Other) ->
 
 -doc """
 The compiled pattern that matches every octet that is not a `tchar`.
-
 A caller that scans many tokens reads the pattern once and passes it to
 `binary:match/2` for each one.
 """.
@@ -373,17 +394,14 @@ to_lower(Bin) -> <<<<(to_lower_byte(C))>> || <<C>> <= Bin>>.
 -doc """
 Validate a field name against the minimal rule that RFC 9113 §8.2.1
 states as a MUST, and that RFC 9114 §4.1.2 repeats for HTTP/3.
-
 A field name must not hold an octet in `0x00-0x20`, `0x41-0x5A` or
 `0x7F-0xFF`. A field name must not hold a colon, except the single
 leading colon of a pseudo-header field (RFC 9113 §8.3). An empty name,
 and a name that is a bare colon and therefore names no pseudo-header
 field, are refused as `empty_field_name`.
-
 `uppercase_field_name` names the case that RFC 9114 §4.1.2 lists apart
 from the other invalid characters. It is reported when the first
 offending octet is in `0x41-0x5A`.
-
 This is the minimal rule, not the `token` rule of RFC 9110 §5.6.2, which
 RFC 9113 §8.2.1 states as a SHOULD. Use `is_token/1` for the stricter
 test.
@@ -397,7 +415,6 @@ validate_field_name(Name) -> name_octets(Name).
 -doc """
 Validate a field value against RFC 9110 §5.5 and the edge whitespace rule
 that RFC 9113 §8.2.1 states as a MUST.
-
 The refused octet set is `0x00-0x1F` except `0x09`, plus `0x7F`. That set
 is a superset of the NUL, LF and CR that RFC 9113 §8.2.1 names, because
 RFC 9113 §8.2.1 asks for validation against RFC 9110 §5.5. A value that
@@ -415,46 +432,6 @@ validate_field_value(Value) ->
         value_octets(Value)
     end.
 
-%%%-----------------------------------------------------------------------------
-%%%-----------------------------------------------------------------------------
-%% INTERNAL
-%%%-----------------------------------------------------------------------------
--spec do_delete(binary(), nhttp_lib:headers(), nhttp_lib:headers()) -> nhttp_lib:headers().
-do_delete(Name, [{Name, _} | Rest], Acc) ->
-    do_delete(Name, Rest, Acc);
-do_delete(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
-    case name_eq(Stored, Name, byte_size(Name) - 1) of
-        true -> do_delete(Name, Rest, Acc);
-        false -> do_delete(Name, Rest, [Pair | Acc])
-    end;
-do_delete(Name, [Pair | Rest], Acc) ->
-    do_delete(Name, Rest, [Pair | Acc]);
-do_delete(_, [], Acc) ->
-    lists:reverse(Acc).
-
--spec do_get(binary(), nhttp_lib:headers(), Default) -> binary() | Default.
-do_get(Name, [{Name, Value} | _], _Default) ->
-    Value;
-do_get(Name, [{Stored, Value} | Rest], Default) when byte_size(Stored) =:= byte_size(Name) ->
-    case name_eq(Stored, Name, byte_size(Name) - 1) of
-        true -> Value;
-        false -> do_get(Name, Rest, Default)
-    end;
-do_get(Name, [_ | Rest], Default) ->
-    do_get(Name, Rest, Default);
-do_get(_, [], Default) ->
-    Default.
-
--spec do_has(binary(), nhttp_lib:headers()) -> boolean().
-do_has(Name, [{Name, _} | _]) ->
-    true;
-do_has(Name, [{Stored, _} | Rest]) when byte_size(Stored) =:= byte_size(Name) ->
-    name_eq(Stored, Name, byte_size(Name) - 1) orelse do_has(Name, Rest);
-do_has(Name, [_ | Rest]) ->
-    do_has(Name, Rest);
-do_has(_, []) ->
-    false.
-
 -compile({inline, [name_eq/3]}).
 -spec name_eq(binary(), binary(), integer()) -> boolean().
 name_eq(_Stored, _Other, -1) ->
@@ -469,24 +446,10 @@ byte_name_eq(C, C) -> true;
 byte_name_eq(C, D) -> to_lower_byte(C) =:= to_lower_byte(D).
 
 -compile({inline, [to_lower_byte/1]}).
--spec to_lower_byte(byte()) -> byte().
-to_lower_byte(C) when C >= $A, C =< $Z -> C + 32;
-to_lower_byte(C) -> C.
-
-%% A scan in bit syntax charges a match context, 5 heap words, on every call.
-%% The encode path of HTTP/2 and of HTTP/3 reads every field name of every
-%% message, so that context is an allocation per field line. `binary:match/2'
-%% over a compiled pattern reads the same octets and allocates nothing when it
-%% answers `nomatch', which is the answer for a name that is already lowercase.
 -spec has_upper_octet(binary()) -> boolean().
 has_upper_octet(Name) ->
     binary:match(Name, persistent_term:get(?PT_UPPER_ALPHA)) =/= nomatch.
 
-%% The accepted octets of RFC 9113 Section 8.2.1 spelled as three ranges:
-%% 0x21 to 0x39, 0x3B to 0x40 and 0x5B to 0x7E. The ranges omit 0x3A, so a
-%% colon is refused at every offset that reaches here. The single leading
-%% colon of a pseudo-header field never reaches here, because
-%% `validate_field_name/1' strips it.
 -spec name_octets(binary()) -> ok | {error, field_name_error()}.
 name_octets(<<C, Rest/binary>>) when
     C >= 16#21, C =< 16#39;
@@ -501,11 +464,11 @@ name_octets(<<_, _/binary>>) ->
 name_octets(<<>>) ->
     ok.
 
--compile({inline, [value_edges/1]}).
+-spec to_lower_byte(byte()) -> byte().
+to_lower_byte(C) when C >= $A, C =< $Z -> C + 32;
+to_lower_byte(C) -> C.
 
-%% The trailing octet is read with a skip in bit syntax rather than with
-%% `binary:last/1', which turns the match context back into a binary and
-%% charges an allocation for it.
+-compile({inline, [value_edges/1]}).
 -spec value_edges(binary()) -> ok | {error, field_value_error()}.
 value_edges(<<>>) ->
     ok;
@@ -520,10 +483,6 @@ value_edges(Value) ->
             ok
     end.
 
-%% Two instruments read the same octet set, and the length picks between them.
-%% `binary:match/2' charges one reduction per ten octets up to its trap and
-%% stops counting above it, so a long value goes to the word scan, which
-%% charges one reduction per call at every length.
 -spec value_octets(binary()) -> ok | {error, field_value_error()}.
 value_octets(Value) when byte_size(Value) < ?VALUE_WORD_SCAN_MIN ->
     case binary:match(Value, persistent_term:get(?PT_FIELD_VALUE_BAD)) of
@@ -537,7 +496,6 @@ value_octets(Value) ->
     end.
 
 -compile({inline, [forbidden_in_word/1]}).
-
 -spec forbidden_in_word(non_neg_integer()) -> boolean().
 forbidden_in_word(W) ->
     U = W band ?W_LOW7,

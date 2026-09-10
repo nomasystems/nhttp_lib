@@ -268,6 +268,17 @@ decode_representations(Bin, Base, DynTable, Acc, UsedDyn) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL - REPRESENTATION RESOLUTION
 %%%-----------------------------------------------------------------------------
+-spec check_field(binary(), binary()) -> ok | {error, field_error()}.
+check_field(Name, Value) ->
+    maybe
+        ok ?= tag(Name, nhttp_headers:validate_field_name(Name)),
+        check_value(Name, Value)
+    end.
+
+-spec check_value(binary(), binary()) -> ok | {error, field_error()}.
+check_value(Name, Value) ->
+    tag(Name, nhttp_headers:validate_field_value(Value)).
+
 -spec resolve_representation(
     nhttp_qpack_field_line:representation(),
     non_neg_integer(),
@@ -341,25 +352,6 @@ resolve_representation(
         ok ?= check_field(Name, Value),
         {ok, {Name, Value}, false}
     end.
-
-%%%-----------------------------------------------------------------------------
-%% INTERNAL - FIELD VALIDITY (RFC 9113 SECTION 8.2.1, RFC 9114 SECTION 4.1.2)
-%%%
-%%% Every name and every value that arrives as a literal is read here. A name
-%%% that arrives as a table index is not read again: the static table holds
-%%% lowercase names, and `apply_encoder_instruction/2' refuses an invalid
-%%% entry, so the dynamic table holds none.
-%%%-----------------------------------------------------------------------------
--spec check_field(binary(), binary()) -> ok | {error, field_error()}.
-check_field(Name, Value) ->
-    maybe
-        ok ?= tag(Name, nhttp_headers:validate_field_name(Name)),
-        check_value(Name, Value)
-    end.
-
--spec check_value(binary(), binary()) -> ok | {error, field_error()}.
-check_value(Name, Value) ->
-    tag(Name, nhttp_headers:validate_field_value(Value)).
 
 -spec tag(binary(), ok | {error, field_reason()}) -> ok | {error, field_error()}.
 tag(_Name, ok) -> ok;

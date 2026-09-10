@@ -180,9 +180,6 @@ CONTINUATION frames that carry the larger field section.
     | {ok, [event()], conn(), iodata()}
     | {error, nhttp_h2_frame:decode_error()}.
 
-%% The outcome of one received frame. `{stream_error, Conn, ...}` carries the
-%% connection forward, because a stream error leaves the connection open and
-%% RFC 9113 Section 4.3 keeps the HPACK context of a discarded field block.
 -type frame_result() ::
     {ok, conn(), [event()], iodata()}
     | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
@@ -451,19 +448,16 @@ open_stream(
 
 -doc """
 Return the stream counters for this connection.
-
 `active` is the number of streams in the "open" state or in either
 "half-closed" state, the set that `SETTINGS_MAX_CONCURRENT_STREAMS` bounds
 (RFC 9113 Section 5.1.2). `peer_opened` is the total number of streams that
 the peer opened. `peer_reset` is the number of streams that the peer
 terminated with RST_STREAM.
-
 `SETTINGS_MAX_CONCURRENT_STREAMS` bounds the streams that are open at one
 instant. It does not bound stream turnover. A peer that alternates HEADERS
 and RST_STREAM holds `active` at a low value and drives `peer_opened` and
 `peer_reset` without limit. RFC 9113 Section 10.5 tells an implementation to
 track such use and to set a limit on it.
-
 This library holds no clock, so it counts events only. The caller reads these
 counters to apply a rate per unit of time. To let the connection refuse the
 peer on its own, set `max_reset_streams` in the local settings. The
@@ -689,14 +683,6 @@ decode_headers_internal(
                     iolist_to_binary(io_lib:format("HPACK decode error: ~p", [HpackError]))}}
     end.
 
--spec invalid_field_reason(nhttp_hpack:field_error()) -> binary().
-invalid_field_reason(uppercase_header_name) ->
-    <<"Uppercase header name (RFC 9113 Section 8.2.1, Section 8.1.1)">>;
-invalid_field_reason(invalid_header_name) ->
-    <<"Invalid header field name (RFC 9113 Section 8.2.1, Section 8.1.1)">>;
-invalid_field_reason(invalid_header_value) ->
-    <<"Invalid header field value (RFC 9113 Section 8.2.1, Section 8.1.1)">>.
-
 -spec default_settings() -> settings().
 default_settings() ->
     #{
@@ -822,6 +808,14 @@ hpack_decode_opts(#h2_conn{local_settings = Settings}) ->
 -spec initial_stream_id(role()) -> nhttp_lib:stream_id().
 initial_stream_id(client) -> 1;
 initial_stream_id(server) -> 2.
+
+-spec invalid_field_reason(nhttp_hpack:field_error()) -> binary().
+invalid_field_reason(uppercase_header_name) ->
+    <<"Uppercase header name (RFC 9113 Section 8.2.1, Section 8.1.1)">>;
+invalid_field_reason(invalid_header_name) ->
+    <<"Invalid header field name (RFC 9113 Section 8.2.1, Section 8.1.1)">>;
+invalid_field_reason(invalid_header_value) ->
+    <<"Invalid header field value (RFC 9113 Section 8.2.1, Section 8.1.1)">>.
 
 -spec invalid_preface_error() -> {error, nhttp_h2_frame:decode_error()}.
 invalid_preface_error() ->

@@ -152,9 +152,7 @@ type COMPRESSION_ERROR.
     | {invalid_field, field_error(), state()}
     | {error, decode_error()}.
 
-%% The verdict of the RFC 9113 Section 8.2.1 read on one field, kept apart for
-%% the name and for the value. An indexed name carries its name verdict into
-%% the field that reuses it, where the value arrives fresh from the wire.
+-type find_result() :: {field, pos_integer()} | {name, pos_integer()} | not_found.
 -type fault_reason() :: ok | field_error().
 -type fault() :: ok | {fault_reason(), fault_reason()}.
 
@@ -214,7 +212,6 @@ table_size(#hpack{size = Size}) ->
 %%%-----------------------------------------------------------------------------
 -doc """
 Decode a header block.
-
 See `decode/3` for the `invalid_field` return.
 """.
 -spec decode(Data :: binary(), State :: state()) -> decode_result().
@@ -251,6 +248,30 @@ encode(Headers, State0, Opts) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
+-spec best({name, pos_integer()} | not_found, find_result()) -> find_result().
+best(_Static, {field, _} = Field) -> Field;
+best({name, _} = Static, _Dyn) -> Static;
+best(not_found, Dyn) -> Dyn.
+
+-spec check_field(binary(), binary()) -> fault_reason().
+check_field(Name, Value) ->
+    first_bad(check_name(Name), check_value(Value)).
+
+-spec check_name(binary()) -> fault_reason().
+check_name(Name) ->
+    case nhttp_headers:validate_field_name(Name) of
+        ok -> ok;
+        {error, uppercase_field_name} -> uppercase_header_name;
+        {error, _} -> invalid_header_name
+    end.
+
+-spec check_value(binary()) -> fault_reason().
+check_value(Value) ->
+    case nhttp_headers:validate_field_value(Value) of
+        ok -> ok;
+        {error, _} -> invalid_header_value
+    end.
+
 -spec clear_table(state()) -> state().
 clear_table(State = #hpack{next_seq = NextSeq}) ->
     State#hpack{
@@ -291,10 +312,6 @@ decode_block(
 decode_block(Data, State, Acc, Total, Limit, Bad) ->
     decode_headers(Data, State, Acc, Total, Limit, Bad).
 
-%% `Bad' carries the first field that broke RFC 9113 Section 8.2.1. The block
-%% still runs to its end, because RFC 9113 Section 4.3 makes an endpoint
-%% decompress a field block even when it discards the frames, and a skipped
-%% dynamic table update leaves this decoder out of step with the peer encoder.
 -spec decode_headers(
     binary(),
     state(),
@@ -374,10 +391,6 @@ decode_headers(<<2#0001:4, Rest/bits>>, State, Acc, Total, Limit, Bad) ->
 decode_headers(_, _, _, _, _, _) ->
     {error, incomplete_header_block}.
 
-%% RFC 9113 Section 8.2: a field name is converted to lowercase when an
-%% HTTP/2 message is constructed. The lowercased name feeds the table lookup,
-%% the literal representation and the dynamic table insert, so the octets on
-%% the wire and the octets in the table agree.
 -spec encode_headers(headers(), state(), boolean(), [iodata()]) ->
     {[iodata()], state()}.
 encode_headers([], State, _, Acc) ->
@@ -399,16 +412,6 @@ encode_headers([{Name0, Value} = Header0 | Tail], State, UseHuffman, Acc) ->
                 | [nhttp_str:encode(Name, UseHuffman) | nhttp_str:encode(Value, UseHuffman)]
             ],
             encode_headers(Tail, State2, UseHuffman, [Encoded | Acc])
-    end.
-
-%% `lower_field_name/1' hands back the very binary it read when the name holds
-%% no uppercase octet, so the tuple the caller wrote survives the common path
-%% and the encoder allocates nothing for a name that is already on the wire form.
--spec lower_name({binary(), binary()}, binary(), binary()) -> {binary(), binary()}.
-lower_name(Header, Name, Value) ->
-    case nhttp_headers:lower_field_name(Name) of
-        Name -> Header;
-        Lower -> {Lower, Value}
     end.
 
 -spec evict_to_size(non_neg_integer(), state()) -> state().
@@ -434,125 +437,23 @@ evict_to_size(
             evict_to_size(TargetSize, NewState)
     end.
 
--spec find({binary(), binary()}, state()) ->
-    {field, pos_integer()} | {name, pos_integer()} | not_found.
-find({<<":authority">>, <<>>}, _) -> {field, 1};
-find({<<":authority">>, _}, _) -> {name, 1};
-find({<<":method">>, <<"GET">>}, _) -> {field, 2};
-find({<<":method">>, <<"POST">>}, _) -> {field, 3};
-find({<<":method">>, _}, _) -> {name, 2};
-find({<<":path">>, <<"/">>}, _) -> {field, 4};
-find({<<":path">>, <<"/index.html">>}, _) -> {field, 5};
-find({<<":path">>, _}, _) -> {name, 4};
-find({<<":scheme">>, <<"http">>}, _) -> {field, 6};
-find({<<":scheme">>, <<"https">>}, _) -> {field, 7};
-find({<<":scheme">>, _}, _) -> {name, 6};
-find({<<":status">>, <<"200">>}, _) -> {field, 8};
-find({<<":status">>, <<"204">>}, _) -> {field, 9};
-find({<<":status">>, <<"206">>}, _) -> {field, 10};
-find({<<":status">>, <<"304">>}, _) -> {field, 11};
-find({<<":status">>, <<"400">>}, _) -> {field, 12};
-find({<<":status">>, <<"404">>}, _) -> {field, 13};
-find({<<":status">>, <<"500">>}, _) -> {field, 14};
-find({<<":status">>, _}, _) -> {name, 8};
-find({<<"accept-charset">>, <<>>}, _) -> {field, 15};
-find({<<"accept-charset">>, _}, _) -> {name, 15};
-find({<<"accept-encoding">>, <<"gzip, deflate">>}, _) -> {field, 16};
-find({<<"accept-encoding">>, _}, _) -> {name, 16};
-find({<<"accept-language">>, <<>>}, _) -> {field, 17};
-find({<<"accept-language">>, _}, _) -> {name, 17};
-find({<<"accept-ranges">>, <<>>}, _) -> {field, 18};
-find({<<"accept-ranges">>, _}, _) -> {name, 18};
-find({<<"accept">>, <<>>}, _) -> {field, 19};
-find({<<"accept">>, _}, _) -> {name, 19};
-find({<<"access-control-allow-origin">>, <<>>}, _) -> {field, 20};
-find({<<"access-control-allow-origin">>, _}, _) -> {name, 20};
-find({<<"age">>, <<>>}, _) -> {field, 21};
-find({<<"age">>, _}, _) -> {name, 21};
-find({<<"allow">>, <<>>}, _) -> {field, 22};
-find({<<"allow">>, _}, _) -> {name, 22};
-find({<<"authorization">>, <<>>}, _) -> {field, 23};
-find({<<"authorization">>, _}, _) -> {name, 23};
-find({<<"cache-control">>, <<>>}, _) -> {field, 24};
-find({<<"cache-control">>, _}, _) -> {name, 24};
-find({<<"content-disposition">>, <<>>}, _) -> {field, 25};
-find({<<"content-disposition">>, _}, _) -> {name, 25};
-find({<<"content-encoding">>, <<>>}, _) -> {field, 26};
-find({<<"content-encoding">>, _}, _) -> {name, 26};
-find({<<"content-language">>, <<>>}, _) -> {field, 27};
-find({<<"content-language">>, _}, _) -> {name, 27};
-find({<<"content-length">>, <<>>}, _) -> {field, 28};
-find({<<"content-length">>, _}, _) -> {name, 28};
-find({<<"content-location">>, <<>>}, _) -> {field, 29};
-find({<<"content-location">>, _}, _) -> {name, 29};
-find({<<"content-range">>, <<>>}, _) -> {field, 30};
-find({<<"content-range">>, _}, _) -> {name, 30};
-find({<<"content-type">>, <<>>}, _) -> {field, 31};
-find({<<"content-type">>, _}, _) -> {name, 31};
-find({<<"cookie">>, <<>>}, _) -> {field, 32};
-find({<<"cookie">>, _}, _) -> {name, 32};
-find({<<"date">>, <<>>}, _) -> {field, 33};
-find({<<"date">>, _}, _) -> {name, 33};
-find({<<"etag">>, <<>>}, _) -> {field, 34};
-find({<<"etag">>, _}, _) -> {name, 34};
-find({<<"expect">>, <<>>}, _) -> {field, 35};
-find({<<"expect">>, _}, _) -> {name, 35};
-find({<<"expires">>, <<>>}, _) -> {field, 36};
-find({<<"expires">>, _}, _) -> {name, 36};
-find({<<"from">>, <<>>}, _) -> {field, 37};
-find({<<"from">>, _}, _) -> {name, 37};
-find({<<"host">>, <<>>}, _) -> {field, 38};
-find({<<"host">>, _}, _) -> {name, 38};
-find({<<"if-match">>, <<>>}, _) -> {field, 39};
-find({<<"if-match">>, _}, _) -> {name, 39};
-find({<<"if-modified-since">>, <<>>}, _) -> {field, 40};
-find({<<"if-modified-since">>, _}, _) -> {name, 40};
-find({<<"if-none-match">>, <<>>}, _) -> {field, 41};
-find({<<"if-none-match">>, _}, _) -> {name, 41};
-find({<<"if-range">>, <<>>}, _) -> {field, 42};
-find({<<"if-range">>, _}, _) -> {name, 42};
-find({<<"if-unmodified-since">>, <<>>}, _) -> {field, 43};
-find({<<"if-unmodified-since">>, _}, _) -> {name, 43};
-find({<<"last-modified">>, <<>>}, _) -> {field, 44};
-find({<<"last-modified">>, _}, _) -> {name, 44};
-find({<<"link">>, <<>>}, _) -> {field, 45};
-find({<<"link">>, _}, _) -> {name, 45};
-find({<<"location">>, <<>>}, _) -> {field, 46};
-find({<<"location">>, _}, _) -> {name, 46};
-find({<<"max-forwards">>, <<>>}, _) -> {field, 47};
-find({<<"max-forwards">>, _}, _) -> {name, 47};
-find({<<"proxy-authenticate">>, <<>>}, _) -> {field, 48};
-find({<<"proxy-authenticate">>, _}, _) -> {name, 48};
-find({<<"proxy-authorization">>, <<>>}, _) -> {field, 49};
-find({<<"proxy-authorization">>, _}, _) -> {name, 49};
-find({<<"range">>, <<>>}, _) -> {field, 50};
-find({<<"range">>, _}, _) -> {name, 50};
-find({<<"referer">>, <<>>}, _) -> {field, 51};
-find({<<"referer">>, _}, _) -> {name, 51};
-find({<<"refresh">>, <<>>}, _) -> {field, 52};
-find({<<"refresh">>, _}, _) -> {name, 52};
-find({<<"retry-after">>, <<>>}, _) -> {field, 53};
-find({<<"retry-after">>, _}, _) -> {name, 53};
-find({<<"server">>, <<>>}, _) -> {field, 54};
-find({<<"server">>, _}, _) -> {name, 54};
-find({<<"set-cookie">>, <<>>}, _) -> {field, 55};
-find({<<"set-cookie">>, _}, _) -> {name, 55};
-find({<<"strict-transport-security">>, <<>>}, _) -> {field, 56};
-find({<<"strict-transport-security">>, _}, _) -> {name, 56};
-find({<<"transfer-encoding">>, <<>>}, _) -> {field, 57};
-find({<<"transfer-encoding">>, _}, _) -> {name, 57};
-find({<<"user-agent">>, <<>>}, _) -> {field, 58};
-find({<<"user-agent">>, _}, _) -> {name, 58};
-find({<<"vary">>, <<>>}, _) -> {field, 59};
-find({<<"vary">>, _}, _) -> {name, 59};
-find({<<"via">>, <<>>}, _) -> {field, 60};
-find({<<"via">>, _}, _) -> {name, 60};
-find({<<"www-authenticate">>, <<>>}, _) -> {field, 61};
-find({<<"www-authenticate">>, _}, _) -> {name, 61};
-find(Header, State) -> find_dyn(Header, State).
+-spec fault(fault_reason(), fault_reason()) -> fault().
+fault(ok, ok) -> ok;
+fault(NameFault, ValueFault) -> {NameFault, ValueFault}.
 
--spec find_dyn({binary(), binary()}, state()) ->
-    {field, pos_integer()} | {name, pos_integer()} | not_found.
+-spec field_fault(fault()) -> fault_reason().
+field_fault(ok) -> ok;
+field_fault({ok, ValueFault}) -> ValueFault;
+field_fault({NameFault, _}) -> NameFault.
+
+-spec find({binary(), binary()}, state()) -> find_result().
+find(Header, State) ->
+    case find_static(Header) of
+        {field, _} = Field -> Field;
+        Static -> best(Static, find_dyn(Header, State))
+    end.
+
+-spec find_dyn({binary(), binary()}, state()) -> find_result().
 find_dyn({Name, _Value} = Header, #hpack{
     next_seq = NextSeq,
     oldest_seq = OldestSeq,
@@ -572,6 +473,126 @@ find_dyn({Name, _Value} = Header, #hpack{
                     not_found
             end
     end.
+
+-spec find_static({binary(), binary()}) -> find_result().
+find_static({<<":authority">>, <<>>}) -> {field, 1};
+find_static({<<":authority">>, _}) -> {name, 1};
+find_static({<<":method">>, <<"GET">>}) -> {field, 2};
+find_static({<<":method">>, <<"POST">>}) -> {field, 3};
+find_static({<<":method">>, _}) -> {name, 2};
+find_static({<<":path">>, <<"/">>}) -> {field, 4};
+find_static({<<":path">>, <<"/index.html">>}) -> {field, 5};
+find_static({<<":path">>, _}) -> {name, 4};
+find_static({<<":scheme">>, <<"http">>}) -> {field, 6};
+find_static({<<":scheme">>, <<"https">>}) -> {field, 7};
+find_static({<<":scheme">>, _}) -> {name, 6};
+find_static({<<":status">>, <<"200">>}) -> {field, 8};
+find_static({<<":status">>, <<"204">>}) -> {field, 9};
+find_static({<<":status">>, <<"206">>}) -> {field, 10};
+find_static({<<":status">>, <<"304">>}) -> {field, 11};
+find_static({<<":status">>, <<"400">>}) -> {field, 12};
+find_static({<<":status">>, <<"404">>}) -> {field, 13};
+find_static({<<":status">>, <<"500">>}) -> {field, 14};
+find_static({<<":status">>, _}) -> {name, 8};
+find_static({<<"accept-charset">>, <<>>}) -> {field, 15};
+find_static({<<"accept-charset">>, _}) -> {name, 15};
+find_static({<<"accept-encoding">>, <<"gzip, deflate">>}) -> {field, 16};
+find_static({<<"accept-encoding">>, _}) -> {name, 16};
+find_static({<<"accept-language">>, <<>>}) -> {field, 17};
+find_static({<<"accept-language">>, _}) -> {name, 17};
+find_static({<<"accept-ranges">>, <<>>}) -> {field, 18};
+find_static({<<"accept-ranges">>, _}) -> {name, 18};
+find_static({<<"accept">>, <<>>}) -> {field, 19};
+find_static({<<"accept">>, _}) -> {name, 19};
+find_static({<<"access-control-allow-origin">>, <<>>}) -> {field, 20};
+find_static({<<"access-control-allow-origin">>, _}) -> {name, 20};
+find_static({<<"age">>, <<>>}) -> {field, 21};
+find_static({<<"age">>, _}) -> {name, 21};
+find_static({<<"allow">>, <<>>}) -> {field, 22};
+find_static({<<"allow">>, _}) -> {name, 22};
+find_static({<<"authorization">>, <<>>}) -> {field, 23};
+find_static({<<"authorization">>, _}) -> {name, 23};
+find_static({<<"cache-control">>, <<>>}) -> {field, 24};
+find_static({<<"cache-control">>, _}) -> {name, 24};
+find_static({<<"content-disposition">>, <<>>}) -> {field, 25};
+find_static({<<"content-disposition">>, _}) -> {name, 25};
+find_static({<<"content-encoding">>, <<>>}) -> {field, 26};
+find_static({<<"content-encoding">>, _}) -> {name, 26};
+find_static({<<"content-language">>, <<>>}) -> {field, 27};
+find_static({<<"content-language">>, _}) -> {name, 27};
+find_static({<<"content-length">>, <<>>}) -> {field, 28};
+find_static({<<"content-length">>, _}) -> {name, 28};
+find_static({<<"content-location">>, <<>>}) -> {field, 29};
+find_static({<<"content-location">>, _}) -> {name, 29};
+find_static({<<"content-range">>, <<>>}) -> {field, 30};
+find_static({<<"content-range">>, _}) -> {name, 30};
+find_static({<<"content-type">>, <<>>}) -> {field, 31};
+find_static({<<"content-type">>, _}) -> {name, 31};
+find_static({<<"cookie">>, <<>>}) -> {field, 32};
+find_static({<<"cookie">>, _}) -> {name, 32};
+find_static({<<"date">>, <<>>}) -> {field, 33};
+find_static({<<"date">>, _}) -> {name, 33};
+find_static({<<"etag">>, <<>>}) -> {field, 34};
+find_static({<<"etag">>, _}) -> {name, 34};
+find_static({<<"expect">>, <<>>}) -> {field, 35};
+find_static({<<"expect">>, _}) -> {name, 35};
+find_static({<<"expires">>, <<>>}) -> {field, 36};
+find_static({<<"expires">>, _}) -> {name, 36};
+find_static({<<"from">>, <<>>}) -> {field, 37};
+find_static({<<"from">>, _}) -> {name, 37};
+find_static({<<"host">>, <<>>}) -> {field, 38};
+find_static({<<"host">>, _}) -> {name, 38};
+find_static({<<"if-match">>, <<>>}) -> {field, 39};
+find_static({<<"if-match">>, _}) -> {name, 39};
+find_static({<<"if-modified-since">>, <<>>}) -> {field, 40};
+find_static({<<"if-modified-since">>, _}) -> {name, 40};
+find_static({<<"if-none-match">>, <<>>}) -> {field, 41};
+find_static({<<"if-none-match">>, _}) -> {name, 41};
+find_static({<<"if-range">>, <<>>}) -> {field, 42};
+find_static({<<"if-range">>, _}) -> {name, 42};
+find_static({<<"if-unmodified-since">>, <<>>}) -> {field, 43};
+find_static({<<"if-unmodified-since">>, _}) -> {name, 43};
+find_static({<<"last-modified">>, <<>>}) -> {field, 44};
+find_static({<<"last-modified">>, _}) -> {name, 44};
+find_static({<<"link">>, <<>>}) -> {field, 45};
+find_static({<<"link">>, _}) -> {name, 45};
+find_static({<<"location">>, <<>>}) -> {field, 46};
+find_static({<<"location">>, _}) -> {name, 46};
+find_static({<<"max-forwards">>, <<>>}) -> {field, 47};
+find_static({<<"max-forwards">>, _}) -> {name, 47};
+find_static({<<"proxy-authenticate">>, <<>>}) -> {field, 48};
+find_static({<<"proxy-authenticate">>, _}) -> {name, 48};
+find_static({<<"proxy-authorization">>, <<>>}) -> {field, 49};
+find_static({<<"proxy-authorization">>, _}) -> {name, 49};
+find_static({<<"range">>, <<>>}) -> {field, 50};
+find_static({<<"range">>, _}) -> {name, 50};
+find_static({<<"referer">>, <<>>}) -> {field, 51};
+find_static({<<"referer">>, _}) -> {name, 51};
+find_static({<<"refresh">>, <<>>}) -> {field, 52};
+find_static({<<"refresh">>, _}) -> {name, 52};
+find_static({<<"retry-after">>, <<>>}) -> {field, 53};
+find_static({<<"retry-after">>, _}) -> {name, 53};
+find_static({<<"server">>, <<>>}) -> {field, 54};
+find_static({<<"server">>, _}) -> {name, 54};
+find_static({<<"set-cookie">>, <<>>}) -> {field, 55};
+find_static({<<"set-cookie">>, _}) -> {name, 55};
+find_static({<<"strict-transport-security">>, <<>>}) -> {field, 56};
+find_static({<<"strict-transport-security">>, _}) -> {name, 56};
+find_static({<<"transfer-encoding">>, <<>>}) -> {field, 57};
+find_static({<<"transfer-encoding">>, _}) -> {name, 57};
+find_static({<<"user-agent">>, <<>>}) -> {field, 58};
+find_static({<<"user-agent">>, _}) -> {name, 58};
+find_static({<<"vary">>, <<>>}) -> {field, 59};
+find_static({<<"vary">>, _}) -> {name, 59};
+find_static({<<"via">>, <<>>}) -> {field, 60};
+find_static({<<"via">>, _}) -> {name, 60};
+find_static({<<"www-authenticate">>, <<>>}) -> {field, 61};
+find_static({<<"www-authenticate">>, _}) -> {name, 61};
+find_static(_) -> not_found.
+
+-spec first_bad(fault_reason(), fault_reason()) -> fault_reason().
+first_bad(ok, Second) -> Second;
+first_bad(First, _) -> First.
 
 -spec insert({binary(), binary()}, state()) -> state().
 insert(Header, State) ->
@@ -742,6 +763,13 @@ lookup(Index, #hpack{next_seq = NextSeq, oldest_seq = OldestSeq, entries = Entri
 lookup(0, _) ->
     {error, invalid_table_index}.
 
+-spec lower_name({binary(), binary()}, binary(), binary()) -> {binary(), binary()}.
+lower_name(Header, Name, Value) ->
+    case nhttp_headers:lower_field_name(Name) of
+        Name -> Header;
+        Lower -> {Lower, Value}
+    end.
+
 -spec map_int_error({ok, non_neg_integer(), bitstring()} | {error, nhttp_int:decode_error()}) ->
     {ok, non_neg_integer(), bitstring()} | {error, decode_error()}.
 map_int_error({ok, _, _} = Ok) -> Ok;
@@ -760,6 +788,10 @@ maybe_emit_table_size_update(State = #hpack{max_size = MaxSize, configured_max_s
 maybe_emit_table_size_update(State0 = #hpack{configured_max_size = MaxSize}) ->
     State1 = update_table_size(MaxSize, State0#hpack{max_size = MaxSize}),
     {nhttp_int:enc5(MaxSize, 2#001), State1}.
+
+-spec name_fault(fault()) -> fault_reason().
+name_fault(ok) -> ok;
+name_fault({NameFault, _}) -> NameFault.
 
 -spec push_header(
     {binary(), binary()},
@@ -785,41 +817,3 @@ update_table_size(MaxSize, State = #hpack{max_size = MaxSize}) ->
 update_table_size(MaxSize, State) ->
     State1 = evict_to_size(MaxSize, State),
     State1#hpack{max_size = MaxSize}.
-
--spec check_field(binary(), binary()) -> fault_reason().
-check_field(Name, Value) ->
-    first_bad(check_name(Name), check_value(Value)).
-
--spec check_name(binary()) -> fault_reason().
-check_name(Name) ->
-    case nhttp_headers:validate_field_name(Name) of
-        ok -> ok;
-        {error, uppercase_field_name} -> uppercase_header_name;
-        {error, _} -> invalid_header_name
-    end.
-
--spec check_value(binary()) -> fault_reason().
-check_value(Value) ->
-    case nhttp_headers:validate_field_value(Value) of
-        ok -> ok;
-        {error, _} -> invalid_header_value
-    end.
-
--spec first_bad(fault_reason(), fault_reason()) -> fault_reason().
-first_bad(ok, Second) -> Second;
-first_bad(First, _) -> First.
-
--spec fault(fault_reason(), fault_reason()) -> fault().
-fault(ok, ok) -> ok;
-fault(NameFault, ValueFault) -> {NameFault, ValueFault}.
-
-%% The verdict on a name that a later field reuses by index. The value of that
-%% entry does not travel with the name, so its verdict stays behind.
--spec name_fault(fault()) -> fault_reason().
-name_fault(ok) -> ok;
-name_fault({NameFault, _}) -> NameFault.
-
--spec field_fault(fault()) -> fault_reason().
-field_fault(ok) -> ok;
-field_fault({ok, ValueFault}) -> ValueFault;
-field_fault({NameFault, _}) -> NameFault.

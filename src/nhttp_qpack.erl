@@ -115,7 +115,6 @@ Decode an encoded field section from a request or push stream.
 Returns `{ok, Decoder, DecoderStreamData, FieldLines}` on success,
 `{blocked, Decoder}` when the field section references entries not
 yet received on the encoder stream, or `{error, Reason}` on failure.
-
 A field name or a field value that breaks the rule of RFC 9113 §8.2.1,
 which RFC 9114 §4.1.2 repeats, is refused as the
 `t:nhttp_qpack_decoder:field_error/0` shape. RFC 9114 §4.1.2 makes that a
@@ -141,7 +140,6 @@ is now satisfied.
 Returns `{ok, Decoder, UnblockedResults}` where UnblockedResults
 is a list of `{StreamId, DecoderStreamData, FieldLines}` tuples
 for streams that became unblocked.
-
 An instruction that carries an invalid field name or an invalid field value
 is refused, and the entry does not enter the dynamic table. RFC 9204 §2.2.3
 makes an error on the encoder stream a connection error of type

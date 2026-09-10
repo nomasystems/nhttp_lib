@@ -194,7 +194,6 @@ the encoder must never reference more than the peer's advertised
 blocked-stream budget. `max_entries` for the field-section prefix is
 fixed by the peer's advertised capacity (Section 4.5.1.1), independent
 of how much of the table this encoder chooses to use.
-
 Arms the Set Dynamic Table Capacity instruction so the next encode
 announces the effective capacity on the encoder stream before any
 reference to a dynamic entry. Capacity 0 (the QPACK default, e.g. a
@@ -327,16 +326,6 @@ encode_headers([{Name0, Value} | Rest], Acc) ->
     Acc1 = encode_one_header(nhttp_headers:lower_field_name(Name0), Value, Acc),
     encode_headers(Rest, Acc1).
 
--spec encode_one_header(binary(), binary(), #enc_acc{}) ->
-    #enc_acc{}.
-encode_one_header(Name, Value, Acc) ->
-    case nhttp_qpack_static_table:find_name_value(Name, Value) of
-        {ok, Index} ->
-            add_rep(Acc, {indexed, static, Index});
-        NameRes ->
-            encode_non_static_full(Name, Value, NameRes, Acc)
-    end.
-
 -spec encode_non_static_full(
     binary(), binary(), {name, non_neg_integer()} | error, #enc_acc{}
 ) -> #enc_acc{}.
@@ -353,6 +342,16 @@ encode_non_static_full(Name, Value, NameRes, Acc) ->
             add_dynamic_rep(Acc, {abs_indexed, AbsIndex}, AbsIndex);
         _ ->
             encode_static_name_or_literal(NameRes, Name, Value, Acc)
+    end.
+
+-spec encode_one_header(binary(), binary(), #enc_acc{}) ->
+    #enc_acc{}.
+encode_one_header(Name, Value, Acc) ->
+    case nhttp_qpack_static_table:find_name_value(Name, Value) of
+        {ok, Index} ->
+            add_rep(Acc, {indexed, static, Index});
+        NameRes ->
+            encode_non_static_full(Name, Value, NameRes, Acc)
     end.
 
 -spec encode_static_name_or_literal(

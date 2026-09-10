@@ -56,7 +56,9 @@ groups() ->
             decode_rfc_c2_4,
             decode_rfc_c4_1,
             decode_rfc_c4_2,
-            decode_rfc_c4_3
+            decode_rfc_c4_3,
+            encode_rfc_c3_sequence,
+            encode_rfc_c4_sequence
         ]},
         {static_table, [parallel], [
             static_indexed_method_get,
@@ -367,6 +369,61 @@ decode_rfc_c4_3(_Config) ->
     ],
     {ok, Decoded, _} = nhttp_hpack:decode(ThirdReq, State2),
     ?assertEqual(Expected, Decoded).
+
+encode_rfc_c3_sequence(_Config) ->
+    Expected = [
+        <<16#82, 16#86, 16#84, 16#41, 16#0f, "www.example.com">>,
+        <<16#82, 16#86, 16#84, 16#be, 16#58, 16#08, "no-cache">>,
+        <<16#82, 16#87, 16#85, 16#bf, 16#40, 16#0a, "custom-key", 16#0c, "custom-value">>
+    ],
+    encode_sequence(#{huffman => false}, Expected).
+
+encode_rfc_c4_sequence(_Config) ->
+    Expected = [
+        <<16#82, 16#86, 16#84, 16#41, 16#8c, 16#f1, 16#e3, 16#c2, 16#e5, 16#f2, 16#3a, 16#6b, 16#a0,
+            16#ab, 16#90, 16#f4, 16#ff>>,
+        <<16#82, 16#86, 16#84, 16#be, 16#58, 16#86, 16#a8, 16#eb, 16#10, 16#64, 16#9c, 16#bf>>,
+        <<16#82, 16#87, 16#85, 16#bf, 16#40, 16#88, 16#25, 16#a8, 16#49, 16#e9, 16#5b, 16#a9, 16#7d,
+            16#7f, 16#89, 16#25, 16#a8, 16#49, 16#e9, 16#5b, 16#b8, 16#e8, 16#b4, 16#bf>>
+    ],
+    encode_sequence(#{huffman => true}, Expected).
+
+%% RFC 7541 C.3 and C.4 share one request sequence. The second and the third
+%% request reuse `:authority' from the dynamic table, so an encoder that only
+%% consults the static table never reaches the expected octets.
+encode_sequence(Opts, Expected) ->
+    Requests = [
+        [
+            {<<":method">>, <<"GET">>},
+            {<<":scheme">>, <<"http">>},
+            {<<":path">>, <<"/">>},
+            {<<":authority">>, <<"www.example.com">>}
+        ],
+        [
+            {<<":method">>, <<"GET">>},
+            {<<":scheme">>, <<"http">>},
+            {<<":path">>, <<"/">>},
+            {<<":authority">>, <<"www.example.com">>},
+            {<<"cache-control">>, <<"no-cache">>}
+        ],
+        [
+            {<<":method">>, <<"GET">>},
+            {<<":scheme">>, <<"https">>},
+            {<<":path">>, <<"/index.html">>},
+            {<<":authority">>, <<"www.example.com">>},
+            {<<"custom-key">>, <<"custom-value">>}
+        ]
+    ],
+    {ok, State0} = nhttp_hpack:new(),
+    lists:foldl(
+        fun({Headers, Want}, State) ->
+            {ok, Encoded, State2} = nhttp_hpack:encode(Headers, State, Opts),
+            ?assertEqual(Want, iolist_to_binary(Encoded)),
+            State2
+        end,
+        State0,
+        lists:zip(Requests, Expected)
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% STATIC TABLE TESTS
