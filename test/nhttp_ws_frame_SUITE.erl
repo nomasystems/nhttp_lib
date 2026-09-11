@@ -16,7 +16,8 @@ all() ->
         {group, encode},
         {group, decode_raw},
         {group, frame_cap},
-        {group, helpers}
+        {group, helpers},
+        {group, partial_payload}
     ].
 
 groups() ->
@@ -58,6 +59,15 @@ groups() ->
             opcode_to_message_fragmented_rejected,
             opcode_to_message_unknown_opcode,
             opcode_to_complete_message_unknown
+        ]},
+        {partial_payload, [parallel], [
+            partial_payload_unmasked,
+            partial_payload_masked_from_offset,
+            partial_payload_16bit_length,
+            partial_payload_64bit_length,
+            partial_payload_short_header,
+            partial_payload_no_new_bytes,
+            partial_payload_stops_at_declared_length
         ]}
     ].
 
@@ -254,3 +264,43 @@ opcode_to_complete_message_unknown(_Config) ->
         {error, {unknown_opcode, 7}},
         nhttp_ws_frame:opcode_to_complete_message(7, <<>>)
     ).
+
+%%%-----------------------------------------------------------------------------
+%%% PARTIAL PAYLOAD TESTS
+%%%-----------------------------------------------------------------------------
+
+partial_payload_unmasked(_Config) ->
+    Partial = <<16#81, 10, "abc">>,
+    ?assertEqual({ok, 1, <<"abc">>}, nhttp_ws_frame:partial_payload(Partial, client, 0)),
+    ?assertEqual({ok, 1, <<"c">>}, nhttp_ws_frame:partial_payload(Partial, client, 2)).
+
+partial_payload_masked_from_offset(_Config) ->
+    Key = binary:decode_hex(<<"1cad1226">>),
+    Arrived = binary:decode_hex(<<"d217f39ba56291e8a063a7d28c2d92">>),
+    Frame = <<16#01, 16#95, Key/binary, Arrived/binary>>,
+    {ok, 1, All} = nhttp_ws_frame:partial_payload(Frame, server, 0),
+    ?assertEqual(binary:decode_hex(<<"cebae1bdb9cf83cebcceb5f4908080">>), All),
+    {ok, 1, Tail} = nhttp_ws_frame:partial_payload(Frame, server, 11),
+    ?assertEqual(<<16#F4, 16#90, 16#80, 16#80>>, Tail).
+
+partial_payload_16bit_length(_Config) ->
+    Frame = <<16#82, 126, 400:16, "xy">>,
+    ?assertEqual({ok, 2, <<"xy">>}, nhttp_ws_frame:partial_payload(Frame, client, 0)).
+
+partial_payload_64bit_length(_Config) ->
+    Frame = <<16#82, 127, 0:1, 70000:63, "xy">>,
+    ?assertEqual({ok, 2, <<"xy">>}, nhttp_ws_frame:partial_payload(Frame, client, 0)).
+
+partial_payload_short_header(_Config) ->
+    ?assertEqual(none, nhttp_ws_frame:partial_payload(<<16#81>>, client, 0)),
+    ?assertEqual(none, nhttp_ws_frame:partial_payload(<<16#81, 126, 0>>, client, 0)),
+    ?assertEqual(none, nhttp_ws_frame:partial_payload(<<16#81, 16#85, 1, 2>>, server, 0)).
+
+partial_payload_no_new_bytes(_Config) ->
+    Frame = <<16#81, 10, "abc">>,
+    ?assertEqual(none, nhttp_ws_frame:partial_payload(Frame, client, 3)),
+    ?assertEqual(none, nhttp_ws_frame:partial_payload(<<16#81, 10>>, client, 0)).
+
+partial_payload_stops_at_declared_length(_Config) ->
+    Frame = <<16#81, 2, "ab", 16#88, 0>>,
+    ?assertEqual({ok, 1, <<"ab">>}, nhttp_ws_frame:partial_payload(Frame, client, 0)).

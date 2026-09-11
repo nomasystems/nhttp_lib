@@ -99,6 +99,15 @@ decoding, and stateful fragmentation for both server and client roles.
     frag_frame_cap_refuses_before_buffering/1,
     frag_frame_cap_infinity_buffers/1,
     frag_default_max_message_size_is_finite/1,
+    partial_autobahn_6_4_3/1,
+    partial_autobahn_6_4_4/1,
+    partial_text_split_code_point_survives/1,
+    partial_text_completes_after_chops/1,
+    partial_binary_not_scanned/1,
+    partial_continuation_scanned/1,
+    partial_text_mid_fragment_not_scanned/1,
+    partial_repeat_without_new_bytes/1,
+    partial_control_frame_not_scanned/1,
     session_accessors/1,
     session_send_envelope/1,
     session_send_async_envelope/1,
@@ -124,6 +133,7 @@ all() ->
         {group, client_encoding},
         {group, client_decoding},
         {group, fragmentation},
+        {group, partial_scan},
         {group, session}
     ].
 
@@ -217,6 +227,17 @@ groups() ->
             frag_frame_cap_refuses_before_buffering,
             frag_frame_cap_infinity_buffers,
             frag_default_max_message_size_is_finite
+        ]},
+        {partial_scan, [parallel], [
+            partial_autobahn_6_4_3,
+            partial_autobahn_6_4_4,
+            partial_text_split_code_point_survives,
+            partial_text_completes_after_chops,
+            partial_binary_not_scanned,
+            partial_continuation_scanned,
+            partial_text_mid_fragment_not_scanned,
+            partial_repeat_without_new_bytes,
+            partial_control_frame_not_scanned
         ]},
         {session, [parallel], [
             session_accessors,
@@ -939,3 +960,85 @@ await_msg(Timeout) ->
     after Timeout ->
         ct:fail(no_message_received)
     end.
+
+%%%-----------------------------------------------------------------------------
+%%% PARTIAL SCAN TESTS
+%%%-----------------------------------------------------------------------------
+
+partial_autobahn_6_4_3(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(server),
+    Header = binary:decode_hex(<<"01951cad1226">>),
+    Chop1 = binary:decode_hex(<<"d217f39ba56291e8a063a7">>),
+    Chop2 = binary:decode_hex(<<"d28c2d92">>),
+    {more, _, Dec1} = nhttp_ws:decode_with_state(<<Header/binary, Chop1/binary>>, Dec0),
+    ?assertEqual(
+        {error, invalid_utf8},
+        nhttp_ws:decode_with_state(<<Header/binary, Chop1/binary, Chop2/binary>>, Dec1)
+    ).
+
+partial_autobahn_6_4_4(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(server),
+    Header = binary:decode_hex(<<"01950b5f0010">>),
+    Chop1 = binary:decode_hex(<<"c5e5e1adb29083deb791b5e4">>),
+    Chop2 = binary:decode_hex(<<"9b">>),
+    {more, _, Dec1} = nhttp_ws:decode_with_state(<<Header/binary, Chop1/binary>>, Dec0),
+    ?assertEqual(
+        {error, invalid_utf8},
+        nhttp_ws:decode_with_state(<<Header/binary, Chop1/binary, Chop2/binary>>, Dec1)
+    ).
+
+partial_text_split_code_point_survives(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {more, _, Dec1} = nhttp_ws:decode_with_state(<<16#81, 5, 16#C3>>, Dec0),
+    {more, _, Dec2} = nhttp_ws:decode_with_state(<<16#81, 5, 16#C3, 16#A9, 16#E2>>, Dec1),
+    Full = <<16#81, 5, 16#C3, 16#A9, 16#E2, 16#82>>,
+    {more, _, Dec3} = nhttp_ws:decode_with_state(Full, Dec2),
+    {ok, {text, Payload}, <<>>, _Dec4} =
+        nhttp_ws:decode_with_state(<<Full/binary, 16#AC>>, Dec3),
+    ?assertEqual(<<"é€"/utf8>>, Payload).
+
+partial_text_completes_after_chops(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {more, _, Dec1} = nhttp_ws:decode_with_state(<<16#81, 5, "he">>, Dec0),
+    {ok, {text, <<"hello">>}, <<>>, Dec2} =
+        nhttp_ws:decode_with_state(<<16#81, 5, "hello">>, Dec1),
+    {ok, {text, <<"hi">>}, <<>>, _Dec3} =
+        nhttp_ws:decode_with_state(<<16#81, 2, "hi">>, Dec2).
+
+partial_binary_not_scanned(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {more, _, Dec1} = nhttp_ws:decode_with_state(<<16#82, 4, 16#F4, 16#90>>, Dec0),
+    {ok, {binary, Payload}, <<>>, _Dec2} =
+        nhttp_ws:decode_with_state(<<16#82, 4, 16#F4, 16#90, 16#80, 16#80>>, Dec1),
+    ?assertEqual(<<16#F4, 16#90, 16#80, 16#80>>, Payload).
+
+partial_continuation_scanned(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(<<16#01, 3, "Hel">>, Dec0),
+    {more, _, Dec2} = nhttp_ws:decode_with_state(<<16#80, 4, "lo">>, Dec1),
+    ?assertEqual(
+        {error, invalid_utf8},
+        nhttp_ws:decode_with_state(<<16#80, 4, "lo", 16#C0>>, Dec2)
+    ).
+
+partial_text_mid_fragment_not_scanned(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {continue, <<>>, Dec1} = nhttp_ws:decode_with_state(<<16#01, 3, "Hel">>, Dec0),
+    {more, _, Dec2} = nhttp_ws:decode_with_state(<<16#81, 2, 16#C0>>, Dec1),
+    ?assertEqual(
+        {error, expected_continuation},
+        nhttp_ws:decode_with_state(<<16#81, 2, 16#C0, 16#AF>>, Dec2)
+    ).
+
+partial_repeat_without_new_bytes(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    Partial = <<16#81, 5, "he">>,
+    {more, N, Dec1} = nhttp_ws:decode_with_state(Partial, Dec0),
+    ?assertEqual({more, N, Dec1}, nhttp_ws:decode_with_state(Partial, Dec1)).
+
+partial_control_frame_not_scanned(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client),
+    {more, _, Dec1} = nhttp_ws:decode_with_state(<<16#89, 2, 16#C0>>, Dec0),
+    {ok, {ping, Payload}, <<>>, _Dec2} =
+        nhttp_ws:decode_with_state(<<16#89, 2, 16#C0, 16#AF>>, Dec1),
+    ?assertEqual(<<16#C0, 16#AF>>, Payload).
