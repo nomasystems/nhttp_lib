@@ -119,21 +119,20 @@ append(Name, Value, Headers) ->
 -doc "Remove every header whose name matches `Name`. Case-insensitive.".
 -spec delete(binary(), nhttp_lib:headers()) -> nhttp_lib:headers().
 delete(Name, Headers) ->
-    Lower = to_lower(Name),
-    do_delete(Lower, Headers, []).
+    lists:reverse(do_delete_rev(to_lower(Name), Headers, [])).
 
--spec do_delete(binary(), nhttp_lib:headers(), nhttp_lib:headers()) -> nhttp_lib:headers().
-do_delete(Name, [{Name, _} | Rest], Acc) ->
-    do_delete(Name, Rest, Acc);
-do_delete(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
+-spec do_delete_rev(binary(), nhttp_lib:headers(), nhttp_lib:headers()) -> nhttp_lib:headers().
+do_delete_rev(Name, [{Name, _} | Rest], Acc) ->
+    do_delete_rev(Name, Rest, Acc);
+do_delete_rev(Name, [{Stored, _} = Pair | Rest], Acc) when byte_size(Stored) =:= byte_size(Name) ->
     case name_eq(Stored, Name, byte_size(Name) - 1) of
-        true -> do_delete(Name, Rest, Acc);
-        false -> do_delete(Name, Rest, [Pair | Acc])
+        true -> do_delete_rev(Name, Rest, Acc);
+        false -> do_delete_rev(Name, Rest, [Pair | Acc])
     end;
-do_delete(Name, [Pair | Rest], Acc) ->
-    do_delete(Name, Rest, [Pair | Acc]);
-do_delete(_, [], Acc) ->
-    lists:reverse(Acc).
+do_delete_rev(Name, [Pair | Rest], Acc) ->
+    do_delete_rev(Name, Rest, [Pair | Acc]);
+do_delete_rev(_, [], Acc) ->
+    Acc.
 
 -spec do_get(binary(), nhttp_lib:headers(), Default) -> binary() | Default.
 do_get(Name, [{Name, Value} | _], _Default) ->
@@ -320,7 +319,7 @@ the headers list when no prior occurrence exists.
 -spec set(binary(), binary(), nhttp_lib:headers()) -> nhttp_lib:headers().
 set(Name, Value, Headers) ->
     Lower = to_lower(Name),
-    do_delete(Lower, Headers, []) ++ [{Lower, Value}].
+    lists:reverse(do_delete_rev(Lower, Headers, []), [{Lower, Value}]).
 
 -doc """
 Lowercase an ASCII binary using HTTP header semantics. RFC 9110 §5.1:
