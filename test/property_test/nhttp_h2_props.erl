@@ -472,3 +472,67 @@ setting_gen() ->
         {initial_window_size, int(1, 16#7fffffff)},
         {max_frame_size, int(16384, 16777215)}
     ]).
+
+-spec prop_send_within_credit() -> triq:property().
+prop_send_within_credit() ->
+    ?FORALL(
+        Ops,
+        list(flow_op_gen()),
+        begin
+            Conn0 = nhttp_h2:new(client),
+            {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+            Headers = [
+                {<<":method">>, <<"POST">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}
+            ],
+            {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, nofin),
+            Initial = 65535,
+            {Sent, StreamCredit, ConnCredit, Conn3} = lists:foldl(
+                fun(Op, Acc) -> apply_flow_op(Op, StreamId, Acc) end,
+                {0, Initial, Initial, Conn2},
+                Ops
+            ),
+            {ok, StreamWindow} = nhttp_h2:stream_send_window(Conn3, StreamId),
+            Sent =< StreamCredit andalso
+                Sent =< ConnCredit andalso
+                StreamWindow =:= StreamCredit - Sent andalso
+                nhttp_h2:connection_send_window(Conn3) =:= ConnCredit - Sent
+        end
+    ).
+
+-spec flow_op_gen() -> triq_dom:domain().
+flow_op_gen() ->
+    oneof([
+        {send, int(0, 40000)},
+        {stream_credit, int(1, 100000)},
+        {connection_credit, int(1, 100000)}
+    ]).
+
+-spec apply_flow_op(
+    {send | stream_credit | connection_credit, non_neg_integer()},
+    nhttp_lib:stream_id(),
+    {non_neg_integer(), non_neg_integer(), non_neg_integer(), nhttp_h2:conn()}
+) -> {non_neg_integer(), non_neg_integer(), non_neg_integer(), nhttp_h2:conn()}.
+apply_flow_op({send, Size}, StreamId, {Sent, StreamCredit, ConnCredit, Conn}) ->
+    Data = binary:copy(<<0>>, Size),
+    case nhttp_h2:send_data(Conn, StreamId, Data, nofin) of
+        {ok, NewConn, Frame} ->
+            {Sent + payload_size(Frame), StreamCredit, ConnCredit, NewConn};
+        {partial, NewConn, Frame, _Rest, nofin, _Window} ->
+            {Sent + payload_size(Frame), StreamCredit, ConnCredit, NewConn}
+    end;
+apply_flow_op({stream_credit, Increment}, StreamId, {Sent, StreamCredit, ConnCredit, Conn}) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
+    {ok, [{window_update, StreamId, Increment}], NewConn} =
+        nhttp_h2:recv(Conn, iolist_to_binary(Frame)),
+    {Sent, StreamCredit + Increment, ConnCredit, NewConn};
+apply_flow_op({connection_credit, Increment}, _StreamId, {Sent, StreamCredit, ConnCredit, Conn}) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(Increment),
+    {ok, [{window_update, 0, Increment}], NewConn} =
+        nhttp_h2:recv(Conn, iolist_to_binary(Frame)),
+    {Sent, StreamCredit, ConnCredit + Increment, NewConn}.
+
+-spec payload_size(iodata()) -> non_neg_integer().
+payload_size([]) ->
+    0;
+payload_size(Frame) ->
+    iolist_size(Frame) - 9.

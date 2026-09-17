@@ -96,6 +96,15 @@ Flow-control and END_STREAM ride on the DATA frame.
 ]).
 
 %%%-----------------------------------------------------------------------------
+%% STATE ACCESSORS
+%%%-----------------------------------------------------------------------------
+-export([
+    connection_send_window/1,
+    peer_settings/1,
+    stream_send_window/2
+]).
+
+%%%-----------------------------------------------------------------------------
 %% TYPE EXPORTS
 %%%-----------------------------------------------------------------------------
 -export_type([
@@ -165,6 +174,15 @@ CONTINUATION frames that carry the larger field section.
 
 -type role() :: nhttp_lib:role().
 
+-doc """
+Events that `recv/2` reports.
+
+A `window_update` event mirrors one WINDOW_UPDATE frame from the peer, with
+stream id 0 for the connection window. A SETTINGS frame that changes
+`initial_window_size` adjusts every stream send window inside the codec and
+reports `{settings, _}` only. `connection_send_window/1` and
+`stream_send_window/2` read the adjusted windows.
+""".
 -type event() ::
     nhttp_lib:event_common()
     | {stream_closed, nhttp_lib:stream_id(), error_code()}
@@ -185,15 +203,23 @@ CONTINUATION frames that carry the larger field section.
     | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
     | {error, nhttp_h2_frame:decode_error()}.
 
+-doc """
+Reasons a send function refuses a call.
+
+`{recv_window_overflow, Target}` reports that the increment given to
+`send_window_update/3` takes the local receive window of `Target` past
+2^31-1 (RFC 9113 Section 6.9.1). The codec sent nothing, the peer saw
+nothing, and the connection stays open.
+""".
 -type send_error() ::
     connection_closing
     | {unknown_stream, nhttp_lib:stream_id()}
     | {stream_closed, nhttp_lib:stream_id()}
-    | {stream_error, nhttp_lib:stream_id(), error_code(), binary()}.
+    | {stream_error, nhttp_lib:stream_id(), error_code(), binary()}
+    | {recv_window_overflow, nhttp_lib:stream_id() | connection}.
 
 -type send_result() ::
-    {ok, conn()}
-    | {ok, conn(), iodata()}
+    {ok, conn(), iodata()}
     | {partial, conn(), iodata(), binary(), fin(), Window :: integer()}
     | {error, send_error()}.
 
@@ -202,6 +228,7 @@ CONTINUATION frames that carry the larger field section.
 %%%-----------------------------------------------------------------------------
 -define(H2_DEFAULT_INITIAL_WINDOW_SIZE, 65535).
 -define(H2_MAX_WINDOW_SIZE, 16#7fffffff).
+-define(H2_MAX_STREAM_ID, 16#7fffffff).
 -define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
 -define(H2_PREFACE_LEN, 24).
 
@@ -329,7 +356,22 @@ recv(#h2_conn{buffer = Buffer} = Conn, Data) ->
 %%%-----------------------------------------------------------------------------
 %% SENDING
 %%%-----------------------------------------------------------------------------
--doc "Send DATA frame(s).".
+-doc """
+Send a DATA frame.
+
+The payload is bounded by the connection send window, the stream send
+window and the peer `max_frame_size`. A payload that fits comes back as
+`{ok, Conn, Frame}`. A payload that does not fit comes back as
+`{partial, Conn, Frame, Rest, EndStream, Window}`, where `Frame` carries the
+prefix that fit and `Rest` is the remainder the caller must offer again
+after WINDOW_UPDATE.
+
+An empty payload with `fin` is sent at any window value, because a frame
+without payload consumes no flow-control credit (RFC 9113 Section 6.9.1).
+An empty payload with `nofin` at a window of zero or below is held back as
+`{partial, ...}`. The frame is legal, but it carries nothing, so the codec
+declines to spend a frame on it.
+""".
 -spec send_data(conn(), nhttp_lib:stream_id(), iodata(), fin()) -> send_result().
 send_data(#h2_conn{} = Conn, StreamId, Data, EndStream) ->
     case validate_send_data(Conn, StreamId) of
@@ -351,7 +393,8 @@ send_goaway(#h2_conn{last_peer_stream_id = LastStreamId} = Conn, ErrorCode, Debu
     {ok, NewConn, Frame}.
 
 -doc "Send HEADERS frame for a new request/response or trailers.".
--spec send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) -> send_result().
+-spec send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) ->
+    {ok, conn(), iodata()} | {error, send_error()}.
 send_headers(#h2_conn{} = Conn, StreamId, Headers, EndStream) ->
     case validate_send_headers(Conn, StreamId) of
         ok ->
@@ -377,26 +420,45 @@ send_rst_stream(#h2_conn{} = Conn, StreamId, ErrorCode) ->
     NewConn = close_stream(Conn, StreamId),
     {ok, NewConn, Frame}.
 
--doc "Send WINDOW_UPDATE for connection or stream.".
+-doc """
+Send WINDOW_UPDATE for the connection or for a stream.
+
+The increment is added to the local receive window. An increment that takes
+that window past 2^31-1 is refused as `{recv_window_overflow, Target}` and
+nothing is sent (RFC 9113 Section 6.9.1). A stream that the codec no longer
+tracks answers `{ok, Conn, []}`: the stream closed, no credit is owed, and
+the peer ignores a frame on a closed stream (RFC 9113 Section 5.1).
+""".
 -spec send_window_update(conn(), nhttp_lib:stream_id() | connection, pos_integer()) ->
     send_result().
-send_window_update(#h2_conn{} = Conn, connection, Increment) when
+send_window_update(#h2_conn{recv_window = RecvWindow} = Conn, connection, Increment) when
     Increment > 0, Increment =< ?H2_MAX_WINDOW_SIZE
 ->
-    {ok, Frame} = nhttp_h2_frame:window_update(Increment),
-    NewConn = Conn#h2_conn{recv_window = Conn#h2_conn.recv_window + Increment},
-    {ok, NewConn, Frame};
+    NewWindow = RecvWindow + Increment,
+    case NewWindow > ?H2_MAX_WINDOW_SIZE of
+        true ->
+            {error, {recv_window_overflow, connection}};
+        false ->
+            {ok, Frame} = nhttp_h2_frame:window_update(Increment),
+            {ok, Conn#h2_conn{recv_window = NewWindow}, Frame}
+    end;
 send_window_update(#h2_conn{streams = Streams} = Conn, StreamId, Increment) when
     Increment > 0, Increment =< ?H2_MAX_WINDOW_SIZE
 ->
     case maps:get(StreamId, Streams, undefined) of
         undefined ->
-            {error, {stream_error, StreamId, protocol_error, <<"Unknown stream">>}};
+            {ok, Conn, []};
         #h2_stream{recv_window = RecvWindow} = Stream ->
-            {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
-            NewStream = Stream#h2_stream{recv_window = RecvWindow + Increment},
-            NewConn = Conn#h2_conn{streams = Streams#{StreamId => NewStream}},
-            {ok, NewConn, Frame}
+            NewWindow = RecvWindow + Increment,
+            case NewWindow > ?H2_MAX_WINDOW_SIZE of
+                true ->
+                    {error, {recv_window_overflow, StreamId}};
+                false ->
+                    {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
+                    NewStream = Stream#h2_stream{recv_window = NewWindow},
+                    NewConn = Conn#h2_conn{streams = Streams#{StreamId => NewStream}},
+                    {ok, NewConn, Frame}
+            end
     end.
 
 %%%-----------------------------------------------------------------------------
@@ -411,13 +473,23 @@ check_peer_max_streams(ActiveCount, PeerSettings) ->
         _ -> ok
     end.
 
--doc "Open a new stream and return its ID.".
+-doc """
+Open a new stream and return its ID.
+
+Stream identifiers grow by two per stream and end at 2^31-1. When the next
+identifier is past that bound, the call answers `{error, stream_ids_exhausted}`
+and leaves the connection unchanged. The caller must open a new connection
+for further requests (RFC 9113 Section 5.1.1).
+""".
 -spec open_stream(conn()) ->
-    {ok, nhttp_lib:stream_id(), conn()} | {error, connection_closing | max_streams_reached}.
+    {ok, nhttp_lib:stream_id(), conn()}
+    | {error, connection_closing | max_streams_reached | stream_ids_exhausted}.
 open_stream(#h2_conn{goaway_sent = true}) ->
     {error, connection_closing};
 open_stream(#h2_conn{goaway_received = true}) ->
     {error, connection_closing};
+open_stream(#h2_conn{next_stream_id = StreamId}) when StreamId > ?H2_MAX_STREAM_ID ->
+    {error, stream_ids_exhausted};
 open_stream(
     #h2_conn{
         next_stream_id = StreamId,
@@ -477,6 +549,51 @@ stream_stats(#h2_conn{
     peer_streams_reset = Reset
 }) ->
     #{active => Active, peer_opened => Opened, peer_reset => Reset}.
+
+%%%-----------------------------------------------------------------------------
+%% STATE ACCESSORS
+%%%-----------------------------------------------------------------------------
+-doc """
+Return the connection send window in octets.
+
+This is the credit the peer granted for DATA payloads on every stream of the
+connection, less what `send_data/4` spent (RFC 9113 Section 6.9.1). The
+value is negative after a SETTINGS_INITIAL_WINDOW_SIZE shrink that overtakes
+the credit already spent, and `send_data/4` sends nothing until WINDOW_UPDATE
+takes it positive again.
+""".
+-spec connection_send_window(conn()) -> integer().
+connection_send_window(#h2_conn{send_window = Window}) ->
+    Window.
+
+-doc """
+Return the settings the peer sent, merged over the defaults.
+
+The map carries the last value of every SETTINGS parameter the peer sent,
+and the default of RFC 9113 Section 6.5.2 for the rest. `initial_window_size`
+is the send window that a new stream starts with, and `max_frame_size` bounds
+the payload of one DATA frame.
+""".
+-spec peer_settings(conn()) -> settings().
+peer_settings(#h2_conn{peer_settings = Settings}) ->
+    Settings.
+
+-doc """
+Return the send window of one stream in octets.
+
+The value is the credit the peer granted for DATA payloads on that stream,
+less what `send_data/4` spent (RFC 9113 Section 6.9.1). A stream that
+`open_stream/1` created and `send_headers/4` has not yet moved out of `idle`
+carries a window too, and a SETTINGS_INITIAL_WINDOW_SIZE change reaches it.
+A stream the codec does not track answers `{error, {unknown_stream, Id}}`.
+""".
+-spec stream_send_window(conn(), nhttp_lib:stream_id()) ->
+    {ok, integer()} | {error, {unknown_stream, nhttp_lib:stream_id()}}.
+stream_send_window(#h2_conn{streams = Streams}, StreamId) ->
+    case Streams of
+        #{StreamId := #h2_stream{send_window = Window}} -> {ok, Window};
+        #{} -> {error, {unknown_stream, StreamId}}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
@@ -704,34 +821,26 @@ derived_continuation_bound(Settings) ->
     end.
 
 -spec do_send_data(conn(), nhttp_lib:stream_id(), iodata(), fin()) -> send_result().
+do_send_data(#h2_conn{streams = Streams} = Conn, StreamId, Data, EndStream) ->
+    Stream = maps:get(StreamId, Streams),
+    do_send_data(Conn, Stream, Data, iolist_size(Data), EndStream).
+
+-spec do_send_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin()) -> send_result().
+do_send_data(Conn, Stream, Data, 0, fin) ->
+    emit_data(Conn, Stream, Data, 0, fin);
 do_send_data(
     #h2_conn{streams = Streams, send_window = ConnWindow, peer_settings = PeerSettings} = Conn,
-    StreamId,
+    #h2_stream{id = StreamId, send_window = StreamWindow} = Stream,
     Data,
+    DataSize,
     EndStream
 ) ->
-    #h2_stream{send_window = StreamWindow} = Stream = maps:get(StreamId, Streams),
-    DataSize = iolist_size(Data),
     EffectiveWindow = min(ConnWindow, StreamWindow),
     MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_DEFAULT_MAX_FRAME_SIZE),
     MaxSend = min(EffectiveWindow, MaxFrameSize),
     case DataSize =< MaxSend of
         true when EffectiveWindow > 0 ->
-            {ok, Frame} = nhttp_h2_frame:data(StreamId, EndStream, Data),
-            OldState = Stream#h2_stream.state,
-            NewState = transition_on_send_end_stream(OldState, EndStream),
-            NewStream = Stream#h2_stream{
-                state = NewState,
-                send_window = StreamWindow - DataSize
-            },
-            ActiveCount = Conn#h2_conn.active_stream_count,
-            NewActiveCount = update_active_count_on_transition(OldState, NewState, ActiveCount),
-            NewConn = Conn#h2_conn{
-                streams = store_or_remove_stream(Streams, StreamId, NewStream),
-                send_window = ConnWindow - DataSize,
-                active_stream_count = NewActiveCount
-            },
-            {ok, NewConn, Frame};
+            emit_data(Conn, Stream, Data, DataSize, EndStream);
         true when EffectiveWindow =< 0 ->
             {partial, Conn, [], <<>>, EndStream, EffectiveWindow};
         false when MaxSend > 0 ->
@@ -750,7 +859,32 @@ do_send_data(
             {partial, Conn, [], iolist_to_binary(Data), EndStream, EffectiveWindow}
     end.
 
--spec do_send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) -> send_result().
+-spec emit_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin()) ->
+    {ok, conn(), iodata()}.
+emit_data(
+    #h2_conn{streams = Streams, send_window = ConnWindow, active_stream_count = ActiveCount} =
+        Conn,
+    #h2_stream{id = StreamId, state = OldState, send_window = StreamWindow} = Stream,
+    Data,
+    DataSize,
+    EndStream
+) ->
+    {ok, Frame} = nhttp_h2_frame:data(StreamId, EndStream, Data),
+    NewState = transition_on_send_end_stream(OldState, EndStream),
+    NewStream = Stream#h2_stream{
+        state = NewState,
+        send_window = StreamWindow - DataSize
+    },
+    NewActiveCount = update_active_count_on_transition(OldState, NewState, ActiveCount),
+    NewConn = Conn#h2_conn{
+        streams = store_or_remove_stream(Streams, StreamId, NewStream),
+        send_window = ConnWindow - DataSize,
+        active_stream_count = NewActiveCount
+    },
+    {ok, NewConn, Frame}.
+
+-spec do_send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) ->
+    {ok, conn(), iodata()}.
 do_send_headers(
     #h2_conn{hpack_enc = HpackEnc, streams = Streams, peer_settings = PeerSettings} = Conn,
     StreamId,
@@ -976,6 +1110,13 @@ process_frame(
         _ ->
             {ok, Conn, [], []}
     end;
+process_frame(
+    #h2_conn{role = client, next_stream_id = NextId},
+    {window_update, StreamId, _Increment}
+) when StreamId band 1 =:= 0; StreamId >= NextId ->
+    {error,
+        {connection_error, protocol_error,
+            <<"WINDOW_UPDATE on idle stream (RFC 9113 Section 5.1)">>}};
 process_frame(#h2_conn{} = Conn, {settings, Settings}) ->
     process_settings(Conn, Settings);
 process_frame(#h2_conn{settings_acked = false} = Conn, settings_ack) ->
@@ -1120,40 +1261,52 @@ process_settings(#h2_conn{peer_settings = OldSettings, streams = Streams} = Conn
                 ),
                 UpdatedEnc
         end,
-    {NewStreams, WindowEvents} =
+    Delta =
         case maps:get(initial_window_size, NewSettings, undefined) of
             undefined ->
-                {Streams, []};
+                0;
             NewInitialWindow ->
-                OldInitialWindow = maps:get(
-                    initial_window_size, OldSettings, ?H2_DEFAULT_INITIAL_WINDOW_SIZE
-                ),
-                Delta = NewInitialWindow - OldInitialWindow,
-                UpdatedStreams = maps:map(
-                    fun(_Id, Stream) ->
-                        Stream#h2_stream{
-                            send_window = Stream#h2_stream.send_window + Delta
-                        }
-                    end,
-                    Streams
-                ),
-                Events =
-                    case Delta > 0 of
-                        true ->
-                            [{window_update, Id, Delta} || Id <- maps:keys(Streams)];
-                        false ->
-                            []
-                    end,
-                {UpdatedStreams, Events}
+                NewInitialWindow -
+                    maps:get(initial_window_size, OldSettings, ?H2_DEFAULT_INITIAL_WINDOW_SIZE)
         end,
-    NewConn = Conn#h2_conn{
-        peer_settings = MergedSettings,
-        streams = NewStreams,
-        hpack_enc = NewHpackEnc,
-        state = open
-    },
-    {ok, AckFrame} = nhttp_h2_frame:settings_ack(),
-    {ok, NewConn, [{settings, NewSettings}] ++ WindowEvents, AckFrame}.
+    maybe
+        {ok, NewStreams} ?= adjust_stream_windows(Streams, Delta),
+        NewConn = Conn#h2_conn{
+            peer_settings = MergedSettings,
+            streams = NewStreams,
+            hpack_enc = NewHpackEnc,
+            state = open
+        },
+        {ok, AckFrame} = nhttp_h2_frame:settings_ack(),
+        {ok, NewConn, [{settings, NewSettings}], AckFrame}
+    end.
+
+-spec adjust_stream_windows(#{nhttp_lib:stream_id() => #h2_stream{}}, integer()) ->
+    {ok, #{nhttp_lib:stream_id() => #h2_stream{}}} | {error, nhttp_h2_frame:decode_error()}.
+adjust_stream_windows(Streams, 0) ->
+    {ok, Streams};
+adjust_stream_windows(Streams, Delta) ->
+    adjust_stream_windows(maps:next(maps:iterator(Streams)), Delta, Streams).
+
+-spec adjust_stream_windows(
+    {nhttp_lib:stream_id(), #h2_stream{}, maps:iterator(nhttp_lib:stream_id(), #h2_stream{})}
+    | none,
+    integer(),
+    #{nhttp_lib:stream_id() => #h2_stream{}}
+) -> {ok, #{nhttp_lib:stream_id() => #h2_stream{}}} | {error, nhttp_h2_frame:decode_error()}.
+adjust_stream_windows(none, _Delta, Streams) ->
+    {ok, Streams};
+adjust_stream_windows({StreamId, #h2_stream{send_window = Window} = Stream, Iter}, Delta, Streams) ->
+    NewWindow = Window + Delta,
+    case NewWindow > ?H2_MAX_WINDOW_SIZE of
+        true ->
+            {error,
+                {connection_error, flow_control_error,
+                    <<"Stream window overflow on SETTINGS_INITIAL_WINDOW_SIZE (RFC 9113 Section 6.9.2)">>}};
+        false ->
+            NewStream = Stream#h2_stream{send_window = NewWindow},
+            adjust_stream_windows(maps:next(Iter), Delta, Streams#{StreamId := NewStream})
+    end.
 
 -spec rapid_reset_error() -> {error, nhttp_h2_frame:decode_error()}.
 rapid_reset_error() ->
