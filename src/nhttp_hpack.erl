@@ -63,7 +63,8 @@ reads a fresh value from the wire.
         check_name/1,
         check_value/1,
         first_invalid/2,
-        name_verdict/1
+        name_verdict/1,
+        remove_if_seq/3
     ]}
 ).
 
@@ -189,6 +190,13 @@ from the wire therefore reads `{invalid_value, _}` as `valid`.
     name_index = #{} :: #{binary() => non_neg_integer()}
 }).
 
+-doc """
+The dynamic table of one HPACK endpoint.
+
+`full_index` and `name_index` hold keys for live entries only. An eviction
+removes the keys that bind to the evicted sequence, so the two indexes stay
+bounded by the table size.
+""".
 -opaque state() :: #hpack{}.
 
 %%%-----------------------------------------------------------------------------
@@ -436,17 +444,21 @@ evict_to_size(
     State = #hpack{
         size = Size,
         oldest_seq = OldestSeq,
-        entries = Entries
+        entries = Entries,
+        full_index = FullIndex,
+        name_index = NameIndex
     }
 ) ->
     case maps:get(OldestSeq, Entries, undefined) of
         undefined ->
             State;
-        #entry{size = EntrySize} ->
+        #entry{size = EntrySize, field = {Name, _} = Header} ->
             NewState = State#hpack{
                 size = Size - EntrySize,
                 oldest_seq = OldestSeq + 1,
-                entries = maps:remove(OldestSeq, Entries)
+                entries = maps:remove(OldestSeq, Entries),
+                full_index = remove_if_seq(Header, OldestSeq, FullIndex),
+                name_index = remove_if_seq(Name, OldestSeq, NameIndex)
             },
             evict_to_size(TargetSize, NewState)
     end.
@@ -801,6 +813,22 @@ maybe_emit_table_size_update(State0 = #hpack{configured_max_size = MaxSize}) ->
 -spec name_verdict(verdict()) -> verdict().
 name_verdict({invalid_value, _}) -> valid;
 name_verdict(Verdict) -> Verdict.
+
+-doc """
+Remove `Key` from `Index` when the index still binds it to `Seq`.
+
+A later insertion of the same header or of the same name rebinds the key to a
+newer sequence. That binding must survive the eviction of the older entry.
+""".
+-spec remove_if_seq(Key, non_neg_integer(), #{Key => non_neg_integer()}) ->
+    #{Key => non_neg_integer()}
+when
+    Key :: binary() | {binary(), binary()}.
+remove_if_seq(Key, Seq, Index) ->
+    case Index of
+        #{Key := Seq} -> maps:remove(Key, Index);
+        #{} -> Index
+    end.
 
 -spec push_header(
     {binary(), binary()},

@@ -482,3 +482,70 @@ encode_varint(N) when N < 128 ->
     <<N:8>>;
 encode_varint(N) ->
     <<(16#80 bor (N band 16#7F)):8, (encode_varint(N bsr 7))/binary>>.
+
+%% Every key in the two reverse indexes of the dynamic table names a live entry,
+%% after any sequence of insertions and after a table size update.
+-spec prop_index_maps_hold_live_entries_only() -> triq:property().
+prop_index_maps_hold_live_entries_only() ->
+    Positions = #{hpack => record_positions(hpack), entry => record_positions(entry)},
+    ?FORALL(
+        {MaxSize, NewSize, HeadersList},
+        {int(64, 512), int(0, 512), non_empty(list(headers_gen()))},
+        begin
+            {ok, State0} = nhttp_hpack:new(MaxSize),
+            index_maps_live(lists:sublist(HeadersList, 20), NewSize, State0, Positions)
+        end
+    ).
+
+-spec index_maps_live(
+    [[{binary(), binary()}]], non_neg_integer(), nhttp_hpack:state(), map()
+) -> boolean().
+index_maps_live([], NewSize, State, Positions) ->
+    {ok, State1} = nhttp_hpack:set_max_table_size(NewSize, State),
+    index_maps_are_live(State1, Positions);
+index_maps_live([Headers | Tail], NewSize, State, Positions) ->
+    {ok, _, State1} = nhttp_hpack:encode(Headers, State),
+    index_maps_are_live(State1, Positions) andalso
+        index_maps_live(Tail, NewSize, State1, Positions).
+
+-spec index_maps_are_live(nhttp_hpack:state(), map()) -> boolean().
+index_maps_are_live(State, #{hpack := Hpack, entry := Entry}) ->
+    Entries = element(maps:get(entries, Hpack), State),
+    FieldPosition = maps:get(field, Entry),
+    FullIndex = element(maps:get(full_index, Hpack), State),
+    NameIndex = element(maps:get(name_index, Hpack), State),
+    FullLive = maps:filter(
+        fun(Header, Seq) -> live_field(Seq, Entries, FieldPosition) =/= Header end,
+        FullIndex
+    ),
+    NameLive = maps:filter(
+        fun(Name, Seq) ->
+            case live_field(Seq, Entries, FieldPosition) of
+                {Name, _} -> false;
+                _ -> true
+            end
+        end,
+        NameIndex
+    ),
+    map_size(FullLive) =:= 0 andalso map_size(NameLive) =:= 0.
+
+-spec live_field(non_neg_integer(), map(), pos_integer()) -> {binary(), binary()} | evicted.
+live_field(Seq, Entries, FieldPosition) ->
+    case maps:get(Seq, Entries, evicted) of
+        evicted -> evicted;
+        Entry -> element(FieldPosition, Entry)
+    end.
+
+-spec record_positions(atom()) -> #{atom() => pos_integer()}.
+record_positions(Record) ->
+    Beam = filename:join([code:lib_dir(nhttp_lib), "ebin", "nhttp_hpack.beam"]),
+    {ok, {nhttp_hpack, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
+        beam_lib:chunks(Beam, [abstract_code]),
+    [Fields] = [Fs || {attribute, _, record, {R, Fs}} <- Forms, R =:= Record],
+    Names = [record_field_name(Field) || Field <- Fields],
+    maps:from_list(lists:zip(Names, lists:seq(2, length(Names) + 1))).
+
+-spec record_field_name(tuple()) -> atom().
+record_field_name({typed_record_field, Field, _Type}) -> record_field_name(Field);
+record_field_name({record_field, _, {atom, _, Name}}) -> Name;
+record_field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.

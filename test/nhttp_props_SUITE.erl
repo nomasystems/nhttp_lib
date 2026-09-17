@@ -80,7 +80,8 @@ groups() ->
             hpack_huffman_random_no_crash,
             hpack_malformed_index_no_crash,
             hpack_bounded_after_error,
-            hpack_encode_lowercases_names
+            hpack_encode_lowercases_names,
+            hpack_index_maps_hold_live_entries_only
         ]},
         {h1_props, [parallel], [
             h1_request_roundtrip,
@@ -319,6 +320,9 @@ hpack_bounded_after_error(Config) ->
 
 hpack_encode_lowercases_names(Config) ->
     run_property(nhttp_hpack_props, prop_encode_lowercases_names, Config).
+
+hpack_index_maps_hold_live_entries_only(Config) ->
+    run_property(nhttp_hpack_props, prop_index_maps_hold_live_entries_only, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% HTTP/1.1 PROPERTY TESTS
