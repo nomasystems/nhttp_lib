@@ -45,7 +45,8 @@ groups() ->
         ]},
         {section_4_frames, [parallel], [
             interleaved_frame_during_continuation_is_connection_error,
-            unknown_frame_type_discarded
+            unknown_frame_type_discarded,
+            send_data_frames_stay_under_peer_max_frame_size
         ]},
         {section_5_streams, [parallel], [
             data_on_idle_stream_is_connection_error,
@@ -904,6 +905,40 @@ h2_reset_rounds(Conn, BaseId, N) ->
         {ok, _, Conn1, _} -> h2_reset_rounds(Conn1, BaseId + 2, N - 1);
         {error, Reason} -> {refused, (BaseId + 1) div 2, Reason}
     end.
+
+-doc """
+No emitted DATA frame exceeds SETTINGS_MAX_FRAME_SIZE, at the raised value
+and again after the peer sets it back (RFC 9113 Section 4.2).
+""".
+send_data_frames_stay_under_peer_max_frame_size(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, S1} = nhttp_h2_frame:settings(#{max_frame_size => 32768, initial_window_size => 200000}),
+    {ok, [{settings, _}], Conn2, _} = nhttp_h2:recv(Conn1, iolist_to_binary(S1)),
+    {ok, Wu} = nhttp_h2_frame:window_update(200000),
+    {ok, [{window_update, 0, 200000}], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Wu)),
+    {ok, Conn4, _} = nhttp_h2:send_headers(Conn3, StreamId, minimal_request_headers(), nofin),
+    Wide = binary:copy(<<1>>, 70000),
+    {ok, Conn5, WideFrames} = nhttp_h2:send_data(Conn4, StreamId, Wide, nofin),
+    WideDecoded = decode_data_frames(iolist_to_binary(WideFrames), 32768),
+    ?assertEqual([32768, 32768, 4464], [byte_size(P) || {_, _, P} <- WideDecoded]),
+    ?assertEqual(Wide, iolist_to_binary([P || {_, _, P} <- WideDecoded])),
+    {ok, S2} = nhttp_h2_frame:settings(#{max_frame_size => 16384}),
+    {ok, [{settings, _}], Conn6, _} = nhttp_h2:recv(Conn5, iolist_to_binary(S2)),
+    Narrow = binary:copy(<<2>>, 40000),
+    {ok, _Conn7, NarrowFrames} = nhttp_h2:send_data(Conn6, StreamId, Narrow, fin),
+    NarrowDecoded = decode_data_frames(iolist_to_binary(NarrowFrames), 16384),
+    ?assertEqual([16384, 16384, 7232], [byte_size(P) || {_, _, P} <- NarrowDecoded]),
+    ?assertEqual([nofin, nofin, fin], [Fin || {_, Fin, _} <- NarrowDecoded]),
+    ?assertEqual(Narrow, iolist_to_binary([P || {_, _, P} <- NarrowDecoded])),
+    ok.
+
+decode_data_frames(<<>>, _MaxFrameSize) ->
+    [];
+decode_data_frames(Bin, MaxFrameSize) ->
+    {ok, {data, StreamId, Fin, Payload}, Consumed} = nhttp_h2_frame:decode(Bin, MaxFrameSize),
+    <<_:Consumed/binary, Rest/binary>> = Bin,
+    [{StreamId, Fin, Payload} | decode_data_frames(Rest, MaxFrameSize)].
 
 server_with_preface() ->
     Conn0 = nhttp_h2:new(server),

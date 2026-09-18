@@ -45,23 +45,29 @@ prop_data_roundtrip() ->
             {ok, ClientConn2, HeaderFrame} = nhttp_h2:send_headers(
                 ClientConn1, StreamId, Headers, nofin
             ),
-            case nhttp_h2:send_data(ClientConn2, StreamId, Data, fin) of
-                {ok, _ClientConn3, DataFrame} ->
-                    ServerConn0 = nhttp_h2:new(server),
-                    {ok, ClientPreface} = nhttp_h2_frame:preface(),
-                    HeaderData = <<ClientPreface/binary, (iolist_to_binary(HeaderFrame))/binary>>,
-                    {ok, _, ServerConn1} = nhttp_h2:recv(ServerConn0, HeaderData),
-                    case nhttp_h2:recv(ServerConn1, iolist_to_binary(DataFrame)) of
-                        {ok, [{data, StreamId, RecvData, fin}], _} ->
-                            iolist_to_binary(Data) =:= RecvData;
-                        _ ->
-                            false
-                    end;
-                {partial, _, _, _, _, _} ->
-                    true
+            {ok, _ClientConn3, DataFrames} = nhttp_h2:send_data(ClientConn2, StreamId, Data, fin),
+            ServerConn0 = nhttp_h2:new(server),
+            {ok, ClientPreface} = nhttp_h2_frame:preface(),
+            HeaderData = <<ClientPreface/binary, (iolist_to_binary(HeaderFrame))/binary>>,
+            {ok, _, ServerConn1} = nhttp_h2:recv(ServerConn0, HeaderData),
+            case nhttp_h2:recv(ServerConn1, iolist_to_binary(DataFrames)) of
+                {ok, Events, _} ->
+                    data_events_carry(Events, StreamId, Data);
+                {ok, Events, _, _} ->
+                    data_events_carry(Events, StreamId, Data);
+                _ ->
+                    false
             end
         end
     ).
+
+-spec data_events_carry([nhttp_h2:event()], nhttp_lib:stream_id(), binary()) -> boolean().
+data_events_carry(Events, StreamId, Data) ->
+    Fins = [Fin || {data, Id, _, Fin} <- Events, Id =:= StreamId],
+    Payloads = [Payload || {data, Id, Payload, _} <- Events, Id =:= StreamId],
+    length(Events) =:= length(Fins) andalso
+        Fins =:= lists:duplicate(length(Fins) - 1, nofin) ++ [fin] andalso
+        iolist_to_binary(Payloads) =:= Data.
 
 -spec prop_request_response_roundtrip() -> triq:property().
 prop_request_response_roundtrip() ->
@@ -452,7 +458,7 @@ header_value_char_gen() ->
 data_gen() ->
     ?LET(
         Size,
-        int(0, 10000),
+        int(0, 65535),
         binary(Size)
     ).
 
@@ -532,7 +538,143 @@ apply_flow_op({connection_credit, Increment}, _StreamId, {Sent, StreamCredit, Co
     {Sent, StreamCredit, ConnCredit + Increment, NewConn}.
 
 -spec payload_size(iodata()) -> non_neg_integer().
-payload_size([]) ->
-    0;
-payload_size(Frame) ->
-    iolist_size(Frame) - 9.
+payload_size(Frames) ->
+    lists:sum([byte_size(Payload) || {_, _, Payload} <- decode_data_frames(Frames)]).
+
+-spec prop_send_data_conserves_body() -> triq:property().
+prop_send_data_conserves_body() ->
+    ?FORALL(
+        {{Parent, Body}, ConnCredit, StreamCredit},
+        {body_gen(), int(0, 100000), int(0, 100000)},
+        begin
+            Conn0 = nhttp_h2:new(client),
+            {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+            Headers = [
+                {<<":method">>, <<"POST">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}
+            ],
+            {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, nofin),
+            {_, _, _, Conn3} = apply_flow_op(
+                {connection_credit, ConnCredit + 1}, StreamId, {0, 0, 0, Conn2}
+            ),
+            {_, _, _, Conn4} = apply_flow_op(
+                {stream_credit, StreamCredit + 1}, StreamId, {0, 0, 0, Conn3}
+            ),
+            Window = min(65536 + ConnCredit, 65536 + StreamCredit),
+            Size = byte_size(Parent),
+            case nhttp_h2:send_data(Conn4, StreamId, Body, fin) of
+                {ok, _, Frames} ->
+                    Decoded = decode_data_frames(Frames),
+                    Size =< Window andalso
+                        length(Decoded) =:= max(1, ceil_div(Size, 16384)) andalso
+                        fins(Decoded) =:= lists:duplicate(length(Decoded) - 1, nofin) ++ [fin] andalso
+                        payloads(Decoded) =:= Parent andalso
+                        shares_parent(Frames, Parent);
+                {partial, _, Frames, Rest, fin, 0} ->
+                    Decoded = decode_data_frames(Frames),
+                    Payloads = payloads(Decoded),
+                    Size > Window andalso
+                        length(Decoded) =:= ceil_div(Window, 16384) andalso
+                        fins(Decoded) =:= lists:duplicate(length(Decoded), nofin) andalso
+                        byte_size(Payloads) =:= Window andalso
+                        <<Payloads/binary, Rest/binary>> =:= Parent andalso
+                        shares_parent(Frames, Parent) andalso
+                        remainder_retention(Rest, Parent, Body)
+            end
+        end
+    ).
+
+-spec body_gen() -> triq_dom:domain().
+body_gen() ->
+    ?LET(
+        {Size, Seed, Cuts, Form},
+        {int(0, 150000), int(0, 255), list(int(0, 150000)), oneof([binary, flat, nested])},
+        begin
+            Parent = numbered_parent(Size, Seed),
+            {Parent, body_form(Form, Parent, lists:usort([Cut || Cut <- Cuts, Cut < Size]))}
+        end
+    ).
+
+-spec numbered_parent(non_neg_integer(), 0..255) -> binary().
+numbered_parent(Size, Seed) ->
+    Pattern = list_to_binary([(Seed + I) rem 256 || I <- lists:seq(0, 255)]),
+    binary:copy(binary:part(binary:copy(Pattern, Size div 256 + 1), 0, Size)).
+
+-spec body_form(binary | flat | nested, binary(), [non_neg_integer()]) -> iodata().
+body_form(binary, Parent, _Cuts) ->
+    Parent;
+body_form(flat, Parent, Cuts) ->
+    pieces(Parent, Cuts);
+body_form(nested, Parent, Cuts) ->
+    [nest(Piece) || Piece <- pieces(Parent, Cuts)].
+
+-spec pieces(binary(), [non_neg_integer()]) -> [binary()].
+pieces(Parent, Cuts) ->
+    Bounds = lists:zip([0 | Cuts], Cuts ++ [byte_size(Parent)]),
+    [binary:part(Parent, From, To - From) || {From, To} <- Bounds].
+
+-spec nest(binary()) -> iodata().
+nest(Piece) when byte_size(Piece) =< 8 ->
+    binary_to_list(Piece);
+nest(Piece) ->
+    [[Piece]].
+
+-spec ceil_div(non_neg_integer(), pos_integer()) -> non_neg_integer().
+ceil_div(N, D) ->
+    (N + D - 1) div D.
+
+-spec decode_data_frames(iodata()) -> [{nhttp_lib:stream_id(), nhttp_h2:fin(), binary()}].
+decode_data_frames(Frames) ->
+    decode_data_frames_bin(iolist_to_binary(Frames)).
+
+-spec decode_data_frames_bin(binary()) -> [{nhttp_lib:stream_id(), nhttp_h2:fin(), binary()}].
+decode_data_frames_bin(<<>>) ->
+    [];
+decode_data_frames_bin(Bin) ->
+    {ok, {data, StreamId, Fin, Payload}, Consumed} = nhttp_h2_frame:decode(Bin),
+    <<_:Consumed/binary, Rest/binary>> = Bin,
+    [{StreamId, Fin, Payload} | decode_data_frames_bin(Rest)].
+
+-spec fins([{nhttp_lib:stream_id(), nhttp_h2:fin(), binary()}]) -> [nhttp_h2:fin()].
+fins(Decoded) ->
+    [Fin || {_, Fin, _} <- Decoded].
+
+-spec payloads([{nhttp_lib:stream_id(), nhttp_h2:fin(), binary()}]) -> binary().
+payloads(Decoded) ->
+    iolist_to_binary([Payload || {_, _, Payload} <- Decoded]).
+
+-spec shares_parent(iodata(), binary()) -> boolean().
+shares_parent(Frames, Parent) ->
+    lists:all(
+        fun(Bin) -> binary:referenced_byte_size(Bin) =:= byte_size(Parent) end,
+        [Bin || Bin <- binaries(Frames, []), byte_size(Bin) > 64]
+    ).
+
+-spec binaries(iodata(), [binary()]) -> [binary()].
+binaries(Bin, Acc) when is_binary(Bin) ->
+    [Bin | Acc];
+binaries([Head | Tail], Acc) ->
+    binaries(Tail, binaries(Head, Acc));
+binaries([], Acc) ->
+    Acc;
+binaries(Byte, Acc) when is_integer(Byte) ->
+    Acc.
+
+-spec remainder_retention(binary(), binary(), iodata()) -> boolean().
+remainder_retention(Rest, Parent, Body) ->
+    RestSize = byte_size(Rest),
+    ParentSize = byte_size(Parent),
+    Referenced = binary:referenced_byte_size(Rest),
+    if
+        RestSize =< 64 ->
+            Referenced =:= own_size(Rest);
+        ParentSize > 4 * RestSize ->
+            Referenced =:= own_size(Rest);
+        is_binary(Body) ->
+            Referenced =:= ParentSize;
+        true ->
+            Referenced =:= own_size(Rest) orelse Referenced =:= ParentSize
+    end.
+
+-spec own_size(binary()) -> non_neg_integer().
+own_size(Bin) ->
+    binary:referenced_byte_size(binary:copy(Bin)).

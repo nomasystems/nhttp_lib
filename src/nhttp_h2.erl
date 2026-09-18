@@ -55,6 +55,7 @@ Flow-control and END_STREAM ride on the DATA frame.
 -compile({inline, [is_active_state/1]}).
 -compile({inline, [is_peer_initiated/2]}).
 -compile({inline, [update_peer_opened_count/5]}).
+-compile({inline, [frames/2]}).
 -compile({inline, [transition_on_recv_end_stream/2]}).
 -compile({inline, [transition_on_send_end_stream/2]}).
 
@@ -231,6 +232,8 @@ nothing, and the connection stays open.
 -define(H2_MAX_STREAM_ID, 16#7fffffff).
 -define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
 -define(H2_PREFACE_LEN, 24).
+-define(H2_HEAP_BINARY_LIMIT, 64).
+-define(H2_REMAINDER_RETENTION_RATIO, 4).
 
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS (RFC 9113 SECTION 6.5.2)
@@ -357,14 +360,22 @@ recv(#h2_conn{buffer = Buffer} = Conn, Data) ->
 %% SENDING
 %%%-----------------------------------------------------------------------------
 -doc """
-Send a DATA frame.
+Send every DATA frame that the current credit allows.
 
-The payload is bounded by the connection send window, the stream send
-window and the peer `max_frame_size`. A payload that fits comes back as
-`{ok, Conn, Frame}`. A payload that does not fit comes back as
-`{partial, Conn, Frame, Rest, EndStream, Window}`, where `Frame` carries the
-prefix that fit and `Rest` is the remainder the caller must offer again
-after WINDOW_UPDATE.
+The payload is split at the peer `max_frame_size` and bounded by the
+connection send window and the stream send window. A payload that fits
+in the credit comes back as `{ok, Conn, Frames}`. `Frames` is one DATA
+frame or a list of DATA frames, and END_STREAM sits on the last frame
+only. A payload that outruns the credit comes back as
+`{partial, Conn, Frames, Rest, EndStream, Window}`. `Frames` carries every
+frame the credit paid for and none of them carries END_STREAM. `Rest` is
+the remainder the caller must offer again after WINDOW_UPDATE, and
+`Window` is the credit that is left, zero or below. A `{partial, ...}`
+return therefore means one thing: the credit ran out.
+
+The frames share the octets of the payload. `Rest` is a copy when the
+payload is more than four times its size, so a small remainder does not
+retain a large payload.
 
 An empty payload with `fin` is sent at any window value, because a frame
 without payload consumes no flow-control credit (RFC 9113 Section 6.9.1).
@@ -823,43 +834,37 @@ derived_continuation_bound(Settings) ->
 -spec do_send_data(conn(), nhttp_lib:stream_id(), iodata(), fin()) -> send_result().
 do_send_data(#h2_conn{streams = Streams} = Conn, StreamId, Data, EndStream) ->
     Stream = maps:get(StreamId, Streams),
-    do_send_data(Conn, Stream, Data, iolist_size(Data), EndStream).
+    do_send_data(Conn, Stream, Data, iolist_size(Data), EndStream, []).
 
--spec do_send_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin()) -> send_result().
-do_send_data(Conn, Stream, Data, 0, fin) ->
-    emit_data(Conn, Stream, Data, 0, fin);
+-spec do_send_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin(), [iodata()]) ->
+    send_result().
+do_send_data(Conn, Stream, Data, 0, fin, []) ->
+    emit_data(Conn, Stream, Data, 0, fin, []);
 do_send_data(
-    #h2_conn{streams = Streams, send_window = ConnWindow, peer_settings = PeerSettings} = Conn,
+    #h2_conn{send_window = ConnWindow, peer_settings = PeerSettings} = Conn,
     #h2_stream{id = StreamId, send_window = StreamWindow} = Stream,
     Data,
     DataSize,
-    EndStream
+    EndStream,
+    Frames
 ) ->
     EffectiveWindow = min(ConnWindow, StreamWindow),
     MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_DEFAULT_MAX_FRAME_SIZE),
     MaxSend = min(EffectiveWindow, MaxFrameSize),
     case DataSize =< MaxSend of
         true when EffectiveWindow > 0 ->
-            emit_data(Conn, Stream, Data, DataSize, EndStream);
-        true when EffectiveWindow =< 0 ->
-            {partial, Conn, [], <<>>, EndStream, EffectiveWindow};
+            emit_data(Conn, Stream, Data, DataSize, EndStream, Frames);
         false when MaxSend > 0 ->
-            DataBin = iolist_to_binary(Data),
-            <<ToSend:MaxSend/binary, Remaining/binary>> = DataBin,
-            {ok, Frame} = nhttp_h2_frame:data(StreamId, nofin, ToSend),
-            NewStream = Stream#h2_stream{
-                send_window = StreamWindow - MaxSend
-            },
-            NewConn = Conn#h2_conn{
-                streams = store_or_remove_stream(Streams, StreamId, NewStream),
-                send_window = ConnWindow - MaxSend
-            },
-            {partial, NewConn, Frame, Remaining, EndStream, EffectiveWindow - MaxSend};
-        false ->
-            {partial, Conn, [], iolist_to_binary(Data), EndStream, EffectiveWindow}
+            {Taken, Rest} = take(Data, MaxSend, []),
+            {ok, Frame} = nhttp_h2_frame:data(StreamId, nofin, Taken),
+            NewConn = Conn#h2_conn{send_window = ConnWindow - MaxSend},
+            NewStream = Stream#h2_stream{send_window = StreamWindow - MaxSend},
+            do_send_data(NewConn, NewStream, Rest, DataSize - MaxSend, EndStream, [Frame | Frames]);
+        _ ->
+            hold_data(Conn, Stream, Data, EndStream, EffectiveWindow, Frames)
     end.
 
--spec emit_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin()) ->
+-spec emit_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin(), [iodata()]) ->
     {ok, conn(), iodata()}.
 emit_data(
     #h2_conn{streams = Streams, send_window = ConnWindow, active_stream_count = ActiveCount} =
@@ -867,7 +872,8 @@ emit_data(
     #h2_stream{id = StreamId, state = OldState, send_window = StreamWindow} = Stream,
     Data,
     DataSize,
-    EndStream
+    EndStream,
+    Frames
 ) ->
     {ok, Frame} = nhttp_h2_frame:data(StreamId, EndStream, Data),
     NewState = transition_on_send_end_stream(OldState, EndStream),
@@ -881,7 +887,67 @@ emit_data(
         send_window = ConnWindow - DataSize,
         active_stream_count = NewActiveCount
     },
-    {ok, NewConn, Frame}.
+    {ok, NewConn, frames(Frame, Frames)}.
+
+-spec hold_data(conn(), #h2_stream{}, iodata(), fin(), integer(), [iodata()]) ->
+    {partial, conn(), iodata(), binary(), fin(), integer()}.
+hold_data(Conn, _Stream, Data, EndStream, Window, []) ->
+    {partial, Conn, [], remainder(Data), EndStream, Window};
+hold_data(
+    #h2_conn{streams = Streams} = Conn,
+    #h2_stream{id = StreamId} = Stream,
+    Data,
+    EndStream,
+    Window,
+    [Frame | Frames]
+) ->
+    NewConn = Conn#h2_conn{streams = store_or_remove_stream(Streams, StreamId, Stream)},
+    {partial, NewConn, frames(Frame, Frames), remainder(Data), EndStream, Window}.
+
+-spec frames(iodata(), [iodata()]) -> iodata().
+frames(Frame, []) ->
+    Frame;
+frames(Frame, Frames) ->
+    lists:reverse([Frame | Frames]).
+
+-spec take(iodata(), non_neg_integer(), [iodata()]) -> {iodata(), iodata()}.
+take(Data, 0, Taken) ->
+    {lists:reverse(Taken), Data};
+take(Bin, N, []) when is_binary(Bin) ->
+    <<Head:N/binary, Tail/binary>> = Bin,
+    {Head, Tail};
+take(Bin, N, Taken) when is_binary(Bin) ->
+    <<Head:N/binary, Tail/binary>> = Bin,
+    {lists:reverse([Head | Taken]), Tail};
+take([Bin | Rest], N, Taken) when is_binary(Bin), byte_size(Bin) =< N ->
+    take(Rest, N - byte_size(Bin), [Bin | Taken]);
+take([Bin | Rest], N, Taken) when is_binary(Bin) ->
+    <<Head:N/binary, Tail/binary>> = Bin,
+    {lists:reverse([Head | Taken]), [Tail | Rest]};
+take([Byte | Rest], N, Taken) when is_integer(Byte) ->
+    take(Rest, N - 1, [Byte | Taken]);
+take([Nested | Rest], N, Taken) ->
+    case iolist_size(Nested) of
+        Size when Size =< N ->
+            take(Rest, N - Size, [Nested | Taken]);
+        _ ->
+            {Head, Tail} = take(Nested, N, []),
+            {lists:reverse([Head | Taken]), [Tail | Rest]}
+    end.
+
+-spec remainder(iodata()) -> binary().
+remainder(Data) ->
+    Rest = iolist_to_binary(Data),
+    Size = byte_size(Rest),
+    case
+        Size > ?H2_HEAP_BINARY_LIMIT andalso
+            binary:referenced_byte_size(Rest) > ?H2_REMAINDER_RETENTION_RATIO * Size
+    of
+        true ->
+            binary:copy(Rest);
+        false ->
+            Rest
+    end.
 
 -spec do_send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) ->
     {ok, conn(), iodata()}.
