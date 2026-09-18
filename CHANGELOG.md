@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.2]
+## [unreleased]
 
 ### Fixed
 
@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `t:nhttp_h2:send_result/0` no longer carries the `{ok, conn()}` arm,
   which no function returned. `nhttp_h2:send_headers/4` carries its own
   spec of `{ok, conn(), iodata()} | {error, send_error()}`
+- Support partial UTF for WS compliance
+
+### Performance
+
+- Header operations optimized
 
 ## [1.1.1]
 
