@@ -230,6 +230,29 @@ http2_constructors_test(_Config) ->
     ?assertEqual(goaway, maps:get(type, Map2)),
     ?assertEqual(enhance_your_calm, maps:get(error_code, Map2)),
     ?assertEqual(true, maps:get(retryable, Map2)),
+    ?assertEqual(error, maps:find(debug_data, Map1)),
+    ?assertEqual(error, maps:find(debug_data, Map2)),
+
+    ?assertEqual(
+        {error, {http2, #{type => goaway, error_code => no_error, debug_data => <<"idle">>}}},
+        nhttp_error:goaway(no_error, <<"idle">>)
+    ),
+    ?assertEqual(
+        {error,
+            {http2, #{
+                type => goaway,
+                error_code => enhance_your_calm,
+                debug_data => <<"too many streams">>,
+                retryable => true
+            }}},
+        nhttp_error:goaway(enhance_your_calm, <<"too many streams">>, retryable)
+    ),
+    ?assert(nhttp_error:is_retryable(nhttp_error:goaway(no_error, <<"idle">>))),
+    ?assert(nhttp_error:is_transient(nhttp_error:goaway(no_error, <<"idle">>, retryable))),
+    ?assertEqual(
+        nhttp_error:format(nhttp_error:goaway(no_error)),
+        nhttp_error:format(nhttp_error:goaway(no_error, <<"idle">>))
+    ),
 
     {error, {http2, Map3}} = nhttp_error:stream_reset(cancel),
     ?assertEqual(stream_reset, maps:get(type, Map3)),
@@ -409,6 +432,14 @@ normalize_http2_errors_test(_Config) ->
     ?assertMatch(
         {error, {http2, #{type := goaway, error_code := enhance_your_calm, retryable := true}}},
         nhttp_error:normalize({error, {goaway, enhance_your_calm, retryable}})
+    ),
+    ?assertEqual(
+        nhttp_error:goaway(no_error, <<"idle">>),
+        nhttp_error:normalize({error, {goaway, no_error, <<"idle">>}})
+    ),
+    ?assertEqual(
+        nhttp_error:goaway(enhance_your_calm, <<"slow">>, retryable),
+        nhttp_error:normalize({error, {goaway, enhance_your_calm, <<"slow">>, retryable}})
     ),
     ?assertMatch(
         {error, {http2, #{type := goaway, error_code := protocol_error}}},

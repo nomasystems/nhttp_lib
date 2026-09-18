@@ -41,9 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame encoder then truncated the identifier to 31 bits. The call now
   answers `{error, stream_ids_exhausted}` and the caller must open a new
   connection (RFC 9113 Section 5.1.1)
+- `nhttp_h2:send_data/4` emitted one DATA frame per call, so a body above
+  the peer `SETTINGS_MAX_FRAME_SIZE` came back as `{partial, ...}` on a
+  connection with credit to spare. The call now emits every frame that
+  the connection window, the stream window and the peer max frame size
+  allow, with END_STREAM on the last frame of a complete body only. A
+  `{partial, ...}` return now means that the credit ran out. The frames
+  share the octets of the body, and the remainder is a copy when the body
+  is more than four times its size (RFC 9113 Section 4.2)
 
 ### Added
 
+- `nhttp_error:goaway/2` with a binary second argument and
+  `nhttp_error:goaway/3` carry the debug data of a GOAWAY frame as
+  `debug_data` on the error map. `nhttp_error:normalize/1` routes
+  `{goaway, Code, DebugData}` and `{goaway, Code, DebugData, retryable}`
+  to them
 - `nhttp_h2:connection_send_window/1` reads the connection send window
 - `nhttp_h2:stream_send_window/2` reads the send window of one stream
 - `nhttp_h2:peer_settings/1` reads the settings the peer sent, merged over

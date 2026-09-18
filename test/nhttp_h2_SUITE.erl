@@ -55,7 +55,13 @@ Tests RFC 9113 compliance for:
     window_overflow_error/1,
     data_consumes_window/1,
     send_data_empty_nofin_at_zero_window_is_partial/1,
-    send_window_update_recv_window_overflow/1
+    send_window_update_recv_window_overflow/1,
+    send_data_emits_every_credited_frame/1,
+    send_data_65536_on_default_window_is_partial_by_one/1,
+    send_data_stops_at_connection_window/1,
+    send_data_stops_at_stream_window/1,
+    send_data_empty_fin_at_zero_window_stays_first/1,
+    send_data_remainder_does_not_retain_a_large_parent/1
 ]).
 
 -export([
@@ -212,7 +218,13 @@ groups() ->
             window_overflow_error,
             data_consumes_window,
             send_data_empty_nofin_at_zero_window_is_partial,
-            send_window_update_recv_window_overflow
+            send_window_update_recv_window_overflow,
+            send_data_emits_every_credited_frame,
+            send_data_65536_on_default_window_is_partial_by_one,
+            send_data_stops_at_connection_window,
+            send_data_stops_at_stream_window,
+            send_data_empty_fin_at_zero_window_stays_first,
+            send_data_remainder_does_not_retain_a_large_parent
         ]},
         {header_processing, [parallel], [
             headers_single_frame,
@@ -749,6 +761,133 @@ send_window_update_recv_window_overflow(_Config) ->
     {error, {recv_window_overflow, StreamId}} = nhttp_h2:send_window_update(Conn3, StreamId, 1),
     ok.
 
+-doc "A 64 KiB body on a full window is four DATA frames in one call, END_STREAM on the last.".
+send_data_emits_every_credited_frame(_Config) ->
+    {Conn0, StreamId} = open_post_stream(),
+    Conn1 = credit(credit(Conn0, connection, 1), StreamId, 1),
+    Body = numbered_body(65536),
+    {ok, Conn2, Frames} = nhttp_h2:send_data(Conn1, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16384], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, fin], fins(Decoded)),
+    ?assertEqual(Body, payloads(Decoded)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn2)),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn2, StreamId)),
+    ?assertEqual(
+        {error, {stream_closed, StreamId}}, nhttp_h2:send_data(Conn2, StreamId, <<"x">>, nofin)
+    ),
+    ok.
+
+-doc "A 65536 octet body on the default window is four frames and one octet of remainder.".
+send_data_65536_on_default_window_is_partial_by_one(_Config) ->
+    {Conn0, StreamId} = open_post_stream(),
+    Body = numbered_body(65536),
+    {partial, Conn1, Frames, Rest, fin, 0} = nhttp_h2:send_data(Conn0, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16383], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, nofin], fins(Decoded)),
+    ?assertEqual(binary:part(Body, 65535, 1), Rest),
+    ?assertEqual(Body, <<(payloads(Decoded))/binary, Rest/binary>>),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn1)),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn1, StreamId)),
+    ok.
+
+-doc "A body above the connection window stops at the connection window with no END_STREAM.".
+send_data_stops_at_connection_window(_Config) ->
+    {Conn0, StreamId} = open_post_stream(),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    Body = numbered_body(100000),
+    {partial, Conn2, Frames, Rest, fin, 0} = nhttp_h2:send_data(Conn1, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16383], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, nofin], fins(Decoded)),
+    ?assertEqual(Body, <<(payloads(Decoded))/binary, Rest/binary>>),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn2)),
+    ?assertEqual({ok, 100000}, nhttp_h2:stream_send_window(Conn2, StreamId)),
+    ok.
+
+-doc "A body above the stream window stops at the stream window with no END_STREAM.".
+send_data_stops_at_stream_window(_Config) ->
+    {Conn0, StreamId} = open_post_stream(),
+    Conn1 = credit(Conn0, connection, 100000),
+    Body = numbered_body(100000),
+    {partial, Conn2, Frames, Rest, fin, 0} = nhttp_h2:send_data(Conn1, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16383], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, nofin], fins(Decoded)),
+    ?assertEqual(Body, <<(payloads(Decoded))/binary, Rest/binary>>),
+    ?assertEqual(100000, nhttp_h2:connection_send_window(Conn2)),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn2, StreamId)),
+    ok.
+
+-doc "The empty END_STREAM frame is still sent at the zero window that a partial send leaves.".
+send_data_empty_fin_at_zero_window_stays_first(_Config) ->
+    {Conn0, StreamId} = open_post_stream(),
+    {partial, Conn1, _Frames, _Rest, nofin, 0} =
+        nhttp_h2:send_data(Conn0, StreamId, numbered_body(100000), nofin),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn1, StreamId)),
+    {ok, Conn2, Frame} = nhttp_h2:send_data(Conn1, StreamId, <<>>, fin),
+    ?assertMatch([Header | _] when is_binary(Header), Frame),
+    {ok, {data, StreamId, fin, <<>>}, _} = nhttp_h2_frame:decode(iolist_to_binary(Frame)),
+    ?assertEqual(
+        {error, {stream_closed, StreamId}}, nhttp_h2:send_data(Conn2, StreamId, <<"x">>, nofin)
+    ),
+    ok.
+
+-doc "A remainder copies out of a parent more than four times its size and shares otherwise.".
+send_data_remainder_does_not_retain_a_large_parent(_Config) ->
+    {Conn0, StreamId} = open_post_stream(),
+    Small = numbered_body(65535 + 100),
+    {partial, _, _, SmallRest, nofin, 0} = nhttp_h2:send_data(Conn0, StreamId, Small, nofin),
+    ?assertEqual(binary:part(Small, 65535, 100), SmallRest),
+    ?assertEqual(100, binary:referenced_byte_size(SmallRest)),
+    Large = numbered_body(65535 + 30000),
+    {partial, _, _, LargeRest, nofin, 0} = nhttp_h2:send_data(Conn0, StreamId, Large, nofin),
+    ?assertEqual(binary:part(Large, 65535, 30000), LargeRest),
+    ?assertEqual(byte_size(Large), binary:referenced_byte_size(LargeRest)),
+    Heap = numbered_body(65535 + 64),
+    {partial, _, _, HeapRest, nofin, 0} = nhttp_h2:send_data(Conn0, StreamId, Heap, nofin),
+    ?assertEqual(binary:part(Heap, 65535, 64), HeapRest),
+    ?assertEqual(64, binary:referenced_byte_size(HeapRest)),
+    ok.
+
+open_post_stream() ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    Headers = [{<<":method">>, <<"POST">>}, {<<":path">>, <<"/">>}],
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, nofin),
+    {Conn2, StreamId}.
+
+credit(Conn, connection, Increment) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(Increment),
+    {ok, [{window_update, 0, Increment}], NewConn} = nhttp_h2:recv(Conn, iolist_to_binary(Frame)),
+    NewConn;
+credit(Conn, StreamId, Increment) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
+    {ok, [{window_update, StreamId, Increment}], NewConn} =
+        nhttp_h2:recv(Conn, iolist_to_binary(Frame)),
+    NewConn.
+
+numbered_body(Size) ->
+    Pattern = list_to_binary(lists:seq(0, 255)),
+    binary:copy(binary:part(binary:copy(Pattern, Size div 256 + 1), 0, Size)).
+
+decode_data_frames(<<>>) ->
+    [];
+decode_data_frames(Bin) ->
+    {ok, {data, StreamId, Fin, Payload}, Consumed} = nhttp_h2_frame:decode(Bin),
+    <<_:Consumed/binary, Rest/binary>> = Bin,
+    [{StreamId, Fin, Payload} | decode_data_frames(Rest)].
+
+payload_sizes(Decoded) ->
+    [byte_size(Payload) || {_, _, Payload} <- Decoded].
+
+fins(Decoded) ->
+    [Fin || {_, Fin, _} <- Decoded].
+
+payloads(Decoded) ->
+    iolist_to_binary([Payload || {_, _, Payload} <- Decoded]).
+
 send_until_stream_window_is_zero(Conn, StreamId) ->
     case nhttp_h2:stream_send_window(Conn, StreamId) of
         {ok, 0} ->
@@ -986,8 +1125,8 @@ flow_control_blocked(_Config) ->
     {partial, _Conn3, _Frame, Remaining, fin, Window} = nhttp_h2:send_data(
         Conn2, StreamId, LargeData, fin
     ),
-    53616 = byte_size(Remaining),
-    49151 = Window,
+    4465 = byte_size(Remaining),
+    0 = Window,
     ok.
 
 continuation_partial_test(_Config) ->

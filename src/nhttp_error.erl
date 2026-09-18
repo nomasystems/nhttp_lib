@@ -86,6 +86,7 @@ end.
     flow_control_error/1,
     goaway/1,
     goaway/2,
+    goaway/3,
     rate_limited/0,
     stream_cancelled/0,
     stream_closed/1,
@@ -262,10 +263,23 @@ flow_control_error(Reason) ->
 goaway(ErrorCode) ->
     {error, {http2, #{type => goaway, error_code => ErrorCode}}}.
 
--doc "Received GOAWAY frame, marked as retryable.".
--spec goaway(nhttp_h2:error_code(), retryable) -> t().
+-doc """
+Received GOAWAY frame, marked as retryable or carrying the debug data of
+the frame.
+""".
+-spec goaway(nhttp_h2:error_code(), retryable | binary()) -> t().
 goaway(ErrorCode, retryable) ->
-    {error, {http2, #{type => goaway, error_code => ErrorCode, retryable => true}}}.
+    {error, {http2, #{type => goaway, error_code => ErrorCode, retryable => true}}};
+goaway(ErrorCode, DebugData) when is_binary(DebugData) ->
+    {error, {http2, #{type => goaway, error_code => ErrorCode, debug_data => DebugData}}}.
+
+-doc "Received GOAWAY frame carrying debug data, marked as retryable.".
+-spec goaway(nhttp_h2:error_code(), binary(), retryable) -> t().
+goaway(ErrorCode, DebugData, retryable) when is_binary(DebugData) ->
+    {error,
+        {http2, #{
+            type => goaway, error_code => ErrorCode, debug_data => DebugData, retryable => true
+        }}}.
 
 -doc "HTTP/2 rate limiting applied by the peer.".
 -spec rate_limited() -> t().
@@ -507,6 +521,10 @@ normalize({error, {goaway, ErrorCode}}) ->
     goaway(ErrorCode);
 normalize({error, {goaway, ErrorCode, retryable}}) ->
     goaway(ErrorCode, retryable);
+normalize({error, {goaway, ErrorCode, DebugData}}) when is_binary(DebugData) ->
+    goaway(ErrorCode, DebugData);
+normalize({error, {goaway, ErrorCode, DebugData, retryable}}) when is_binary(DebugData) ->
+    goaway(ErrorCode, DebugData, retryable);
 normalize({error, {http2_error, {goaway, ErrorCode}}}) ->
     goaway(ErrorCode);
 normalize({error, goaway}) ->
