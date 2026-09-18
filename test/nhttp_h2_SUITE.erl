@@ -840,7 +840,7 @@ send_data_remainder_does_not_retain_a_large_parent(_Config) ->
     Small = numbered_body(65535 + 100),
     {partial, _, _, SmallRest, nofin, 0} = nhttp_h2:send_data(Conn0, StreamId, Small, nofin),
     ?assertEqual(binary:part(Small, 65535, 100), SmallRest),
-    ?assertEqual(100, binary:referenced_byte_size(SmallRest)),
+    ?assertEqual(own_size(SmallRest), binary:referenced_byte_size(SmallRest)),
     Large = numbered_body(65535 + 30000),
     {partial, _, _, LargeRest, nofin, 0} = nhttp_h2:send_data(Conn0, StreamId, Large, nofin),
     ?assertEqual(binary:part(Large, 65535, 30000), LargeRest),
@@ -848,7 +848,7 @@ send_data_remainder_does_not_retain_a_large_parent(_Config) ->
     Heap = numbered_body(65535 + 64),
     {partial, _, _, HeapRest, nofin, 0} = nhttp_h2:send_data(Conn0, StreamId, Heap, nofin),
     ?assertEqual(binary:part(Heap, 65535, 64), HeapRest),
-    ?assertEqual(64, binary:referenced_byte_size(HeapRest)),
+    ?assertEqual(own_size(HeapRest), binary:referenced_byte_size(HeapRest)),
     ok.
 
 open_post_stream() ->
@@ -887,6 +887,9 @@ fins(Decoded) ->
 
 payloads(Decoded) ->
     iolist_to_binary([Payload || {_, _, Payload} <- Decoded]).
+
+own_size(Bin) ->
+    binary:referenced_byte_size(binary:copy(Bin)).
 
 send_until_stream_window_is_zero(Conn, StreamId) ->
     case nhttp_h2:stream_send_window(Conn, StreamId) of

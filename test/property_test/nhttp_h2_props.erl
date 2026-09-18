@@ -666,11 +666,15 @@ remainder_retention(Rest, Parent, Body) ->
     Referenced = binary:referenced_byte_size(Rest),
     if
         RestSize =< 64 ->
-            Referenced =:= RestSize;
+            Referenced =:= own_size(Rest);
         ParentSize > 4 * RestSize ->
-            Referenced =:= RestSize;
+            Referenced =:= own_size(Rest);
         is_binary(Body) ->
             Referenced =:= ParentSize;
         true ->
-            Referenced =:= RestSize orelse Referenced =:= ParentSize
+            Referenced =:= own_size(Rest) orelse Referenced =:= ParentSize
     end.
+
+-spec own_size(binary()) -> non_neg_integer().
+own_size(Bin) ->
+    binary:referenced_byte_size(binary:copy(Bin)).
