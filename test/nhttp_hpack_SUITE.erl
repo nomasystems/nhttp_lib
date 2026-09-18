@@ -23,7 +23,8 @@ all() ->
         {group, integer_encoding},
         {group, error_handling},
         {group, encode_lowercase},
-        {group, coverage_edge_cases}
+        {group, coverage_edge_cases},
+        {group, index_maps}
     ].
 
 groups() ->
@@ -114,6 +115,12 @@ groups() ->
             transfer_encoding_header,
             incomplete_string_error,
             incomplete_indexed_name_error
+        ]},
+        {index_maps, [], [
+            encoder_state_is_bounded,
+            evicted_key_is_absent,
+            rebound_key_survives_eviction,
+            allocation_per_request_is_flat
         ]}
     ].
 
@@ -917,6 +924,69 @@ mixed_case_name_enters_the_table_lowercase(_Config) ->
     ?assertEqual(<<2#1:1, 62:7>>, iolist_to_binary(Again)).
 
 %%%-----------------------------------------------------------------------------
+%%% INDEX MAP TESTS
+%%%-----------------------------------------------------------------------------
+
+encoder_state_is_bounded(_Config) ->
+    {ok, State0} = nhttp_hpack:new(),
+    State1 = encode_apns_requests(1, 999, State0),
+    {Words1, State2} = max_state_words(1000, 1063, State1),
+    State3 = encode_apns_requests(1064, 9999, State2),
+    {Words2, State4} = max_state_words(10000, 10063, State3),
+    State5 = encode_apns_requests(10064, 99999, State4),
+    {Words3, _State6} = max_state_words(100000, 100063, State5),
+    ct:log("state words at 1000, 10000, 100000 requests: ~p", [[Words1, Words2, Words3]]),
+    Tolerance = erts_debug:flat_size(apns_request(1)),
+    ?assert(lists:max([Words1, Words2, Words3]) - lists:min([Words1, Words2, Words3]) =< Tolerance).
+
+evicted_key_is_absent(_Config) ->
+    {ok, State0} = nhttp_hpack:new(72),
+    {ok, _, State1} = nhttp_hpack:encode([{<<"aa">>, <<"bb">>}, {<<"cc">>, <<"dd">>}], State0),
+    ?assertEqual(72, nhttp_hpack:table_size(State1)),
+    {ok, _, State2} = nhttp_hpack:encode([{<<"ee">>, <<"ff">>}], State1),
+    ?assertEqual(72, nhttp_hpack:table_size(State2)),
+    ?assertNot(maps:is_key({<<"aa">>, <<"bb">>}, hpack_field(full_index, State2))),
+    ?assertNot(maps:is_key(<<"aa">>, hpack_field(name_index, State2))),
+    {ok, Encoded, _State3} = nhttp_hpack:encode([{<<"aa">>, <<"bb">>}], State2),
+    ?assertMatch(<<2#01:2, 0:6, _/binary>>, iolist_to_binary(Encoded)).
+
+rebound_key_survives_eviction(_Config) ->
+    rebound_name_survives_eviction(),
+    rebound_field_survives_eviction().
+
+rebound_name_survives_eviction() ->
+    {ok, State0} = nhttp_hpack:new(72),
+    {ok, _, State1} = nhttp_hpack:encode([{<<"aa">>, <<"bb">>}, {<<"aa">>, <<"cc">>}], State0),
+    ?assertEqual(#{<<"aa">> => 1}, hpack_field(name_index, State1)),
+    {ok, _, State2} = nhttp_hpack:encode([{<<"ee">>, <<"ff">>}], State1),
+    ?assertEqual(#{<<"aa">> => 1, <<"ee">> => 2}, hpack_field(name_index, State2)),
+    ?assertEqual(
+        #{{<<"aa">>, <<"cc">>} => 1, {<<"ee">>, <<"ff">>} => 2},
+        hpack_field(full_index, State2)
+    ),
+    {ok, Encoded, _State3} = nhttp_hpack:encode([{<<"aa">>, <<"dd">>}], State2),
+    ?assertMatch(<<2#01:2, 63:6, 0, _/binary>>, iolist_to_binary(Encoded)).
+
+rebound_field_survives_eviction() ->
+    {ok, State0} = nhttp_hpack:new(72),
+    Literal = <<2#01:2, 0:6, 2, "aa", 2, "bb">>,
+    {ok, _, State1} = nhttp_hpack:decode(<<Literal/binary, Literal/binary>>, State0),
+    ?assertEqual(#{{<<"aa">>, <<"bb">>} => 1}, hpack_field(full_index, State1)),
+    {ok, _, State2} = nhttp_hpack:decode(<<2#01:2, 0:6, 2, "cc", 2, "dd">>, State1),
+    ?assertEqual(
+        #{{<<"aa">>, <<"bb">>} => 1, {<<"cc">>, <<"dd">>} => 2},
+        hpack_field(full_index, State2)
+    ),
+    ?assertEqual(#{<<"aa">> => 1, <<"cc">> => 2}, hpack_field(name_index, State2)).
+
+allocation_per_request_is_flat(_Config) ->
+    {ok, State0} = nhttp_hpack:new(),
+    {State1, Words1} = allocated_words(fun() -> encode_apns_requests(1, 10000, State0) end),
+    {_State2, Words2} = allocated_words(fun() -> encode_apns_requests(10001, 20000, State1) end),
+    ct:log("words allocated: first window ~p, second window ~p", [Words1, Words2]),
+    ?assert(abs(Words2 - Words1) * 100 =< Words1).
+
+%%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
 
@@ -945,3 +1015,96 @@ test_int_roundtrip(Value) ->
     LongValue = list_to_binary(lists:duplicate(Value, $x)),
     Headers = [{<<"x">>, LongValue}],
     roundtrip(Headers).
+
+hpack_field(Field, State) ->
+    element(maps:get(Field, record_positions(hpack)), State).
+
+record_positions(Record) ->
+    Beam = filename:join([code:lib_dir(nhttp_lib), "ebin", "nhttp_hpack.beam"]),
+    {ok, {nhttp_hpack, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
+        beam_lib:chunks(Beam, [abstract_code]),
+    [Fields] = [Fs || {attribute, _, record, {R, Fs}} <- Forms, R =:= Record],
+    Names = [record_field_name(Field) || Field <- Fields],
+    maps:from_list(lists:zip(Names, lists:seq(2, length(Names) + 1))).
+
+record_field_name({typed_record_field, Field, _Type}) -> record_field_name(Field);
+record_field_name({record_field, _, {atom, _, Name}}) -> Name;
+record_field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.
+
+apns_request(N) ->
+    Token = binary:encode_hex(<<N:256>>, lowercase),
+    <<A:8/binary, B:4/binary, C:4/binary, D:4/binary, E:12/binary>> =
+        binary:encode_hex(<<N:128>>, lowercase),
+    Id = <<A/binary, "-", B/binary, "-", C/binary, "-", D/binary, "-", E/binary>>,
+    Jwt = binary:copy(<<"x">>, 184),
+    [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"api.push.apple.com">>},
+        {<<":path">>, <<"/3/device/", Token/binary>>},
+        {<<"apns-id">>, Id},
+        {<<"apns-topic">>, <<"com.example.app">>},
+        {<<"apns-push-type">>, <<"alert">>},
+        {<<"apns-priority">>, <<"10">>},
+        {<<"apns-expiration">>, <<"0">>},
+        {<<"authorization">>, <<"bearer ", Jwt/binary>>},
+        {<<"content-type">>, <<"application/json">>},
+        {<<"content-length">>, <<"134">>}
+    ].
+
+encode_apns_requests(From, To, State) when From > To ->
+    State;
+encode_apns_requests(From, To, State) ->
+    {ok, _, State1} = nhttp_hpack:encode(apns_request(From), State),
+    encode_apns_requests(From + 1, To, State1).
+
+max_state_words(From, To, State) ->
+    max_state_words(From, To, State, 0).
+
+max_state_words(From, To, State, Max) when From > To ->
+    {Max, State};
+max_state_words(From, To, State, Max) ->
+    {ok, _, State1} = nhttp_hpack:encode(apns_request(From), State),
+    max_state_words(From + 1, To, State1, max(Max, erts_debug:flat_size(State1))).
+
+allocated_words(Fun) ->
+    Parent = self(),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        receive
+            go -> ok
+        end,
+        true = erlang:garbage_collect(),
+        Result = Fun(),
+        true = erlang:garbage_collect(),
+        Parent ! {result, self(), Result}
+    end),
+    Session = trace:session_create(hpack_allocation, self(), []),
+    1 = trace:process(Session, Pid, true, [garbage_collection]),
+    Pid ! go,
+    Result =
+        receive
+            {result, Pid, R} -> R
+        end,
+    receive
+        {'DOWN', Ref, process, Pid, normal} -> ok
+    end,
+    true = trace:session_destroy(Session),
+    {Result, sum_gc_allocations(Pid, undefined, 0)}.
+
+sum_gc_allocations(Pid, PrevEnd, Sum) ->
+    receive
+        {trace, Pid, Start, Info} when Start =:= gc_minor_start; Start =:= gc_major_start ->
+            sum_gc_allocations(Pid, PrevEnd, Sum + allocated_since(PrevEnd, Info));
+        {trace, Pid, End, Info} when End =:= gc_minor_end; End =:= gc_major_end ->
+            {heap_size, Live} = lists:keyfind(heap_size, 1, Info),
+            sum_gc_allocations(Pid, Live, Sum)
+    after 0 ->
+        Sum
+    end.
+
+allocated_since(undefined, _Info) ->
+    0;
+allocated_since(PrevEnd, Info) ->
+    {heap_size, Used} = lists:keyfind(heap_size, 1, Info),
+    {mbuf_size, Mbuf} = lists:keyfind(mbuf_size, 1, Info),
+    Used + Mbuf - PrevEnd.

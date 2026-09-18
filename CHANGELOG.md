@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Fixed
+
+- The HPACK dynamic table state grew without bound on a long-lived
+  connection. An eviction removed the entry from `entries` and left its
+  keys in `full_index` and `name_index`, so the two indexes held one key
+  for every distinct header that the connection ever inserted. An eviction
+  now removes the keys that bind to the evicted sequence. A key that a
+  later insertion of the same header or the same name rebound to a newer
+  sequence survives the eviction of the older entry.
+- Support partial UTF for WS compliance
+
 ### Performance
 
 - Header operations optimized
-- Support partial UTF for WS compliance
 
 ## [1.1.1]
 
