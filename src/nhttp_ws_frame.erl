@@ -45,6 +45,7 @@ code and reason.
     encode_masked/1,
     opcode_to_complete_message/2,
     opcode_to_message/3,
+    partial_payload/3,
     scan_utf8/1,
     scan_utf8/2,
     validate_control_frame/3
@@ -248,6 +249,30 @@ opcode_to_message(1, Opcode, Data) ->
     opcode_to_complete_message(Opcode, Data);
 opcode_to_message(0, _Opcode, _Data) ->
     {error, fragmentation_not_supported}.
+
+-doc """
+Unmasked payload bytes of a frame whose payload is not complete yet,
+from byte `Scanned` of that payload onward.
+
+The stateful message-level decoder calls this while a frame is still on
+its way, so that a text payload is refused at the byte that breaks it
+rather than at the end of the frame (RFC 6455 §5.6 and §8.1). A caller
+that feeds the returned run to `scan_utf8/2` and remembers how many
+bytes it consumed scans each payload byte once.
+
+Returns `none` when the header is not complete, and when no payload byte
+arrived after `Scanned`.
+""".
+-spec partial_payload(binary(), client | server, non_neg_integer()) ->
+    {ok, Opcode :: 0..15, New :: binary()} | none.
+partial_payload(Data, Role, Scanned) ->
+    case frame_header(Data, Role) of
+        {ok, Opcode, HeaderSize, Len, MaskKey} ->
+            Avail = min(byte_size(Data) - HeaderSize, Len),
+            partial_slice(Opcode, Data, HeaderSize, MaskKey, Scanned, Avail);
+        none ->
+            none
+    end.
 
 -doc """
 Scan a run of text for UTF-8 validity (RFC 3629) and return the trailing
@@ -581,6 +606,34 @@ effective_cap(Limits) ->
         Cap -> max(Cap, ?MAX_CONTROL_PAYLOAD)
     end.
 
+-spec frame_header(binary(), client | server) ->
+    {ok, Opcode :: 0..15, HeaderSize :: pos_integer(), Len :: non_neg_integer(),
+        MaskKey :: binary()}
+    | none.
+frame_header(<<_:1, 0:3, Op:4, 1:1, 127:7, 0:1, Len:63, Key:4/binary, _/binary>>, server) ->
+    {ok, Op, 14, Len, Key};
+frame_header(<<_:1, 0:3, Op:4, 1:1, 126:7, Len:16, Key:4/binary, _/binary>>, server) ->
+    {ok, Op, 8, Len, Key};
+frame_header(<<_:1, 0:3, Op:4, 1:1, Len:7, Key:4/binary, _/binary>>, server) when Len < 126 ->
+    {ok, Op, 6, Len, Key};
+frame_header(<<_:1, 0:3, Op:4, 0:1, 127:7, 0:1, Len:63, _/binary>>, client) ->
+    {ok, Op, 10, Len, <<>>};
+frame_header(<<_:1, 0:3, Op:4, 0:1, 126:7, Len:16, _/binary>>, client) ->
+    {ok, Op, 4, Len, <<>>};
+frame_header(<<_:1, 0:3, Op:4, 0:1, Len:7, _/binary>>, client) when Len < 126 ->
+    {ok, Op, 2, Len, <<>>};
+frame_header(_Data, _Role) ->
+    none.
+
+-spec partial_slice(
+    0..15, binary(), pos_integer(), binary(), non_neg_integer(), non_neg_integer()
+) -> {ok, 0..15, binary()} | none.
+partial_slice(_Op, _Data, _HeaderSize, _MaskKey, Scanned, Avail) when Avail =< Scanned ->
+    none;
+partial_slice(Op, Data, HeaderSize, MaskKey, Scanned, Avail) ->
+    Slice = binary:part(Data, HeaderSize + Scanned, Avail - Scanned),
+    {ok, Op, unmask_from(MaskKey, Scanned, Slice)}.
+
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: VALIDATION
 %%%-----------------------------------------------------------------------------
@@ -619,6 +672,12 @@ is_valid_utf8(_) -> false.
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: MASK
 %%%-----------------------------------------------------------------------------
+-spec rotate_mask(MaskKey :: binary(), Offset :: non_neg_integer()) -> binary().
+rotate_mask(MaskKey, Offset) ->
+    Split = Offset rem 4,
+    <<Head:Split/binary, Tail/binary>> = MaskKey,
+    <<Tail/binary, Head/binary>>.
+
 -spec unmask(MaskKey :: binary(), Data :: binary()) -> binary().
 unmask(<<Key:32>>, Data) when byte_size(Data) >= 64 ->
     LongKey = binary:copy(<<Key:32>>, 16),
@@ -626,6 +685,12 @@ unmask(<<Key:32>>, Data) when byte_size(Data) >= 64 ->
     unmask_loop(Key, LongKeyInt, Data, <<>>);
 unmask(<<Key:32>>, Data) ->
     unmask_loop(Key, 0, Data, <<>>).
+
+-spec unmask_from(MaskKey :: binary(), Offset :: non_neg_integer(), Data :: binary()) -> binary().
+unmask_from(<<>>, _Offset, Data) ->
+    Data;
+unmask_from(MaskKey, Offset, Data) ->
+    unmask(rotate_mask(MaskKey, Offset), Data).
 
 -spec unmask_loop(integer(), integer(), binary(), binary()) -> binary().
 unmask_loop(Key, LongKey, Data, Acc) ->

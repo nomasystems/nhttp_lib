@@ -203,7 +203,9 @@ for backwards compatibility.
     max_message_size = ?WS_DEFAULT_MAX_MESSAGE_SIZE :: pos_integer() | infinity,
     frame_limits = #{max_frame_size => ?WS_DEFAULT_MAX_MESSAGE_SIZE} ::
         nhttp_ws_frame:frame_limits(),
-    utf8_carry = <<>> :: binary()
+    utf8_carry = <<>> :: binary(),
+    partial_carry = <<>> :: binary(),
+    partial_scanned = 0 :: non_neg_integer()
 }).
 
 -opaque ws_decoder() :: #ws_decoder{}.
@@ -418,6 +420,12 @@ A successful return has three forms, and each one says what to keep:
   non-final fragment. No message yet. Keep `Rest`.
 - `{more, MinBytes, Decoder}`: nothing was consumed. Keep the input
   buffer and wait for `MinBytes` more bytes.
+
+A text payload is scanned as UTF-8 while it arrives, so a broken byte
+gives `{error, invalid_utf8}` on the read that carries it and not on the
+read that completes the frame (RFC 6455 §5.6 and §8.1). The `{more, ...}`
+decoder holds how far that scan got, so keep it, or the next call scans
+the same bytes again.
 If you keep the whole buffer after a consumed frame, the next call
 decodes that frame again and fails with `expected_continuation`.
 """.
@@ -430,7 +438,7 @@ decode_with_state(Data, #ws_decoder{role = Role, frame_limits = Limits} = Dec) -
                 {error, _} = Err -> Err
             end;
         {more, Needed} ->
-            {more, Needed, Dec};
+            scan_partial(Data, Needed, Dec);
         {error, _} = Err ->
             Err
     end.
@@ -647,10 +655,6 @@ check_message_size(Size, #ws_decoder{max_message_size = Max}) when Size =< Max -
 check_message_size(_Size, _Dec) ->
     {error, message_too_large}.
 
--spec fragmented_message(?OP_TEXT | ?OP_BINARY, binary()) -> ws_message().
-fragmented_message(?OP_TEXT, Payload) -> {text, Payload};
-fragmented_message(?OP_BINARY, Payload) -> {binary, Payload}.
-
 -spec get_websocket_key(nhttp_lib:headers()) -> {ok, binary()} | {error, missing_key}.
 get_websocket_key(Headers) ->
     case nhttp_headers:get(<<"sec-websocket-key">>, Headers) of
@@ -658,14 +662,29 @@ get_websocket_key(Headers) ->
         Key -> {ok, Key}
     end.
 
+-spec partial_carry(ws_decoder()) -> binary().
+partial_carry(#ws_decoder{partial_scanned = 0, utf8_carry = Carry}) -> Carry;
+partial_carry(#ws_decoder{partial_carry = Carry}) -> Carry.
+
 -spec process_fragment(0 | 1, 0..15, binary(), binary(), ws_decoder()) -> stateful_decode_result().
+process_fragment(1, Opcode, Payload, Rest, #ws_decoder{frag_opcode = undefined} = Dec) when
+    Opcode =:= ?OP_TEXT; Opcode =:= ?OP_BINARY
+->
+    maybe
+        ok ?= check_message_size(byte_size(Payload), Dec),
+        {ok, <<>>} ?= scan_text(Opcode, Payload, Dec),
+        {ok, text_or_binary_message(Opcode, Payload), Rest, reset_partial(Dec)}
+    else
+        {ok, _Truncated} -> {error, invalid_utf8};
+        {error, _} = Err -> Err
+    end;
 process_fragment(1, Opcode, Payload, Rest, #ws_decoder{frag_opcode = undefined} = Dec) when
     not ?IS_CONTROL(Opcode)
 ->
     case check_message_size(byte_size(Payload), Dec) of
         ok ->
             case nhttp_ws_frame:opcode_to_complete_message(Opcode, Payload) of
-                {ok, Msg} -> {ok, Msg, Rest, Dec};
+                {ok, Msg} -> {ok, Msg, Rest, reset_partial(Dec)};
                 {error, _} = Err -> Err
             end;
         {error, _} = Err ->
@@ -677,19 +696,20 @@ process_fragment(0, Opcode, Payload, Rest, #ws_decoder{frag_opcode = undefined} 
     Size = byte_size(Payload),
     maybe
         ok ?= check_message_size(Size, Dec),
-        {ok, Carry} ?= scan_text(Opcode, Payload, <<>>),
-        {continue, Rest, Dec#ws_decoder{
-            frag_opcode = Opcode,
-            frag_acc = [Payload],
-            frag_acc_size = Size,
-            utf8_carry = Carry
-        }}
+        {ok, Carry} ?= scan_text(Opcode, Payload, Dec),
+        {continue, Rest,
+            reset_partial(Dec#ws_decoder{
+                frag_opcode = Opcode,
+                frag_acc = [Payload],
+                frag_acc_size = Size,
+                utf8_carry = Carry
+            })}
     end;
 process_fragment(
     _Fin, Opcode, Payload, Rest, #ws_decoder{frag_opcode = _FragOp} = Dec
 ) when ?IS_CONTROL(Opcode) ->
     case nhttp_ws_frame:opcode_to_complete_message(Opcode, Payload) of
-        {ok, Msg} -> {ok, Msg, Rest, Dec};
+        {ok, Msg} -> {ok, Msg, Rest, reset_partial(Dec)};
         {error, _} = Err -> Err
     end;
 process_fragment(
@@ -702,10 +722,11 @@ process_fragment(
     NewSize = AccSize + byte_size(Payload),
     maybe
         ok ?= check_message_size(NewSize, Dec),
-        {ok, Carry} ?= scan_text(FragOp, Payload, Dec#ws_decoder.utf8_carry),
-        {continue, Rest, Dec#ws_decoder{
-            frag_acc = [Payload | Acc], frag_acc_size = NewSize, utf8_carry = Carry
-        }}
+        {ok, Carry} ?= scan_text(FragOp, Payload, Dec),
+        {continue, Rest,
+            reset_partial(Dec#ws_decoder{
+                frag_acc = [Payload | Acc], frag_acc_size = NewSize, utf8_carry = Carry
+            })}
     end;
 process_fragment(
     1,
@@ -717,11 +738,12 @@ process_fragment(
     NewSize = AccSize + byte_size(Payload),
     maybe
         ok ?= check_message_size(NewSize, Dec),
-        {ok, <<>>} ?= scan_text(FragOp, Payload, Dec#ws_decoder.utf8_carry),
+        {ok, <<>>} ?= scan_text(FragOp, Payload, Dec),
         FullPayload = iolist_to_binary(lists:reverse([Payload | Acc])),
-        {ok, fragmented_message(FragOp, FullPayload), Rest, Dec#ws_decoder{
-            frag_opcode = undefined, frag_acc = [], frag_acc_size = 0, utf8_carry = <<>>
-        }}
+        {ok, text_or_binary_message(FragOp, FullPayload), Rest,
+            reset_partial(Dec#ws_decoder{
+                frag_opcode = undefined, frag_acc = [], frag_acc_size = 0, utf8_carry = <<>>
+            })}
     else
         {ok, _Truncated} -> {error, invalid_utf8};
         {error, _} = Err -> Err
@@ -729,11 +751,53 @@ process_fragment(
 process_fragment(_, _, _, _, _) ->
     {error, expected_continuation}.
 
--spec scan_text(?OP_TEXT | ?OP_BINARY, binary(), binary()) ->
+-spec reset_partial(ws_decoder()) -> ws_decoder().
+reset_partial(Dec) ->
+    Dec#ws_decoder{partial_carry = <<>>, partial_scanned = 0}.
+
+-spec scan_partial(binary(), pos_integer(), ws_decoder()) -> stateful_decode_result().
+scan_partial(Data, Needed, #ws_decoder{role = Role, partial_scanned = Scanned} = Dec) ->
+    case nhttp_ws_frame:partial_payload(Data, Role, Scanned) of
+        {ok, Opcode, New} ->
+            case scans_as_text(Opcode, Dec) of
+                true -> scan_partial_text(New, Needed, Dec);
+                false -> {more, Needed, Dec}
+            end;
+        none ->
+            {more, Needed, Dec}
+    end.
+
+-spec scan_partial_text(binary(), pos_integer(), ws_decoder()) -> stateful_decode_result().
+scan_partial_text(New, Needed, #ws_decoder{partial_scanned = Scanned} = Dec) ->
+    case scan_run(partial_carry(Dec), New) of
+        {ok, Carry} ->
+            {more, Needed, Dec#ws_decoder{
+                partial_carry = Carry, partial_scanned = Scanned + byte_size(New)
+            }};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec scan_run(Carry :: binary(), binary()) -> {ok, Carry :: binary()} | {error, invalid_utf8}.
+scan_run(<<>>, Payload) -> nhttp_ws_frame:scan_utf8(Payload);
+scan_run(Carry, Payload) -> nhttp_ws_frame:scan_utf8(Carry, Payload).
+
+-spec scan_text(?OP_TEXT | ?OP_BINARY, binary(), ws_decoder()) ->
     {ok, Carry :: binary()} | {error, invalid_utf8}.
-scan_text(?OP_TEXT, Payload, <<>>) -> nhttp_ws_frame:scan_utf8(Payload);
-scan_text(?OP_TEXT, Payload, Carry) -> nhttp_ws_frame:scan_utf8(Carry, Payload);
-scan_text(?OP_BINARY, _Payload, _Carry) -> {ok, <<>>}.
+scan_text(?OP_BINARY, _Payload, _Dec) ->
+    {ok, <<>>};
+scan_text(?OP_TEXT, Payload, #ws_decoder{partial_scanned = Scanned} = Dec) ->
+    Tail = binary:part(Payload, Scanned, byte_size(Payload) - Scanned),
+    scan_run(partial_carry(Dec), Tail).
+
+-spec scans_as_text(0..15, ws_decoder()) -> boolean().
+scans_as_text(?OP_TEXT, #ws_decoder{frag_opcode = undefined}) -> true;
+scans_as_text(?OP_CONTINUATION, #ws_decoder{frag_opcode = ?OP_TEXT}) -> true;
+scans_as_text(_Opcode, _Dec) -> false.
+
+-spec text_or_binary_message(?OP_TEXT | ?OP_BINARY, binary()) -> ws_message().
+text_or_binary_message(?OP_TEXT, Payload) -> {text, Payload};
+text_or_binary_message(?OP_BINARY, Payload) -> {binary, Payload}.
 
 -spec validate_connection_header(nhttp_lib:headers()) -> ok | {error, invalid_connection}.
 validate_connection_header(Headers) ->
