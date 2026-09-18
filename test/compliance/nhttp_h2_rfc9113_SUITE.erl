@@ -55,11 +55,18 @@ groups() ->
             server_rejects_even_client_stream_id,
             server_rejects_non_increasing_stream_id,
             client_rejects_odd_server_stream_id,
-            max_concurrent_streams_triggers_refused_stream
+            max_concurrent_streams_triggers_refused_stream,
+            client_rejects_window_update_on_idle_stream,
+            client_refuses_stream_id_above_maximum
         ]},
         {section_6_settings_and_flow_control, [parallel], [
             settings_ack_sent_in_response,
             settings_initial_window_size_updates_streams,
+            settings_initial_window_size_reaches_idle_stream,
+            settings_initial_window_size_shrink_retains_negative_window,
+            settings_initial_window_size_overflow_is_connection_error,
+            settings_initial_window_size_emits_no_window_update_event,
+            zero_length_end_stream_data_is_sent_at_zero_window,
             settings_header_table_size_propagates_to_hpack,
             ping_ack_echoes_payload,
             connection_window_overflow_is_connection_error,
@@ -229,6 +236,36 @@ window_update_on_idle_stream_is_connection_error(_Config) ->
         nhttp_h2:recv(Conn0, iolist_to_binary(Wu)),
     ok.
 
+client_rejects_window_update_on_idle_stream(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, WuEven} = nhttp_h2_frame:window_update(2, 100),
+    {error, {connection_error, protocol_error, _}} =
+        nhttp_h2:recv(Conn0, iolist_to_binary(WuEven)),
+    {ok, WuUnopened} = nhttp_h2_frame:window_update(1, 100),
+    {error, {connection_error, protocol_error, _}} =
+        nhttp_h2:recv(Conn0, iolist_to_binary(WuUnopened)),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
+    RespBlock = encode_headers([{<<":status">>, <<"204">>}]),
+    {ok, Resp} = nhttp_h2_frame:headers(StreamId, fin, fin, RespBlock),
+    {ok, [{response, StreamId, _, fin}], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Resp)),
+    {ok, WuClosed} = nhttp_h2_frame:window_update(StreamId, 100),
+    {ok, [], _Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(WuClosed)),
+    {ok, WuNext} = nhttp_h2_frame:window_update(StreamId + 2, 100),
+    {error, {connection_error, protocol_error, _}} =
+        nhttp_h2:recv(Conn3, iolist_to_binary(WuNext)),
+    ok.
+
+client_refuses_stream_id_above_maximum(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    Index = maps:get(next_stream_id, record_positions(nhttp_h2, h2_conn)),
+    LastId = 16#7fffffff,
+    Conn1 = setelement(Index, Conn0, LastId),
+    {ok, LastId, Conn2} = nhttp_h2:open_stream(Conn1),
+    ?assertEqual(LastId + 2, element(Index, Conn2)),
+    {error, stream_ids_exhausted} = nhttp_h2:open_stream(Conn2),
+    ok.
+
 server_rejects_even_client_stream_id(_Config) ->
     Conn0 = server_with_preface(),
     HeaderBlock = encode_headers(minimal_request_headers()),
@@ -285,11 +322,102 @@ settings_initial_window_size_updates_streams(_Config) ->
     HeaderBlock = encode_headers(minimal_request_headers()),
     {ok, F1} = nhttp_h2_frame:headers(1, nofin, fin, HeaderBlock),
     {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(F1)),
+    ?assertEqual({ok, 65535}, nhttp_h2:stream_send_window(Conn1, 1)),
     {ok, S} = nhttp_h2_frame:settings(#{initial_window_size => 131070}),
-    Result = nhttp_h2:recv(Conn1, iolist_to_binary(S)),
-    {ok, Events, _Conn2, _OutData} = Result,
-    ?assert(lists:any(fun({window_update, 1, 65535}) -> true; (_) -> false end, Events)),
+    {ok, [{settings, #{initial_window_size := 131070}}], Conn2, _OutData} =
+        nhttp_h2:recv(Conn1, iolist_to_binary(S)),
+    ?assertEqual({ok, 131070}, nhttp_h2:stream_send_window(Conn2, 1)),
     ok.
+
+settings_initial_window_size_reaches_idle_stream(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    ?assertEqual({ok, 65535}, nhttp_h2:stream_send_window(Conn1, StreamId)),
+    {ok, S} = nhttp_h2_frame:settings(#{initial_window_size => 100000, max_frame_size => 131072}),
+    {ok, [{settings, _}], Conn2, _} = nhttp_h2:recv(Conn1, iolist_to_binary(S)),
+    ?assertEqual({ok, 100000}, nhttp_h2:stream_send_window(Conn2, StreamId)),
+    {ok, Wu} = nhttp_h2_frame:window_update(100000),
+    {ok, [{window_update, 0, 100000}], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Wu)),
+    {ok, Conn4, _} = nhttp_h2:send_headers(Conn3, StreamId, minimal_request_headers(), nofin),
+    Body = binary:copy(<<$a>>, 100000),
+    {ok, Conn5, Frame} = nhttp_h2:send_data(Conn4, StreamId, Body, fin),
+    ?assertEqual(100000 + 9, iolist_size(Frame)),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn5, StreamId)),
+    ?assertEqual(65535, nhttp_h2:connection_send_window(Conn5)),
+    ok.
+
+settings_initial_window_size_shrink_retains_negative_window(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
+    {ok, Conn3, _} = nhttp_h2:send_data(Conn2, StreamId, binary:copy(<<0>>, 16384), nofin),
+    ?assertEqual({ok, 65535 - 16384}, nhttp_h2:stream_send_window(Conn3, StreamId)),
+    {ok, S} = nhttp_h2_frame:settings(#{initial_window_size => 1}),
+    {ok, [{settings, _}], Conn4, _} = nhttp_h2:recv(Conn3, iolist_to_binary(S)),
+    ?assertEqual({ok, 1 - 16384}, nhttp_h2:stream_send_window(Conn4, StreamId)),
+    {partial, Conn4, [], <<"x">>, nofin, -16383} = nhttp_h2:send_data(Conn4, StreamId, <<"x">>, nofin),
+    {ok, Wu} = nhttp_h2_frame:window_update(StreamId, 16384),
+    {ok, [{window_update, StreamId, 16384}], Conn5} = nhttp_h2:recv(Conn4, iolist_to_binary(Wu)),
+    ?assertEqual({ok, 1}, nhttp_h2:stream_send_window(Conn5, StreamId)),
+    {ok, _Conn6, Frame} = nhttp_h2:send_data(Conn5, StreamId, <<"x">>, nofin),
+    {ok, {data, StreamId, nofin, <<"x">>}, _} = nhttp_h2_frame:decode(iolist_to_binary(Frame)),
+    ok.
+
+settings_initial_window_size_overflow_is_connection_error(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, S1} = nhttp_h2_frame:settings(#{initial_window_size => 1000}),
+    {ok, [{settings, _}], Conn1, _} = nhttp_h2:recv(Conn0, iolist_to_binary(S1)),
+    {ok, StreamId, Conn2} = nhttp_h2:open_stream(Conn1),
+    {ok, Conn3, _} = nhttp_h2:send_headers(Conn2, StreamId, minimal_request_headers(), nofin),
+    {ok, Wu} = nhttp_h2_frame:window_update(StreamId, 16#7fffffff - 1000),
+    {ok, [{window_update, StreamId, _}], Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(Wu)),
+    {ok, S2} = nhttp_h2_frame:settings(#{initial_window_size => 16#7fffffff}),
+    {error, {connection_error, flow_control_error, _}} =
+        nhttp_h2:recv(Conn4, iolist_to_binary(S2)),
+    ok.
+
+settings_initial_window_size_emits_no_window_update_event(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, S1} = nhttp_h2_frame:settings(#{max_concurrent_streams => 1000}),
+    {ok, [{settings, _}], Conn1, _} = nhttp_h2:recv(Conn0, iolist_to_binary(S1)),
+    Conn2 = open_streams_with_headers(Conn1, 1000),
+    ?assertEqual(1000, maps:get(active, nhttp_h2:stream_stats(Conn2))),
+    {ok, S2} = nhttp_h2_frame:settings(#{initial_window_size => 131070}),
+    {ok, Events, Conn3, _} = nhttp_h2:recv(Conn2, iolist_to_binary(S2)),
+    ?assertMatch([{settings, #{initial_window_size := 131070}}], Events),
+    ?assertEqual({ok, 131070}, nhttp_h2:stream_send_window(Conn3, 1)),
+    ?assertEqual({ok, 131070}, nhttp_h2:stream_send_window(Conn3, 1999)),
+    ok.
+
+zero_length_end_stream_data_is_sent_at_zero_window(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
+    Conn3 = send_chunks(Conn2, StreamId, [16384, 16384, 16384, 16383]),
+    {ok, Conn4, Frame} = nhttp_h2:send_data(Conn3, StreamId, <<>>, fin),
+    {ok, {data, StreamId, fin, <<>>}, _} = nhttp_h2_frame:decode(iolist_to_binary(Frame)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn3)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn4)),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn4, StreamId)),
+    {error, {stream_closed, StreamId}} = nhttp_h2:send_data(Conn4, StreamId, <<"x">>, nofin),
+    RespBlock = encode_headers([{<<":status">>, <<"204">>}]),
+    {ok, Resp} = nhttp_h2_frame:headers(StreamId, fin, fin, RespBlock),
+    {ok, [{response, StreamId, #{status := 204}, fin}], _Conn5} =
+        nhttp_h2:recv(Conn4, iolist_to_binary(Resp)),
+    ok.
+
+open_streams_with_headers(Conn, 0) ->
+    Conn;
+open_streams_with_headers(Conn0, N) ->
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
+    open_streams_with_headers(Conn2, N - 1).
+
+send_chunks(Conn, _StreamId, []) ->
+    Conn;
+send_chunks(Conn0, StreamId, [Size | Sizes]) ->
+    {ok, Conn1, _} = nhttp_h2:send_data(Conn0, StreamId, binary:copy(<<0>>, Size), nofin),
+    send_chunks(Conn1, StreamId, Sizes).
 
 settings_header_table_size_propagates_to_hpack(_Config) ->
     Conn0 = server_with_preface(),
@@ -802,6 +930,18 @@ encode_headers(Headers) ->
 
 minimal_request_headers() ->
     [{<<":method">>, <<"GET">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}].
+
+record_positions(Module, Record) ->
+    Beam = filename:join([code:lib_dir(nhttp_lib), "ebin", atom_to_list(Module) ++ ".beam"]),
+    {ok, {Module, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
+        beam_lib:chunks(Beam, [abstract_code]),
+    [Fields] = [Fs || {attribute, _, record, {R, Fs}} <- Forms, R =:= Record],
+    Names = [record_field_name(Field) || Field <- Fields],
+    maps:from_list(lists:zip(Names, lists:seq(2, length(Names) + 1))).
+
+record_field_name({typed_record_field, Field, _Type}) -> record_field_name(Field);
+record_field_name({record_field, _, {atom, _, Name}}) -> Name;
+record_field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.
 
 assert_request_rejected(Headers) ->
     Conn0 = server_with_preface(),

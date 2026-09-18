@@ -45,14 +45,17 @@ Tests RFC 9113 compliance for:
     settings_exchange/1,
     settings_ack_sent/1,
     settings_updates_peer/1,
-    settings_initial_window_size_update/1
+    settings_initial_window_size_update/1,
+    peer_settings_reports_peer_values/1
 ]).
 
 -export([
     connection_window_update/1,
     stream_window_update/1,
     window_overflow_error/1,
-    data_consumes_window/1
+    data_consumes_window/1,
+    send_data_empty_nofin_at_zero_window_is_partial/1,
+    send_window_update_recv_window_overflow/1
 ]).
 
 -export([
@@ -200,13 +203,16 @@ groups() ->
             settings_exchange,
             settings_ack_sent,
             settings_updates_peer,
-            settings_initial_window_size_update
+            settings_initial_window_size_update,
+            peer_settings_reports_peer_values
         ]},
         {flow_control, [parallel], [
             connection_window_update,
             stream_window_update,
             window_overflow_error,
-            data_consumes_window
+            data_consumes_window,
+            send_data_empty_nofin_at_zero_window_is_partial,
+            send_window_update_recv_window_overflow
         ]},
         {header_processing, [parallel], [
             headers_single_frame,
@@ -467,6 +473,25 @@ settings_initial_window_size_update(_Config) ->
     ?assertMatch([{settings, #{initial_window_size := 131072}} | _], Events),
     ok.
 
+peer_settings_reports_peer_values(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    Defaults = nhttp_h2:peer_settings(Conn0),
+    ?assertEqual(65535, maps:get(initial_window_size, Defaults)),
+    ?assertEqual(16384, maps:get(max_frame_size, Defaults)),
+    Settings = #{
+        initial_window_size => 1048576,
+        max_frame_size => 32768,
+        max_concurrent_streams => 1000
+    },
+    {ok, Frame} = nhttp_h2_frame:settings(Settings),
+    {ok, [{settings, Settings}], Conn1, _Ack} = nhttp_h2:recv(Conn0, iolist_to_binary(Frame)),
+    Peer = nhttp_h2:peer_settings(Conn1),
+    ?assertEqual(1048576, maps:get(initial_window_size, Peer)),
+    ?assertEqual(32768, maps:get(max_frame_size, Peer)),
+    ?assertEqual(1000, maps:get(max_concurrent_streams, Peer)),
+    ?assertEqual(4096, maps:get(header_table_size, Peer)),
+    ok.
+
 %%%-----------------------------------------------------------------------------
 %%% FLOW CONTROL TESTS
 %%%-----------------------------------------------------------------------------
@@ -698,8 +723,41 @@ send_data_on_closed_stream(_Config) ->
 
 send_window_update_unknown_stream(_Config) ->
     Conn0 = nhttp_h2:new(client),
-    {error, {stream_error, 99, protocol_error, _}} = nhttp_h2:send_window_update(Conn0, 99, 1000),
+    {ok, Conn0, []} = nhttp_h2:send_window_update(Conn0, 99, 1000),
     ok.
+
+send_data_empty_nofin_at_zero_window_is_partial(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    Headers = [{<<":method">>, <<"POST">>}, {<<":path">>, <<"/">>}],
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, nofin),
+    Conn3 = send_until_stream_window_is_zero(Conn2, StreamId),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn3, StreamId)),
+    {partial, Conn3, [], <<>>, nofin, 0} = nhttp_h2:send_data(Conn3, StreamId, <<>>, nofin),
+    ok.
+
+send_window_update_recv_window_overflow(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    RoomToMax = 16#7fffffff - 65535,
+    {ok, Conn2, ConnFrame} = nhttp_h2:send_window_update(Conn1, connection, RoomToMax),
+    ?assert(iolist_size(ConnFrame) > 0),
+    {error, {recv_window_overflow, connection}} =
+        nhttp_h2:send_window_update(Conn2, connection, 1),
+    {ok, Conn3, StreamFrame} = nhttp_h2:send_window_update(Conn2, StreamId, RoomToMax),
+    ?assert(iolist_size(StreamFrame) > 0),
+    {error, {recv_window_overflow, StreamId}} = nhttp_h2:send_window_update(Conn3, StreamId, 1),
+    ok.
+
+send_until_stream_window_is_zero(Conn, StreamId) ->
+    case nhttp_h2:stream_send_window(Conn, StreamId) of
+        {ok, 0} ->
+            Conn;
+        {ok, Window} ->
+            Chunk = binary:copy(<<0>>, min(Window, 16384)),
+            {ok, NewConn, _} = nhttp_h2:send_data(Conn, StreamId, Chunk, nofin),
+            send_until_stream_window_is_zero(NewConn, StreamId)
+    end.
 
 open_stream_after_goaway_sent(_Config) ->
     Conn0 = nhttp_h2:new(server),

@@ -16,6 +16,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now removes the keys that bind to the evicted sequence. A key that a
   later insertion of the same header or the same name rebound to a newer
   sequence survives the eviction of the older entry.
+- `nhttp_h2:send_data/4` held back an empty payload with `fin` at a send
+  window of zero. The stream never closed, and the caller waited for
+  credit that no frame consumes. The empty END_STREAM frame is now sent at
+  any window value (RFC 9113 Section 6.9.1)
+- A SETTINGS_INITIAL_WINDOW_SIZE change that took a stream send window
+  past 2^31-1 was applied without a bound test. The change is now a
+  connection error of type FLOW_CONTROL_ERROR (RFC 9113 Section 6.9.2)
+- A SETTINGS frame with a positive SETTINGS_INITIAL_WINDOW_SIZE delta
+  reported one synthetic `window_update` event per stream. The codec
+  adjusts every stream window itself and reports `{settings, _}` only. A
+  `window_update` event now mirrors one WINDOW_UPDATE frame from the peer
+- `nhttp_h2:send_window_update/3` tested the increment against 2^31-1 and
+  not the sum. An increment that takes the local receive window past the
+  bound is now refused as `{recv_window_overflow, Target}` and nothing is
+  sent (RFC 9113 Section 6.9.1)
+- `nhttp_h2:send_window_update/3` answered a stream error for a stream
+  that the codec no longer tracks. That stream closed, so the call now
+  answers `{ok, Conn, []}` and sends nothing
+- A client ignored a WINDOW_UPDATE frame on an idle stream. It is now a
+  connection error of type PROTOCOL_ERROR, as it already was for a server
+  (RFC 9113 Section 5.1)
+- `nhttp_h2:open_stream/1` advanced `next_stream_id` past 2^31-1, and the
+  frame encoder then truncated the identifier to 31 bits. The call now
+  answers `{error, stream_ids_exhausted}` and the caller must open a new
+  connection (RFC 9113 Section 5.1.1)
+
+### Added
+
+- `nhttp_h2:connection_send_window/1` reads the connection send window
+- `nhttp_h2:stream_send_window/2` reads the send window of one stream
+- `nhttp_h2:peer_settings/1` reads the settings the peer sent, merged over
+  the defaults
+
+### Changed
+
+- `t:nhttp_h2:send_result/0` no longer carries the `{ok, conn()}` arm,
+  which no function returned. `nhttp_h2:send_headers/4` carries its own
+  spec of `{ok, conn(), iodata()} | {error, send_error()}`
 - Support partial UTF for WS compliance
 
 ### Performance

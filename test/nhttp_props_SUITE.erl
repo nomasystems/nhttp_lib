@@ -113,7 +113,8 @@ groups() ->
             h2_flow_control_consumes,
             h2_settings_roundtrip,
             h2_settings_update_peer,
-            h2_continuation_sequence
+            h2_continuation_sequence,
+            h2_send_within_credit
         ]},
         {qpack_props, [parallel], [
             qpack_roundtrip_static,
@@ -415,6 +416,9 @@ h2_settings_update_peer(Config) ->
 
 h2_continuation_sequence(Config) ->
     run_property(nhttp_h2_props, prop_continuation_sequence, Config).
+
+h2_send_within_credit(Config) ->
+    run_property(nhttp_h2_props, prop_send_within_credit, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% QPACK PROPERTY TESTS
