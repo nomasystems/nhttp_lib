@@ -65,6 +65,7 @@ groups() ->
             settings_initial_window_size_updates_streams,
             settings_initial_window_size_reaches_idle_stream,
             settings_initial_window_size_shrink_retains_negative_window,
+            settings_initial_window_size_growth_drains_queued_data,
             settings_initial_window_size_overflow_is_connection_error,
             settings_initial_window_size_emits_no_window_update_event,
             zero_length_end_stream_data_is_sent_at_zero_window,
@@ -345,6 +346,30 @@ settings_initial_window_size_reaches_idle_stream(_Config) ->
     ?assertEqual(100000 + 9, iolist_size(Frame)),
     ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn5, StreamId)),
     ?assertEqual(65535, nhttp_h2:connection_send_window(Conn5)),
+    ok.
+
+settings_initial_window_size_growth_drains_queued_data(_Config) ->
+    Conn0 = nhttp_h2:new(client, #{send_queue => true}),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
+    {ok, Wu} = nhttp_h2_frame:window_update(100000),
+    {ok, [{window_update, 0, 100000}], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Wu)),
+    Body = binary:copy(<<$a>>, 70000),
+    {queued, Conn4, _Frames, 4465} = nhttp_h2:send_data(Conn3, StreamId, Body, fin),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn4, StreamId)),
+    {ok, S} = nhttp_h2_frame:settings(#{initial_window_size => 131070}),
+    {ok, Events, Conn5, OutData} = nhttp_h2:recv(Conn4, iolist_to_binary(S)),
+    ?assertMatch(
+        [{settings, #{initial_window_size := 131070}}, {data_sent, StreamId, 4465, fin}], Events
+    ),
+    Bin = iolist_to_binary(OutData),
+    {ok, settings_ack, Consumed} = nhttp_h2_frame:decode(Bin),
+    <<_:Consumed/binary, Rest/binary>> = Bin,
+    {ok, {data, StreamId, fin, Payload}, _} = nhttp_h2_frame:decode(Rest),
+    ?assertEqual(4465, byte_size(Payload)),
+    ?assertEqual({ok, 131070 - 70000}, nhttp_h2:stream_send_window(Conn5, StreamId)),
+    ?assertEqual(165535 - 70000, nhttp_h2:connection_send_window(Conn5)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn5)),
     ok.
 
 settings_initial_window_size_shrink_retains_negative_window(_Config) ->

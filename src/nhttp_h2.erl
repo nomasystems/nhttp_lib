@@ -45,6 +45,22 @@ exchange into discrete frame sends. The pattern is:
 For a one-shot send when the body is already a single `iodata()`, call
 `send_headers/4` with `nofin` followed by `send_data/4` with `fin`.
 Flow-control and END_STREAM ride on the DATA frame.
+
+## Send queue
+
+With `send_queue => true`, `send_data/4` holds what the credit cannot
+take and answers `{queued, Conn, Frames, Buffered}`. `recv/2` emits the
+held octets as credit arrives, after its control frames, round-robin
+with one frame per stream per turn, and reports
+`{data_sent, StreamId, Bytes, Fin}` per stream. The caller MUST write
+every iodata the codec returns, in order, from one process.
+
+`max_send_buffer` (128 KiB) and `max_queued_streams` (a quarter of the
+peer `SETTINGS_MAX_CONCURRENT_STREAMS`) refuse an offer as
+`{error, send_buffer_full}`. RST_STREAM in either direction and GOAWAY
+purge the queue without restoring credit. A queued `fin` leaves the
+stream `open` until the frame goes out, and `send_headers/4` behind
+queued data answers `{error, {data_pending, StreamId}}`.
 """.
 
 -include("nhttp_msg.hrl").
@@ -54,8 +70,11 @@ Flow-control and END_STREAM ride on the DATA frame.
 %%%-----------------------------------------------------------------------------
 -compile({inline, [is_active_state/1]}).
 -compile({inline, [is_peer_initiated/2]}).
+-compile({inline, [is_send_state/1]}).
 -compile({inline, [update_peer_opened_count/5]}).
+-compile({inline, [finish_recv/3]}).
 -compile({inline, [frames/2]}).
+-compile({inline, [recv_result/3]}).
 -compile({inline, [transition_on_recv_end_stream/2]}).
 -compile({inline, [transition_on_send_end_stream/2]}).
 
@@ -104,6 +123,9 @@ Flow-control and END_STREAM ride on the DATA frame.
     encoder_table_entries/1,
     encoder_table_size/1,
     peer_settings/1,
+    queued_streams/1,
+    send_buffer_bytes/1,
+    send_buffer_bytes/2,
     stream_send_window/2
 ]).
 
@@ -141,13 +163,16 @@ Flow-control and END_STREAM ride on the DATA frame.
 Connection settings.
 
 Most keys map to a SETTINGS parameter of RFC 9113 Section 6.5.2 and go on
-the wire. `max_continuation_frames`, `max_reset_streams` and
-`hpack_index_policy` are local policy. They have no wire representation,
+the wire. `max_continuation_frames`, `max_reset_streams`,
+`hpack_index_policy`, `send_queue`, `max_send_buffer` and
+`max_queued_streams` are local policy. They have no wire representation,
 and the encoder drops them. The first two bound work that a peer can
 request. `hpack_index_policy` reaches `nhttp_hpack:new/2` and names the
 fields that the HPACK encoder keeps out of its dynamic table. The
 `nhttp_hpack` module documentation gives the two literal forms and the
-sets that fit a deployment.
+sets that fit a deployment. `send_queue`, `max_send_buffer` and
+`max_queued_streams` configure the send queue of the module
+documentation.
 
 `max_continuation_frames` bounds the number of CONTINUATION frames in one
 field section, per RFC 9113 Section 10.5. An empty CONTINUATION frame adds
@@ -168,7 +193,10 @@ CONTINUATION frames that carry the larger field section.
     max_continuation_frames => pos_integer() | infinity,
     enable_connect_protocol => boolean(),
     max_reset_streams => pos_integer() | infinity,
-    hpack_index_policy => nhttp_hpack:index_policy()
+    hpack_index_policy => nhttp_hpack:index_policy(),
+    send_queue => boolean(),
+    max_send_buffer => pos_integer() | infinity,
+    max_queued_streams => pos_integer() | infinity
 }.
 
 -type stream_state() ::
@@ -190,12 +218,16 @@ stream id 0 for the connection window. A SETTINGS frame that changes
 `initial_window_size` adjusts every stream send window inside the codec and
 reports `{settings, _}` only. `connection_send_window/1` and
 `stream_send_window/2` read the adjusted windows.
+
+A `data_sent` event reports the octets the send queue emitted for a
+stream in this call, with `Fin` `fin` when the END_STREAM frame went out.
 """.
 -type event() ::
     nhttp_lib:event_common()
     | {stream_closed, nhttp_lib:stream_id(), error_code()}
     | {stream_refused, nhttp_lib:stream_id()}
     | {window_update, nhttp_lib:stream_id(), pos_integer()}
+    | {data_sent, nhttp_lib:stream_id(), non_neg_integer(), fin()}
     | {settings, settings()}
     | settings_ack
     | {ping, binary()}
@@ -218,9 +250,15 @@ Reasons a send function refuses a call.
 `send_window_update/3` takes the local receive window of `Target` past
 2^31-1 (RFC 9113 Section 6.9.1). The codec sent nothing, the peer saw
 nothing, and the connection stays open.
+
+`send_buffer_full` reports an offer past `max_send_buffer` or
+`max_queued_streams`, and `{data_pending, StreamId}` a HEADERS frame on a
+stream with octets in the send queue. Nothing changed in either case.
 """.
 -type send_error() ::
     connection_closing
+    | send_buffer_full
+    | {data_pending, nhttp_lib:stream_id()}
     | {unknown_stream, nhttp_lib:stream_id()}
     | {stream_closed, nhttp_lib:stream_id()}
     | {stream_error, nhttp_lib:stream_id(), error_code(), binary()}
@@ -229,6 +267,7 @@ nothing, and the connection stays open.
 -type send_result() ::
     {ok, conn(), iodata()}
     | {partial, conn(), iodata(), binary(), fin(), Window :: integer()}
+    | {queued, conn(), iodata(), Buffered :: pos_integer()}
     | {error, send_error()}.
 
 %%%-----------------------------------------------------------------------------
@@ -241,6 +280,7 @@ nothing, and the connection stays open.
 -define(H2_PREFACE_LEN, 24).
 -define(H2_HEAP_BINARY_LIMIT, 64).
 -define(H2_REMAINDER_RETENTION_RATIO, 4).
+-define(H2_DEFAULT_MAX_SEND_BUFFER, 131072).
 
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS (RFC 9113 SECTION 6.5.2)
@@ -265,6 +305,18 @@ nothing, and the connection stays open.
     headers_received = false :: boolean()
 }).
 
+-record(pending, {
+    data :: iodata(),
+    size :: pos_integer(),
+    fin :: fin()
+}).
+
+-record(send_q, {
+    pending :: #{nhttp_lib:stream_id() => #pending{}},
+    order :: queue:queue(nhttp_lib:stream_id()),
+    bytes :: non_neg_integer()
+}).
+
 -record(h2_conn, {
     role :: role(),
     state = preface :: preface | open | closing | closed,
@@ -287,7 +339,10 @@ nothing, and the connection stays open.
     goaway_sent = false :: boolean(),
     goaway_received = false :: boolean(),
     last_good_stream_id = 0 :: nhttp_lib:stream_id(),
-    peer = undefined :: undefined | nhttp_lib:peer()
+    peer = undefined :: undefined | nhttp_lib:peer(),
+    send_q = undefined :: undefined | #send_q{},
+    max_send_buffer = ?H2_DEFAULT_MAX_SEND_BUFFER :: pos_integer() | infinity,
+    max_queued_streams = undefined :: undefined | pos_integer() | infinity
 }).
 
 -opaque conn() :: #h2_conn{}.
@@ -306,6 +361,8 @@ new(Role, LocalSettings) ->
     MergedSettings = maps:merge(default_settings(), LocalSettings),
     HeaderTableSize = maps:get(header_table_size, MergedSettings, ?H2_DEFAULT_HEADER_TABLE_SIZE),
     IndexPolicy = maps:get(hpack_index_policy, MergedSettings, #{}),
+    MaxSendBuffer = maps:get(max_send_buffer, MergedSettings, ?H2_DEFAULT_MAX_SEND_BUFFER),
+    MaxQueuedStreams = maps:get(max_queued_streams, MergedSettings, undefined),
     {ok, HpackEnc} = nhttp_hpack:new(HeaderTableSize, IndexPolicy),
     {ok, HpackDec} = nhttp_hpack:new(HeaderTableSize),
     #h2_conn{
@@ -315,7 +372,9 @@ new(Role, LocalSettings) ->
         peer_settings = default_settings(),
         next_stream_id = initial_stream_id(Role),
         hpack_enc = HpackEnc,
-        hpack_dec = HpackDec
+        hpack_dec = HpackDec,
+        max_send_buffer = MaxSendBuffer,
+        max_queued_streams = MaxQueuedStreams
     }.
 
 -doc "Generate the connection preface for this role. Client sends: magic + SETTINGS. Server sends: SETTINGS.".
@@ -346,7 +405,12 @@ set_peer(#h2_conn{} = Conn, {{_, _, _, _, _, _, _, _}, Port} = Peer) when
 %%%-----------------------------------------------------------------------------
 %% RECEIVING
 %%%-----------------------------------------------------------------------------
--doc "Process incoming data and return events. May return frames to send (e.g., SETTINGS_ACK, PING_ACK, WINDOW_UPDATE).".
+-doc """
+Process incoming data and return events.
+
+The four-tuple arm carries frames for the caller to write: SETTINGS ACK,
+PING ACK and RST_STREAM, then the DATA frames the send queue emitted.
+""".
 -spec recv(conn(), binary()) -> recv_result().
 recv(#h2_conn{role = server, state = preface, buffer = <<>>} = Conn, Data) ->
     maybe
@@ -390,6 +454,14 @@ without payload consumes no flow-control credit (RFC 9113 Section 6.9.1).
 An empty payload with `nofin` at a window of zero or below is held back as
 `{partial, ...}`. The frame is legal, but it carries nothing, so the codec
 declines to spend a frame on it.
+
+With `send_queue => true` the call never answers `{partial, ...}`. A
+payload that outruns the credit comes back as
+`{queued, Conn, Frames, Buffered}`, where `Buffered` is the octet count
+of this stream that the codec holds. An empty payload with `nofin`
+answers `{ok, Conn, []}` at any window, an empty `fin` behind pending
+octets rides the last drained frame, and a stream whose pending entry
+carries `fin` answers `{error, {stream_closed, StreamId}}`.
 """.
 -spec send_data(conn(), nhttp_lib:stream_id(), iodata(), fin()) -> send_result().
 send_data(#h2_conn{} = Conn, StreamId, Data, EndStream) ->
@@ -411,15 +483,19 @@ send_goaway(#h2_conn{last_peer_stream_id = LastStreamId} = Conn, ErrorCode, Debu
     },
     {ok, NewConn, Frame}.
 
--doc "Send HEADERS frame for a new request/response or trailers.".
+-doc """
+Send HEADERS frame for a new request/response or trailers.
+
+A stream with octets in the send queue answers
+`{error, {data_pending, StreamId}}`.
+""".
 -spec send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) ->
     {ok, conn(), iodata()} | {error, send_error()}.
 send_headers(#h2_conn{} = Conn, StreamId, Headers, EndStream) ->
-    case validate_send_headers(Conn, StreamId) of
-        ok ->
-            do_send_headers(Conn, StreamId, Headers, EndStream);
-        {error, _} = Error ->
-            Error
+    maybe
+        ok ?= validate_send_headers(Conn, StreamId),
+        ok ?= validate_no_pending_data(Conn, StreamId),
+        do_send_headers(Conn, StreamId, Headers, EndStream)
     end.
 
 -doc """
@@ -432,7 +508,13 @@ send_ping(#h2_conn{} = Conn, <<_:8/binary>> = OpaqueData) ->
     {ok, Frame} = nhttp_h2_frame:ping(OpaqueData),
     {ok, Conn, Frame}.
 
--doc "Send RST_STREAM to cancel a stream.".
+-doc """
+Send RST_STREAM to cancel a stream.
+
+The call removes the stream and purges its send queue entry. The purge
+changes no window: octets already emitted stay debited until the peer
+credits stream 0 (RFC 9113 Section 6.9.1).
+""".
 -spec send_rst_stream(conn(), nhttp_lib:stream_id(), error_code()) -> send_result().
 send_rst_stream(#h2_conn{} = Conn, StreamId, ErrorCode) ->
     {ok, Frame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
@@ -620,6 +702,30 @@ the payload of one DATA frame.
 peer_settings(#h2_conn{peer_settings = Settings}) ->
     Settings.
 
+-doc "Return the number of streams with an entry in the send queue.".
+-spec queued_streams(conn()) -> non_neg_integer().
+queued_streams(#h2_conn{send_q = undefined}) ->
+    0;
+queued_streams(#h2_conn{send_q = #send_q{pending = Pending}}) ->
+    map_size(Pending).
+
+-doc "Return the octets the send queue holds on the connection.".
+-spec send_buffer_bytes(conn()) -> non_neg_integer().
+send_buffer_bytes(#h2_conn{send_q = undefined}) ->
+    0;
+send_buffer_bytes(#h2_conn{send_q = #send_q{bytes = Bytes}}) ->
+    Bytes.
+
+-doc "Return the octets the send queue holds for one stream, 0 without an entry.".
+-spec send_buffer_bytes(conn(), nhttp_lib:stream_id()) -> non_neg_integer().
+send_buffer_bytes(#h2_conn{send_q = undefined}, _StreamId) ->
+    0;
+send_buffer_bytes(#h2_conn{send_q = #send_q{pending = Pending}}, StreamId) ->
+    case Pending of
+        #{StreamId := #pending{size = Size}} -> Size;
+        #{} -> 0
+    end.
+
 -doc """
 Return the send window of one stream in octets.
 
@@ -682,7 +788,11 @@ check_stream_concurrency(#h2_conn{
     end.
 
 -spec close_stream(conn(), nhttp_lib:stream_id()) -> conn().
-close_stream(#h2_conn{streams = Streams, active_stream_count = Count} = Conn, StreamId) ->
+close_stream(Conn, StreamId) ->
+    purge_pending(remove_stream(Conn, StreamId), StreamId).
+
+-spec remove_stream(conn(), nhttp_lib:stream_id()) -> conn().
+remove_stream(#h2_conn{streams = Streams, active_stream_count = Count} = Conn, StreamId) ->
     case maps:get(StreamId, Streams, undefined) of
         undefined ->
             Conn;
@@ -863,14 +973,25 @@ derived_continuation_bound(Settings) ->
     end.
 
 -spec do_send_data(conn(), nhttp_lib:stream_id(), iodata(), fin()) -> send_result().
-do_send_data(#h2_conn{streams = Streams} = Conn, StreamId, Data, EndStream) ->
+do_send_data(#h2_conn{send_q = undefined, streams = Streams} = Conn, StreamId, Data, EndStream) ->
     Stream = maps:get(StreamId, Streams),
-    do_send_data(Conn, Stream, Data, iolist_size(Data), EndStream, []).
+    do_send_data(Conn, Stream, Data, iolist_size(Data), EndStream, []);
+do_send_data(#h2_conn{send_q = #send_q{pending = Pending}} = Conn, StreamId, Data, EndStream) ->
+    case Pending of
+        #{StreamId := #pending{fin = fin}} ->
+            {error, {stream_closed, StreamId}};
+        #{StreamId := Entry} ->
+            append_offer(Conn, StreamId, Entry, Data, iolist_size(Data), EndStream);
+        #{} ->
+            queue_offer(Conn, StreamId, Data, iolist_size(Data), EndStream)
+    end.
 
 -spec do_send_data(conn(), #h2_stream{}, iodata(), non_neg_integer(), fin(), [iodata()]) ->
     send_result().
 do_send_data(Conn, Stream, Data, 0, fin, []) ->
     emit_data(Conn, Stream, Data, 0, fin, []);
+do_send_data(#h2_conn{local_settings = #{send_queue := true}} = Conn, _Stream, _Data, 0, nofin, []) ->
+    {ok, Conn, []};
 do_send_data(
     #h2_conn{send_window = ConnWindow, peer_settings = PeerSettings} = Conn,
     #h2_stream{id = StreamId, send_window = StreamWindow} = Stream,
@@ -921,7 +1042,18 @@ emit_data(
     {ok, NewConn, frames(Frame, Frames)}.
 
 -spec hold_data(conn(), #h2_stream{}, iodata(), fin(), integer(), [iodata()]) ->
-    {partial, conn(), iodata(), binary(), fin(), integer()}.
+    {partial, conn(), iodata(), binary(), fin(), integer()}
+    | {queued, conn(), iodata(), pos_integer()}
+    | {error, send_buffer_full}.
+hold_data(
+    #h2_conn{local_settings = #{send_queue := true}} = Conn,
+    Stream,
+    Data,
+    EndStream,
+    _Window,
+    Frames
+) ->
+    queue_remainder(Conn, Stream, remainder(Data), EndStream, Frames);
 hold_data(Conn, _Stream, Data, EndStream, Window, []) ->
     {partial, Conn, [], remainder(Data), EndStream, Window};
 hold_data(
@@ -934,6 +1066,12 @@ hold_data(
 ) ->
     NewConn = Conn#h2_conn{streams = store_or_remove_stream(Streams, StreamId, Stream)},
     {partial, NewConn, frames(Frame, Frames), remainder(Data), EndStream, Window}.
+
+-spec frames([iodata()]) -> iodata().
+frames([]) ->
+    [];
+frames([Frame | Frames]) ->
+    frames(Frame, Frames).
 
 -spec frames(iodata(), [iodata()]) -> iodata().
 frames(Frame, []) ->
@@ -968,7 +1106,10 @@ take([Nested | Rest], N, Taken) ->
 
 -spec remainder(iodata()) -> binary().
 remainder(Data) ->
-    Rest = iolist_to_binary(Data),
+    retain_binary(iolist_to_binary(Data)).
+
+-spec retain_binary(binary()) -> binary().
+retain_binary(Rest) ->
     Size = byte_size(Rest),
     case
         Size > ?H2_HEAP_BINARY_LIMIT andalso
@@ -979,6 +1120,334 @@ remainder(Data) ->
         false ->
             Rest
     end.
+
+-spec retain(iodata()) -> iodata().
+retain(Rest) when is_binary(Rest) ->
+    retain_binary(Rest);
+retain([Head | Rest]) when is_binary(Head) ->
+    [retain_binary(Head) | Rest];
+retain(Rest) ->
+    Rest.
+
+-spec queue_remainder(conn(), #h2_stream{}, binary(), fin(), [iodata()]) ->
+    {queued, conn(), iodata(), pos_integer()} | {error, send_buffer_full}.
+queue_remainder(
+    #h2_conn{streams = Streams} = Conn, #h2_stream{id = StreamId} = Stream, Rest, EndStream, Frames
+) ->
+    Size = byte_size(Rest),
+    maybe
+        ok ?= check_send_buffer(Conn, Size, new_entry),
+        Entry = #pending{data = Rest, size = Size, fin = EndStream},
+        SendQ = #send_q{
+            pending = #{StreamId => Entry}, order = queue:from_list([StreamId]), bytes = Size
+        },
+        NewConn = Conn#h2_conn{streams = Streams#{StreamId => Stream}, send_q = SendQ},
+        {queued, NewConn, frames(Frames), Size}
+    end.
+
+-spec queue_offer(conn(), nhttp_lib:stream_id(), iodata(), non_neg_integer(), fin()) ->
+    send_result().
+queue_offer(Conn, _StreamId, _Data, 0, nofin) ->
+    {ok, Conn, []};
+queue_offer(#h2_conn{streams = Streams} = Conn, StreamId, Data, 0, fin) ->
+    emit_data(Conn, maps:get(StreamId, Streams), Data, 0, fin, []);
+queue_offer(
+    #h2_conn{send_q = #send_q{pending = Pending, order = Order, bytes = Bytes} = SendQ} = Conn,
+    StreamId,
+    Data,
+    Size,
+    EndStream
+) ->
+    maybe
+        ok ?= check_send_buffer(Conn, Size, new_entry),
+        Entry = #pending{data = offer_data(Data), size = Size, fin = EndStream},
+        NewSendQ = SendQ#send_q{
+            pending = Pending#{StreamId => Entry},
+            order = enqueue_once(StreamId, Order),
+            bytes = Bytes + Size
+        },
+        {NewConn, Frames, _Events} = drain_send_q(Conn#h2_conn{send_q = NewSendQ}),
+        offer_result(NewConn, StreamId, Frames)
+    end.
+
+-spec append_offer(
+    conn(), nhttp_lib:stream_id(), #pending{}, iodata(), non_neg_integer(), fin()
+) -> send_result().
+append_offer(Conn, _StreamId, _Entry, _Data, 0, nofin) ->
+    {ok, Conn, []};
+append_offer(
+    #h2_conn{send_q = #send_q{pending = Pending} = SendQ} = Conn,
+    StreamId,
+    #pending{size = Size} = Entry,
+    _Data,
+    0,
+    fin
+) ->
+    NewSendQ = SendQ#send_q{pending = Pending#{StreamId := Entry#pending{fin = fin}}},
+    {queued, Conn#h2_conn{send_q = NewSendQ}, [], Size};
+append_offer(
+    #h2_conn{send_q = #send_q{pending = Pending, bytes = Bytes} = SendQ} = Conn,
+    StreamId,
+    #pending{data = Held, size = Size} = Entry,
+    Data,
+    DataSize,
+    EndStream
+) ->
+    maybe
+        ok ?= check_send_buffer(Conn, DataSize, same_entry),
+        NewSize = Size + DataSize,
+        NewEntry = Entry#pending{
+            data = append_data(Held, Data), size = NewSize, fin = EndStream
+        },
+        NewSendQ = SendQ#send_q{pending = Pending#{StreamId := NewEntry}, bytes = Bytes + DataSize},
+        {queued, Conn#h2_conn{send_q = NewSendQ}, [], NewSize}
+    end.
+
+-spec offer_data(iodata()) -> iodata().
+offer_data(Data) when is_binary(Data) ->
+    Data;
+offer_data(Data) ->
+    [Data].
+
+-spec append_data(iodata(), iodata()) -> iodata().
+append_data(Held, Data) when is_binary(Held) ->
+    [Held, Data];
+append_data(Held, Data) ->
+    Held ++ [Data].
+
+-spec enqueue_once(nhttp_lib:stream_id(), queue:queue(nhttp_lib:stream_id())) ->
+    queue:queue(nhttp_lib:stream_id()).
+enqueue_once(StreamId, Order) ->
+    case queue:member(StreamId, Order) of
+        true -> Order;
+        false -> queue:in(StreamId, Order)
+    end.
+
+-spec offer_result(conn(), nhttp_lib:stream_id(), iodata()) ->
+    {ok, conn(), iodata()} | {queued, conn(), iodata(), pos_integer()}.
+offer_result(#h2_conn{send_q = undefined} = Conn, _StreamId, Frames) ->
+    {ok, Conn, Frames};
+offer_result(#h2_conn{send_q = #send_q{pending = Pending}} = Conn, StreamId, Frames) ->
+    case Pending of
+        #{StreamId := #pending{size = Size}} -> {queued, Conn, Frames, Size};
+        #{} -> {ok, Conn, Frames}
+    end.
+
+-spec check_send_buffer(conn(), non_neg_integer(), new_entry | same_entry) ->
+    ok | {error, send_buffer_full}.
+check_send_buffer(#h2_conn{send_q = SendQ, max_send_buffer = MaxBytes} = Conn, Size, Entry) ->
+    {Bytes, Count} =
+        case SendQ of
+            undefined -> {0, 0};
+            #send_q{bytes = Held, pending = Pending} -> {Held, map_size(Pending)}
+        end,
+    case within_bound(Bytes + Size, MaxBytes) of
+        false ->
+            {error, send_buffer_full};
+        true when Entry =:= same_entry ->
+            ok;
+        true ->
+            case within_bound(Count + 1, queued_streams_bound(Conn)) of
+                true -> ok;
+                false -> {error, send_buffer_full}
+            end
+    end.
+
+-spec within_bound(non_neg_integer(), pos_integer() | infinity) -> boolean().
+within_bound(_Value, infinity) -> true;
+within_bound(Value, Bound) -> Value =< Bound.
+
+-spec queued_streams_bound(conn()) -> pos_integer() | infinity.
+queued_streams_bound(#h2_conn{max_queued_streams = undefined, peer_settings = PeerSettings}) ->
+    case maps:get(max_concurrent_streams, PeerSettings, infinity) of
+        infinity -> infinity;
+        PeerMax -> max(1, PeerMax div 4)
+    end;
+queued_streams_bound(#h2_conn{max_queued_streams = Bound}) ->
+    Bound.
+
+-spec drain_send_q(conn()) -> {conn(), iodata(), [event()]}.
+drain_send_q(#h2_conn{send_window = ConnWindow} = Conn) when ConnWindow =< 0 ->
+    {Conn, [], []};
+drain_send_q(#h2_conn{send_q = #send_q{order = Order}, peer_settings = PeerSettings} = Conn) ->
+    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_DEFAULT_MAX_FRAME_SIZE),
+    round_robin(Conn, MaxFrameSize, Order, queue:new(), queue:new(), [], #{}).
+
+-spec round_robin(
+    conn(),
+    pos_integer(),
+    queue:queue(nhttp_lib:stream_id()),
+    queue:queue(nhttp_lib:stream_id()),
+    queue:queue(nhttp_lib:stream_id()),
+    [iodata()],
+    #{nhttp_lib:stream_id() => {non_neg_integer(), fin()}}
+) -> {conn(), iodata(), [event()]}.
+round_robin(
+    #h2_conn{send_window = ConnWindow} = Conn, _MaxFrameSize, Order, Runnable, Parked, Frames, Sent
+) when
+    ConnWindow =< 0
+->
+    finish_drain(Conn, queue:join(Parked, queue:join(Order, Runnable)), Frames, Sent);
+round_robin(Conn, MaxFrameSize, Order, Runnable, Parked, Frames, Sent) ->
+    case queue:out(Order) of
+        {empty, _} ->
+            case queue:is_empty(Runnable) of
+                true ->
+                    finish_drain(Conn, Parked, Frames, Sent);
+                false ->
+                    round_robin(Conn, MaxFrameSize, Runnable, queue:new(), Parked, Frames, Sent)
+            end;
+        {{value, StreamId}, Rest} ->
+            case drain_turn(Conn, MaxFrameSize, StreamId) of
+                {skip, NewConn} ->
+                    round_robin(NewConn, MaxFrameSize, Rest, Runnable, Parked, Frames, Sent);
+                blocked ->
+                    NewParked = queue:in(StreamId, Parked),
+                    round_robin(Conn, MaxFrameSize, Rest, Runnable, NewParked, Frames, Sent);
+                {sent, NewConn, Frame, Bytes, Fin, 0} ->
+                    NewSent = record_sent(Sent, StreamId, Bytes, Fin),
+                    round_robin(
+                        NewConn, MaxFrameSize, Rest, Runnable, Parked, [Frame | Frames], NewSent
+                    );
+                {sent, NewConn, Frame, Bytes, Fin, _Left} ->
+                    NewSent = record_sent(Sent, StreamId, Bytes, Fin),
+                    NewRunnable = queue:in(StreamId, Runnable),
+                    round_robin(
+                        NewConn, MaxFrameSize, Rest, NewRunnable, Parked, [Frame | Frames], NewSent
+                    )
+            end
+    end.
+
+-spec drain_turn(conn(), pos_integer(), nhttp_lib:stream_id()) ->
+    {skip, conn()}
+    | blocked
+    | {sent, conn(), iodata(), non_neg_integer(), fin(), non_neg_integer()}.
+drain_turn(
+    #h2_conn{send_q = #send_q{pending = Pending}, streams = Streams, send_window = ConnWindow} =
+        Conn,
+    MaxFrameSize,
+    StreamId
+) ->
+    case Pending of
+        #{StreamId := #pending{data = Data, size = Size, fin = Fin}} ->
+            case stream_open_until_queued_fin_leaves(Streams, StreamId) of
+                {ok, #h2_stream{send_window = StreamWindow} = Stream} ->
+                    Quantum = min(min(StreamWindow, ConnWindow), MaxFrameSize),
+                    emit_pending(Conn, Stream, Data, Size, Fin, Quantum);
+                closed_by_peer ->
+                    {skip, remove_pending(Conn, StreamId)}
+            end;
+        #{} ->
+            {skip, Conn}
+    end.
+
+-spec emit_pending(conn(), #h2_stream{}, iodata(), pos_integer(), fin(), integer()) ->
+    blocked | {sent, conn(), iodata(), non_neg_integer(), fin(), non_neg_integer()}.
+emit_pending(_Conn, _Stream, _Data, _Size, _Fin, Quantum) when Quantum =< 0 ->
+    blocked;
+emit_pending(Conn, #h2_stream{id = StreamId} = Stream, Data, Size, Fin, Quantum) when
+    Size =< Quantum
+->
+    {ok, NewConn, Frame} = emit_data(Conn, Stream, Data, Size, Fin, []),
+    {sent, remove_pending(NewConn, StreamId), Frame, Size, Fin, 0};
+emit_pending(
+    #h2_conn{send_q = #send_q{pending = Pending, bytes = Bytes} = SendQ} = Conn,
+    #h2_stream{id = StreamId} = Stream,
+    Data,
+    Size,
+    Fin,
+    Quantum
+) ->
+    {Taken, Rest} = take(Data, Quantum, []),
+    {ok, NewConn, Frame} = emit_data(Conn, Stream, Taken, Quantum, nofin, []),
+    Left = Size - Quantum,
+    Entry = #pending{data = retain(Rest), size = Left, fin = Fin},
+    NewSendQ = SendQ#send_q{pending = Pending#{StreamId := Entry}, bytes = Bytes - Quantum},
+    {sent, NewConn#h2_conn{send_q = NewSendQ}, Frame, Quantum, nofin, Left}.
+
+-spec record_sent(
+    #{nhttp_lib:stream_id() => {non_neg_integer(), fin()}},
+    nhttp_lib:stream_id(),
+    non_neg_integer(),
+    fin()
+) -> #{nhttp_lib:stream_id() => {non_neg_integer(), fin()}}.
+record_sent(Sent, StreamId, Bytes, Fin) ->
+    case Sent of
+        #{StreamId := {Before, _}} -> Sent#{StreamId := {Before + Bytes, Fin}};
+        #{} -> Sent#{StreamId => {Bytes, Fin}}
+    end.
+
+-spec finish_drain(
+    conn(),
+    queue:queue(nhttp_lib:stream_id()),
+    [iodata()],
+    #{nhttp_lib:stream_id() => {non_neg_integer(), fin()}}
+) -> {conn(), iodata(), [event()]}.
+finish_drain(#h2_conn{send_q = #send_q{pending = Pending} = SendQ} = Conn, Order, Frames, Sent) ->
+    NewSendQ =
+        case map_size(Pending) of
+            0 -> undefined;
+            _ -> SendQ#send_q{order = Order}
+        end,
+    Events = [
+        {data_sent, StreamId, Bytes, Fin}
+     || {StreamId, {Bytes, Fin}} <- lists:sort(maps:to_list(Sent))
+    ],
+    {Conn#h2_conn{send_q = NewSendQ}, frames(Frames), Events}.
+
+-spec stream_open_until_queued_fin_leaves(
+    #{nhttp_lib:stream_id() => #h2_stream{}}, nhttp_lib:stream_id()
+) -> {ok, #h2_stream{}} | closed_by_peer.
+stream_open_until_queued_fin_leaves(Streams, StreamId) ->
+    case Streams of
+        #{StreamId := #h2_stream{state = State} = Stream} ->
+            case is_send_state(State) of
+                true -> {ok, Stream};
+                false -> closed_by_peer
+            end;
+        #{} ->
+            closed_by_peer
+    end.
+
+-spec remove_pending(conn(), nhttp_lib:stream_id()) -> conn().
+remove_pending(
+    #h2_conn{send_q = #send_q{pending = Pending, bytes = Bytes} = SendQ} = Conn, StreamId
+) ->
+    case Pending of
+        #{StreamId := #pending{size = Size}} ->
+            NewSendQ = SendQ#send_q{pending = maps:remove(StreamId, Pending), bytes = Bytes - Size},
+            Conn#h2_conn{send_q = NewSendQ};
+        #{} ->
+            Conn
+    end.
+
+-spec purge_pending(conn(), nhttp_lib:stream_id()) -> conn().
+purge_pending(#h2_conn{send_q = undefined} = Conn, _StreamId) ->
+    Conn;
+purge_pending(Conn, StreamId) ->
+    settle_send_q(remove_pending(Conn, StreamId)).
+
+-spec purge_pending_above(conn(), nhttp_lib:stream_id()) -> conn().
+purge_pending_above(#h2_conn{send_q = undefined} = Conn, _LastStreamId) ->
+    Conn;
+purge_pending_above(
+    #h2_conn{send_q = #send_q{pending = Pending}, role = Role} = Conn, LastStreamId
+) ->
+    Purged = [
+        StreamId
+     || StreamId <- maps:keys(Pending),
+        StreamId > LastStreamId,
+        not is_peer_initiated(Role, StreamId)
+    ],
+    settle_send_q(
+        lists:foldl(fun(StreamId, Acc) -> remove_pending(Acc, StreamId) end, Conn, Purged)
+    ).
+
+-spec settle_send_q(conn()) -> conn().
+settle_send_q(#h2_conn{send_q = #send_q{pending = Pending}} = Conn) when map_size(Pending) =:= 0 ->
+    Conn#h2_conn{send_q = undefined};
+settle_send_q(Conn) ->
+    Conn.
 
 -spec do_send_headers(conn(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin()) ->
     {ok, conn(), iodata()}.
@@ -1062,6 +1531,11 @@ is_active_state(_) -> false.
 -spec is_peer_initiated(role(), nhttp_lib:stream_id()) -> boolean().
 is_peer_initiated(server, StreamId) -> StreamId band 1 =:= 1;
 is_peer_initiated(client, StreamId) -> StreamId band 1 =:= 0.
+
+-spec is_send_state(stream_state()) -> boolean().
+is_send_state(open) -> true;
+is_send_state(half_closed_remote) -> true;
+is_send_state(_) -> false.
 
 -spec process_continuation(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
 process_continuation(
@@ -1259,11 +1733,14 @@ process_frame(#h2_conn{streams = Streams} = Conn, {window_update, StreamId, Incr
             end
     end;
 process_frame(#h2_conn{} = Conn, {goaway, LastStreamId, ErrorCode, DebugData}) ->
-    NewConn = Conn#h2_conn{
-        goaway_received = true,
-        state = closing,
-        last_good_stream_id = LastStreamId
-    },
+    NewConn = purge_pending_above(
+        Conn#h2_conn{
+            goaway_received = true,
+            state = closing,
+            last_good_stream_id = LastStreamId
+        },
+        LastStreamId
+    ),
     {ok, NewConn, [{goaway, LastStreamId, ErrorCode, DebugData}], []};
 process_frame(#h2_conn{} = Conn, {rst_stream, StreamId, ErrorCode}) ->
     process_rst_stream(Conn, StreamId, ErrorCode);
@@ -1442,14 +1919,28 @@ recv_loop(Conn, Data, EventsAcc, ToSend) ->
                     Error
             end;
         {more, _} ->
-            FinalConn = Conn#h2_conn{buffer = Data},
             FinalEvents = lists:append(lists:reverse(EventsAcc)),
-            case iolist_size(ToSend) of
-                0 -> {ok, FinalEvents, FinalConn};
-                _ -> {ok, FinalEvents, FinalConn, ToSend}
-            end;
+            finish_recv(Conn#h2_conn{buffer = Data}, FinalEvents, ToSend);
         {error, _} = Error ->
             Error
+    end.
+
+-spec finish_recv(conn(), [event()], iodata()) -> recv_result().
+finish_recv(#h2_conn{send_q = undefined} = Conn, Events, ToSend) ->
+    recv_result(Conn, Events, ToSend);
+finish_recv(Conn, Events, ToSend) ->
+    case drain_send_q(Conn) of
+        {NewConn, [], []} ->
+            recv_result(NewConn, Events, ToSend);
+        {NewConn, Frames, Sent} ->
+            {ok, Events ++ Sent, NewConn, [ToSend, Frames]}
+    end.
+
+-spec recv_result(conn(), [event()], iodata()) -> recv_result().
+recv_result(Conn, Events, ToSend) ->
+    case iolist_size(ToSend) of
+        0 -> {ok, Events, Conn};
+        _ -> {ok, Events, Conn, ToSend}
     end.
 
 -spec store_or_remove_stream(
@@ -1670,11 +2161,20 @@ validate_send_data(#h2_conn{streams = Streams}, StreamId) ->
         undefined ->
             {error, {unknown_stream, StreamId}};
         #h2_stream{state = State} ->
-            case State of
-                open -> ok;
-                half_closed_remote -> ok;
-                _ -> {error, {stream_closed, StreamId}}
+            case is_send_state(State) of
+                true -> ok;
+                false -> {error, {stream_closed, StreamId}}
             end
+    end.
+
+-spec validate_no_pending_data(conn(), nhttp_lib:stream_id()) ->
+    ok | {error, {data_pending, nhttp_lib:stream_id()}}.
+validate_no_pending_data(#h2_conn{send_q = undefined}, _StreamId) ->
+    ok;
+validate_no_pending_data(#h2_conn{send_q = #send_q{pending = Pending}}, StreamId) ->
+    case maps:is_key(StreamId, Pending) of
+        true -> {error, {data_pending, StreamId}};
+        false -> ok
     end.
 
 -spec validate_send_headers(conn(), nhttp_lib:stream_id()) -> ok | {error, term()}.
