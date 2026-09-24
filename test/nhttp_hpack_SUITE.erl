@@ -24,7 +24,8 @@ all() ->
         {group, error_handling},
         {group, encode_lowercase},
         {group, coverage_edge_cases},
-        {group, index_maps}
+        {group, index_maps},
+        {group, index_policy}
     ].
 
 groups() ->
@@ -32,8 +33,10 @@ groups() ->
         {state, [parallel], [
             new_default,
             new_with_size,
+            new_with_policy,
             is_empty_initial,
-            table_size_initial
+            table_size_initial,
+            table_entries_initial
         ]},
         {roundtrip, [parallel], [
             roundtrip_simple_request,
@@ -121,6 +124,18 @@ groups() ->
             evicted_key_is_absent,
             rebound_key_survives_eviction,
             allocation_per_request_is_flat
+        ]},
+        {index_policy, [], [
+            no_index_emits_literal_without_indexing,
+            never_index_emits_literal_never_indexed,
+            unlisted_name_encodes_as_before,
+            encode_rfc_c3_sequence_with_policy,
+            authorization_survives_unique_paths,
+            path_only_policy_turns_the_table_over,
+            no_index_keeps_static_name_reference,
+            table_entries_tracks_insertions_and_evictions,
+            policy_state_is_flat,
+            policy_names_are_lowercased_and_never_index_wins
         ]}
     ].
 
@@ -163,6 +178,19 @@ is_empty_initial(_Config) ->
 table_size_initial(_Config) ->
     {ok, State} = nhttp_hpack:new(),
     ?assertEqual(0, nhttp_hpack:table_size(State)).
+
+new_with_policy(_Config) ->
+    Policy = #{no_index => [<<":path">>], never_index => [<<"authorization">>]},
+    {ok, State} = nhttp_hpack:new(8192, Policy),
+    ?assertEqual(0, nhttp_hpack:table_size(State)),
+    ?assertEqual(0, nhttp_hpack:table_entries(State)),
+    ?assert(nhttp_hpack:is_empty(State)),
+    {ok, Empty} = nhttp_hpack:new(8192, #{}),
+    ?assertEqual(0, nhttp_hpack:table_entries(Empty)).
+
+table_entries_initial(_Config) ->
+    {ok, State} = nhttp_hpack:new(),
+    ?assertEqual(0, nhttp_hpack:table_entries(State)).
 
 %%%-----------------------------------------------------------------------------
 %%% ROUNDTRIP TESTS
@@ -378,12 +406,14 @@ decode_rfc_c4_3(_Config) ->
     ?assertEqual(Expected, Decoded).
 
 encode_rfc_c3_sequence(_Config) ->
-    Expected = [
+    encode_sequence(#{huffman => false}, rfc_c3_expected()).
+
+rfc_c3_expected() ->
+    [
         <<16#82, 16#86, 16#84, 16#41, 16#0f, "www.example.com">>,
         <<16#82, 16#86, 16#84, 16#be, 16#58, 16#08, "no-cache">>,
         <<16#82, 16#87, 16#85, 16#bf, 16#40, 16#0a, "custom-key", 16#0c, "custom-value">>
-    ],
-    encode_sequence(#{huffman => false}, Expected).
+    ].
 
 encode_rfc_c4_sequence(_Config) ->
     Expected = [
@@ -399,6 +429,10 @@ encode_rfc_c4_sequence(_Config) ->
 %% request reuse `:authority' from the dynamic table, so an encoder that only
 %% consults the static table never reaches the expected octets.
 encode_sequence(Opts, Expected) ->
+    {ok, State0} = nhttp_hpack:new(),
+    encode_sequence(Opts, Expected, State0).
+
+encode_sequence(Opts, Expected, State0) ->
     Requests = [
         [
             {<<":method">>, <<"GET">>},
@@ -421,7 +455,6 @@ encode_sequence(Opts, Expected) ->
             {<<"custom-key">>, <<"custom-value">>}
         ]
     ],
-    {ok, State0} = nhttp_hpack:new(),
     lists:foldl(
         fun({Headers, Want}, State) ->
             {ok, Encoded, State2} = nhttp_hpack:encode(Headers, State, Opts),
@@ -985,6 +1018,155 @@ allocation_per_request_is_flat(_Config) ->
     {_State2, Words2} = allocated_words(fun() -> encode_apns_requests(10001, 20000, State1) end),
     ct:log("words allocated: first window ~p, second window ~p", [Words1, Words2]),
     ?assert(abs(Words2 - Words1) * 100 =< Words1).
+
+%%%-----------------------------------------------------------------------------
+%%% INDEX POLICY TESTS
+%%%-----------------------------------------------------------------------------
+
+no_index_emits_literal_without_indexing(_Config) ->
+    Policy = #{no_index => [<<":path">>, <<"apns-id">>]},
+    {ok, State0} = nhttp_hpack:new(4096, Policy),
+    Headers = [{<<":path">>, <<"/3/device/ab">>}, {<<"apns-id">>, <<"id-1">>}],
+    {ok, Encoded, State1} = nhttp_hpack:encode(Headers, State0),
+    ?assertEqual(
+        <<2#0000:4, 4:4, 12, "/3/device/ab", 2#0000:4, 0:4, 7, "apns-id", 4, "id-1">>,
+        iolist_to_binary(Encoded)
+    ),
+    ?assertEqual(0, nhttp_hpack:table_size(State1)),
+    ?assertEqual(0, nhttp_hpack:table_entries(State1)),
+    {ok, Decoder0} = nhttp_hpack:new(),
+    {ok, Decoded, Decoder1} = nhttp_hpack:decode(iolist_to_binary(Encoded), Decoder0),
+    ?assertEqual(Headers, Decoded),
+    ?assertEqual(0, nhttp_hpack:table_entries(Decoder1)).
+
+never_index_emits_literal_never_indexed(_Config) ->
+    Policy = #{never_index => [<<"authorization">>, <<"x-secret">>]},
+    {ok, State0} = nhttp_hpack:new(4096, Policy),
+    Headers = [{<<"authorization">>, <<"bearer t">>}, {<<"x-secret">>, <<"s">>}],
+    {ok, Encoded, State1} = nhttp_hpack:encode(Headers, State0),
+    ?assertEqual(
+        <<2#0001:4, 15:4, 8, 8, "bearer t", 2#0001:4, 0:4, 8, "x-secret", 1, "s">>,
+        iolist_to_binary(Encoded)
+    ),
+    ?assertEqual(0, nhttp_hpack:table_size(State1)),
+    ?assertEqual(0, nhttp_hpack:table_entries(State1)),
+    {ok, Decoder0} = nhttp_hpack:new(),
+    {ok, Decoded, Decoder1} = nhttp_hpack:decode(iolist_to_binary(Encoded), Decoder0),
+    ?assertEqual(Headers, Decoded),
+    ?assertEqual(0, nhttp_hpack:table_entries(Decoder1)).
+
+unlisted_name_encodes_as_before(_Config) ->
+    Policy = #{no_index => [<<":path">>], never_index => [<<"authorization">>]},
+    {ok, Plain0} = nhttp_hpack:new(4096),
+    {ok, Policed0} = nhttp_hpack:new(4096, Policy),
+    Headers = [
+        Header
+     || {Name, _} = Header <- apns_request(1),
+        Name =/= <<":path">>,
+        Name =/= <<"authorization">>
+    ],
+    {ok, Plain1, PlainState1} = nhttp_hpack:encode(Headers, Plain0),
+    {ok, Policed1, PolicedState1} = nhttp_hpack:encode(Headers, Policed0),
+    ?assertEqual(iolist_to_binary(Plain1), iolist_to_binary(Policed1)),
+    {ok, Plain2, PlainState2} = nhttp_hpack:encode(Headers, PlainState1),
+    {ok, Policed2, PolicedState2} = nhttp_hpack:encode(Headers, PolicedState1),
+    ?assertEqual(iolist_to_binary(Plain2), iolist_to_binary(Policed2)),
+    ?assertEqual(nhttp_hpack:table_size(PlainState2), nhttp_hpack:table_size(PolicedState2)),
+    ?assertEqual(
+        nhttp_hpack:table_entries(PlainState2), nhttp_hpack:table_entries(PolicedState2)
+    ).
+
+encode_rfc_c3_sequence_with_policy(_Config) ->
+    {ok, Empty} = nhttp_hpack:new(4096, #{}),
+    encode_sequence(#{huffman => false}, rfc_c3_expected(), Empty),
+    Policy = #{no_index => [<<"apns-id">>], never_index => [<<"authorization">>]},
+    {ok, Absent} = nhttp_hpack:new(4096, Policy),
+    encode_sequence(#{huffman => false}, rfc_c3_expected(), Absent).
+
+authorization_survives_unique_paths(_Config) ->
+    {ok, State0} = nhttp_hpack:new(4096, #{no_index => [<<":path">>, <<"apns-id">>]}),
+    ?assertEqual(none, first_literal_authorization(1000, State0)).
+
+%% HPACK evicts in insertion order (RFC 7541 Section 4.4), so one unique field
+%% that still inserts pushes every constant entry out once the table fills.
+path_only_policy_turns_the_table_over(_Config) ->
+    {ok, State0} = nhttp_hpack:new(4096, #{no_index => [<<":path">>]}),
+    {literal, N} = first_literal_authorization(1000, State0),
+    ct:log("authorization re-emitted as a literal at request ~p", [N]),
+    ?assert(N > 2).
+
+first_literal_authorization(To, State0) ->
+    Positions = record_positions(hpack),
+    {ok, _, State1} = nhttp_hpack:encode(apns_request(1), State0),
+    {_, Value} = lists:keyfind(<<"authorization">>, 1, apns_request(1)),
+    Seq = maps:get({<<"authorization">>, Value}, element(maps:get(full_index, Positions), State1)),
+    first_literal_authorization(2, To, State1, Seq, Positions).
+
+first_literal_authorization(From, To, _State, _Seq, _Positions) when From > To ->
+    none;
+first_literal_authorization(N, To, State, Seq, Positions) ->
+    Headers = apns_request(N),
+    {ok, [_Prefix | PerHeader], State1} = nhttp_hpack:encode(Headers, State),
+    ?assertEqual(length(Headers), length(PerHeader)),
+    Names = [Name || {Name, _} <- Headers],
+    Position = length(lists:takewhile(fun(Name) -> Name =/= <<"authorization">> end, Names)) + 1,
+    Octets = iolist_to_binary(lists:nth(Position, PerHeader)),
+    {_, Value} = lists:keyfind(<<"authorization">>, 1, Headers),
+    FullIndex = element(maps:get(full_index, Positions), State1),
+    case {is_indexed_field(Octets), maps:get({<<"authorization">>, Value}, FullIndex, none)} of
+        {true, Seq} -> first_literal_authorization(N + 1, To, State1, Seq, Positions);
+        _ -> {literal, N}
+    end.
+
+is_indexed_field(<<2#1:1, Index:7>>) -> Index >= 62 andalso Index =< 126;
+is_indexed_field(<<2#1:1, 127:7, _:8>>) -> true;
+is_indexed_field(_) -> false.
+
+no_index_keeps_static_name_reference(_Config) ->
+    {ok, State0} = nhttp_hpack:new(4096, #{no_index => [<<":path">>]}),
+    Path = <<"/3/device/0123456789abcdef">>,
+    {ok, Encoded, State1} = nhttp_hpack:encode([{<<":path">>, Path}], State0),
+    ?assertEqual(<<2#0000:4, 4:4, 26, Path/binary>>, iolist_to_binary(Encoded)),
+    {ok, Root, State2} = nhttp_hpack:encode([{<<":path">>, <<"/">>}], State1),
+    ?assertEqual(<<2#1:1, 4:7>>, iolist_to_binary(Root)),
+    ?assertEqual(0, nhttp_hpack:table_entries(State2)).
+
+table_entries_tracks_insertions_and_evictions(_Config) ->
+    {ok, State0} = nhttp_hpack:new(72),
+    {ok, _, State1} = nhttp_hpack:encode([{<<"aa">>, <<"bb">>}], State0),
+    ?assertEqual({1, 36}, {nhttp_hpack:table_entries(State1), nhttp_hpack:table_size(State1)}),
+    {ok, _, State2} = nhttp_hpack:encode([{<<"cc">>, <<"dd">>}], State1),
+    ?assertEqual({2, 72}, {nhttp_hpack:table_entries(State2), nhttp_hpack:table_size(State2)}),
+    {ok, _, State3} = nhttp_hpack:encode([{<<"ee">>, <<"ff">>}], State2),
+    ?assertEqual({2, 72}, {nhttp_hpack:table_entries(State3), nhttp_hpack:table_size(State3)}),
+    {ok, State4} = nhttp_hpack:set_max_table_size(36, State3),
+    ?assertEqual({1, 36}, {nhttp_hpack:table_entries(State4), nhttp_hpack:table_size(State4)}),
+    {ok, State5} = nhttp_hpack:set_max_table_size(0, State4),
+    ?assertEqual({0, 0}, {nhttp_hpack:table_entries(State5), nhttp_hpack:table_size(State5)}).
+
+policy_state_is_flat(_Config) ->
+    {ok, Both0} = nhttp_hpack:new(4096, #{no_index => [<<":path">>, <<"apns-id">>]}),
+    {BothWords1, Both1} = max_state_words(1, 1, Both0),
+    {BothWords2, Both2} = max_state_words(2, 5000, Both1),
+    {BothWords3, _Both3} = max_state_words(5001, 10000, Both2),
+    ct:log("state words with both names unindexed: ~p", [[BothWords1, BothWords2, BothWords3]]),
+    ?assertEqual(BothWords1, BothWords2),
+    ?assertEqual(BothWords1, BothWords3),
+    {ok, Path0} = nhttp_hpack:new(4096, #{no_index => [<<":path">>]}),
+    {PathWords1, Path1} = max_state_words(1, 1000, Path0),
+    {PathWords2, _Path2} = max_state_words(1001, 10000, Path1),
+    ct:log("state words with the path unindexed: ~p", [[PathWords1, PathWords2]]),
+    ?assert(abs(PathWords2 - PathWords1) =< erts_debug:flat_size(apns_request(1))).
+
+policy_names_are_lowercased_and_never_index_wins(_Config) ->
+    Policy = #{no_index => [<<"X-Token">>], never_index => [<<"x-token">>]},
+    {ok, State0} = nhttp_hpack:new(4096, Policy),
+    {ok, Encoded, State1} = nhttp_hpack:encode([{<<"X-Token">>, <<"v">>}], State0),
+    ?assertEqual(<<2#0001:4, 0:4, 7, "x-token", 1, "v">>, iolist_to_binary(Encoded)),
+    ?assertEqual(0, nhttp_hpack:table_entries(State1)),
+    {ok, Lower} = nhttp_hpack:new(4096, #{no_index => [<<"X-Path">>]}),
+    {ok, Plain, _} = nhttp_hpack:encode([{<<"x-path">>, <<"/">>}], Lower),
+    ?assertEqual(<<2#0000:4, 0:4, 6, "x-path", 1, "/">>, iolist_to_binary(Plain)).
 
 %%%-----------------------------------------------------------------------------
 %%% HELPERS

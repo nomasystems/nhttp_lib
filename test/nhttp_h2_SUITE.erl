@@ -46,7 +46,9 @@ Tests RFC 9113 compliance for:
     settings_ack_sent/1,
     settings_updates_peer/1,
     settings_initial_window_size_update/1,
-    peer_settings_reports_peer_values/1
+    peer_settings_reports_peer_values/1,
+    settings_hpack_index_policy_reaches_encoder/1,
+    encoder_table_accessors_report_encoder_state/1
 ]).
 
 -export([
@@ -210,7 +212,9 @@ groups() ->
             settings_ack_sent,
             settings_updates_peer,
             settings_initial_window_size_update,
-            peer_settings_reports_peer_values
+            peer_settings_reports_peer_values,
+            settings_hpack_index_policy_reaches_encoder,
+            encoder_table_accessors_report_encoder_state
         ]},
         {flow_control, [parallel], [
             connection_window_update,
@@ -484,6 +488,44 @@ settings_initial_window_size_update(_Config) ->
     {ok, Events, _Conn3, _} = nhttp_h2:recv(Conn2, iolist_to_binary(SettingsFrame)),
     ?assertMatch([{settings, #{initial_window_size := 131072}} | _], Events),
     ok.
+
+settings_hpack_index_policy_reaches_encoder(_Config) ->
+    Policy = #{no_index => [<<":path">>, <<"apns-id">>]},
+    Conn0 = nhttp_h2:new(client, #{hpack_index_policy => Policy}),
+    ?assertEqual(
+        iolist_to_binary(nhttp_h2:preface(nhttp_h2:new(client))),
+        iolist_to_binary(nhttp_h2:preface(Conn0))
+    ),
+    {ok, Stream1, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, Stream1, push_request(<<"/3/device/a">>), fin),
+    Entries = nhttp_h2:encoder_table_entries(Conn2),
+    Size = nhttp_h2:encoder_table_size(Conn2),
+    ?assertEqual(2, Entries),
+    ?assertEqual(60 + 60, Size),
+    {ok, Stream2, Conn3} = nhttp_h2:open_stream(Conn2),
+    {ok, Conn4, _} = nhttp_h2:send_headers(Conn3, Stream2, push_request(<<"/3/device/b">>), fin),
+    ?assertEqual(Entries, nhttp_h2:encoder_table_entries(Conn4)),
+    ?assertEqual(Size, nhttp_h2:encoder_table_size(Conn4)).
+
+push_request(Path) ->
+    [
+        {<<":method">>, <<"POST">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"api.push.apple.com">>},
+        {<<":path">>, Path},
+        {<<"apns-id">>, Path},
+        {<<"content-type">>, <<"application/json">>}
+    ].
+
+encoder_table_accessors_report_encoder_state(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    ?assertEqual(0, nhttp_h2:encoder_table_entries(Conn0)),
+    ?assertEqual(0, nhttp_h2:encoder_table_size(Conn0)),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/x">>}, {<<"x-a">>, <<"b">>}],
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, fin),
+    ?assertEqual(2, nhttp_h2:encoder_table_entries(Conn2)),
+    ?assertEqual(39 + 36, nhttp_h2:encoder_table_size(Conn2)).
 
 peer_settings_reports_peer_values(_Config) ->
     Conn0 = nhttp_h2:new(client),

@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nhttp_h2:stream_send_window/2` reads the send window of one stream
 - `nhttp_h2:peer_settings/1` reads the settings the peer sent, merged over
   the defaults
+- `nhttp_hpack:new/2` takes an indexing policy of type
+  `t:nhttp_hpack:index_policy/0`. A field name in `no_index` encodes as a
+  literal without indexing (RFC 7541 Section 6.2.2) and a name in
+  `never_index` as a literal never indexed (RFC 7541 Section 6.2.3). Neither
+  enters the dynamic table, and both keep a static name reference. The
+  default of `new/0` and `new/1` is the empty policy, which changes no byte
+  of output
+- `hpack_index_policy` on `t:nhttp_h2:settings/0` carries the policy to the
+  HPACK encoder of the connection. It has no wire representation
+- `nhttp_hpack:table_entries/1`, `nhttp_h2:encoder_table_entries/1` and
+  `nhttp_h2:encoder_table_size/1` read the live entry count and the octets
+  of the encoder dynamic table
 
 ### Changed
 

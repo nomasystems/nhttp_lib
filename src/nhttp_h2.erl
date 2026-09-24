@@ -101,6 +101,8 @@ Flow-control and END_STREAM ride on the DATA frame.
 %%%-----------------------------------------------------------------------------
 -export([
     connection_send_window/1,
+    encoder_table_entries/1,
+    encoder_table_size/1,
     peer_settings/1,
     stream_send_window/2
 ]).
@@ -139,9 +141,13 @@ Flow-control and END_STREAM ride on the DATA frame.
 Connection settings.
 
 Most keys map to a SETTINGS parameter of RFC 9113 Section 6.5.2 and go on
-the wire. `max_continuation_frames` and `max_reset_streams` are local
-policy. They bound work that a peer can request, they have no wire
-representation, and the encoder drops them.
+the wire. `max_continuation_frames`, `max_reset_streams` and
+`hpack_index_policy` are local policy. They have no wire representation,
+and the encoder drops them. The first two bound work that a peer can
+request. `hpack_index_policy` reaches `nhttp_hpack:new/2` and names the
+fields that the HPACK encoder keeps out of its dynamic table. The
+`nhttp_hpack` module documentation gives the two literal forms and the
+sets that fit a deployment.
 
 `max_continuation_frames` bounds the number of CONTINUATION frames in one
 field section, per RFC 9113 Section 10.5. An empty CONTINUATION frame adds
@@ -161,7 +167,8 @@ CONTINUATION frames that carry the larger field section.
     max_header_list_size => pos_integer() | infinity,
     max_continuation_frames => pos_integer() | infinity,
     enable_connect_protocol => boolean(),
-    max_reset_streams => pos_integer() | infinity
+    max_reset_streams => pos_integer() | infinity,
+    hpack_index_policy => nhttp_hpack:index_policy()
 }.
 
 -type stream_state() ::
@@ -298,7 +305,8 @@ new(Role) ->
 new(Role, LocalSettings) ->
     MergedSettings = maps:merge(default_settings(), LocalSettings),
     HeaderTableSize = maps:get(header_table_size, MergedSettings, ?H2_DEFAULT_HEADER_TABLE_SIZE),
-    {ok, HpackEnc} = nhttp_hpack:new(HeaderTableSize),
+    IndexPolicy = maps:get(hpack_index_policy, MergedSettings, #{}),
+    {ok, HpackEnc} = nhttp_hpack:new(HeaderTableSize, IndexPolicy),
     {ok, HpackDec} = nhttp_hpack:new(HeaderTableSize),
     #h2_conn{
         role = Role,
@@ -576,6 +584,29 @@ takes it positive again.
 -spec connection_send_window(conn()) -> integer().
 connection_send_window(#h2_conn{send_window = Window}) ->
     Window.
+
+-doc """
+Return the number of live entries in the dynamic table of the HPACK encoder.
+
+The count moves with every field that `send_headers/4` inserts and with
+every eviction that the insert forces (RFC 7541 Section 4.4). A field whose
+name is in `hpack_index_policy` never inserts, so a caller that tunes the
+policy reads its effect here.
+""".
+-spec encoder_table_entries(conn()) -> non_neg_integer().
+encoder_table_entries(#h2_conn{hpack_enc = HpackEnc}) ->
+    nhttp_hpack:table_entries(HpackEnc).
+
+-doc """
+Return the size of the dynamic table of the HPACK encoder in octets.
+
+The size counts every live entry as name, value and the 32 octets of
+overhead of RFC 7541 Section 4.1. It never exceeds the
+SETTINGS_HEADER_TABLE_SIZE that the peer sent.
+""".
+-spec encoder_table_size(conn()) -> non_neg_integer().
+encoder_table_size(#h2_conn{hpack_enc = HpackEnc}) ->
+    nhttp_hpack:table_size(HpackEnc).
 
 -doc """
 Return the settings the peer sent, merged over the defaults.
