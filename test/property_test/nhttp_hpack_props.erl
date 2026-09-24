@@ -536,6 +536,55 @@ live_field(Seq, Entries, FieldPosition) ->
         Entry -> element(FieldPosition, Entry)
     end.
 
+%% No name of the policy is a key of `name_index' or the name of a key of
+%% `full_index' after any encode, and the decoder round trips every block.
+-spec prop_policy_names_never_enter_the_table() -> triq:property().
+prop_policy_names_never_enter_the_table() ->
+    Positions = record_positions(hpack),
+    ?FORALL(
+        {HeadersList, Rules},
+        {non_empty(list(headers_gen())), list(oneof([index, no_index, never_index]))},
+        begin
+            Blocks = lists:sublist(HeadersList, 10),
+            Names = lists:usort([Name || Headers <- Blocks, {Name, _} <- Headers]),
+            Policy = policy_from(Names, Rules),
+            {ok, EncState0} = nhttp_hpack:new(4096, Policy),
+            {ok, DecState0} = nhttp_hpack:new(),
+            PolicyNames = maps:get(no_index, Policy) ++ maps:get(never_index, Policy),
+            policy_names_absent(Blocks, PolicyNames, EncState0, DecState0, Positions)
+        end
+    ).
+
+%% The rule list runs out on a long name list, and the tail then keeps the
+%% default rule.
+-spec policy_from([binary()], [index | no_index | never_index]) -> nhttp_hpack:index_policy().
+policy_from(Names, Rules) ->
+    Padded = Rules ++ lists:duplicate(max(0, length(Names) - length(Rules)), index),
+    Pairs = lists:zip(Names, lists:sublist(Padded, length(Names))),
+    #{
+        no_index => [Name || {Name, no_index} <- Pairs],
+        never_index => [Name || {Name, never_index} <- Pairs]
+    }.
+
+-spec policy_names_absent(
+    [[{binary(), binary()}]], [binary()], nhttp_hpack:state(), nhttp_hpack:state(), map()
+) -> boolean().
+policy_names_absent([], _PolicyNames, _EncState, _DecState, _Positions) ->
+    true;
+policy_names_absent([Headers | Tail], PolicyNames, EncState, DecState, Positions) ->
+    {ok, Encoded, EncState1} = nhttp_hpack:encode(Headers, EncState),
+    FullIndex = element(maps:get(full_index, Positions), EncState1),
+    NameIndex = element(maps:get(name_index, Positions), EncState1),
+    TableNames = [Name || {Name, _} <- maps:keys(FullIndex)] ++ maps:keys(NameIndex),
+    Absent = lists:all(fun(Name) -> not lists:member(Name, TableNames) end, PolicyNames),
+    case nhttp_hpack:decode(iolist_to_binary(Encoded), DecState) of
+        {ok, Headers, DecState1} ->
+            Absent andalso
+                policy_names_absent(Tail, PolicyNames, EncState1, DecState1, Positions);
+        _ ->
+            false
+    end.
+
 -spec record_positions(atom()) -> #{atom() => pos_integer()}.
 record_positions(Record) ->
     Beam = filename:join([code:lib_dir(nhttp_lib), "ebin", "nhttp_hpack.beam"]),

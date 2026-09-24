@@ -52,6 +52,40 @@ field that arrives by index carries that verdict out again and needs no
 second read of the octets. The verdict names the part that failed, so a
 field that reuses the name by index drops a verdict against the value and
 reads a fresh value from the wire.
+
+## Indexing policy
+
+`new/2` takes a policy that names the fields the encoder keeps out of the
+dynamic table. RFC 7541 §6.2 gives three literal representations, and the
+policy selects one for each field name:
+
+- A name in neither list uses literal with incremental indexing (§6.2.1).
+  The field enters the dynamic table of both endpoints.
+- A name in `no_index` uses literal without indexing (§6.2.2). The field
+  enters no table on this hop. Use it for a value that differs on every
+  request. Such a value costs a table entry that no later request reuses.
+- A name in `never_index` uses literal never indexed (§6.2.3). Every
+  intermediary keeps this form on every later hop. Use it for a secret:
+  RFC 7541 §7.1 shows how an attacker who places values in the same block
+  and reads the compressed size recovers an indexed secret, and §7.1.3
+  names this form as the mitigation.
+
+A name in both lists resolves to `never_index`. The policy holds every name
+in lowercase. A name with a static entry keeps its static name reference
+under both literal forms. The default of `new/0` and `new/1` is the empty
+policy, which changes no byte of output.
+
+The dynamic table evicts in insertion order (§4.4). One field that differs
+on every request and still inserts pushes every constant entry out once
+the table fills, and the encoder then re-emits the constant fields as
+literals. A `no_index` list must therefore name every such field.
+
+A client that shares a connection between principals, or that compresses
+a value an attacker controls in the same block as a credential, puts
+`authorization`, `cookie` and `proxy-authorization` in `never_index`. A
+client with one principal on a TLS connection and no attacker-controlled
+value in the block can leave a constant credential indexed and put the
+fields that differ on every request in `no_index`.
 """.
 
 %%%-----------------------------------------------------------------------------
@@ -63,6 +97,9 @@ reads a fresh value from the wire.
         check_name/1,
         check_value/1,
         first_invalid/2,
+        literal_prefix/1,
+        maybe_insert/3,
+        name_ref_prefix/2,
         name_verdict/1,
         remove_if_seq/3
     ]}
@@ -75,7 +112,9 @@ reads a fresh value from the wire.
     is_empty/1,
     new/0,
     new/1,
+    new/2,
     set_max_table_size/2,
+    table_entries/1,
     table_size/1
 ]).
 
@@ -99,6 +138,7 @@ reads a fresh value from the wire.
     encode_opts/0,
     field_error/0,
     headers/0,
+    index_policy/0,
     state/0
 ]).
 
@@ -112,6 +152,21 @@ reads a fresh value from the wire.
 -type decode_opts() :: #{
     max_list_size => pos_integer() | infinity
 }.
+
+-doc """
+The field names that the encoder keeps out of the dynamic table.
+
+`no_index` selects literal without indexing (RFC 7541 §6.2.2) and
+`never_index` selects literal never indexed (RFC 7541 §6.2.3). A name in
+neither list uses literal with incremental indexing (RFC 7541 §6.2.1). See
+the module documentation for the choice between the two lists.
+""".
+-type index_policy() :: #{
+    never_index => [binary()],
+    no_index => [binary()]
+}.
+
+-type index_rule() :: index | no_index | never_index.
 -type decode_error() ::
     dynamic_table_size_exceeded
     | invalid_table_index
@@ -187,7 +242,8 @@ from the wire therefore reads `{invalid_value, _}` as `valid`.
     oldest_seq = 0 :: non_neg_integer(),
     entries = #{} :: #{non_neg_integer() => #entry{}},
     full_index = #{} :: #{{binary(), binary()} => non_neg_integer()},
-    name_index = #{} :: #{binary() => non_neg_integer()}
+    name_index = #{} :: #{binary() => non_neg_integer()},
+    policy = #{} :: #{binary() => no_index | never_index}
 }).
 
 -doc """
@@ -196,6 +252,9 @@ The dynamic table of one HPACK endpoint.
 `full_index` and `name_index` hold keys for live entries only. An eviction
 removes the keys that bind to the evicted sequence, so the two indexes stay
 bounded by the table size.
+
+`policy` holds the lowercased names of `t:index_policy/0` with the literal
+form each one selects. The encoder reads it on the two literal arms only.
 """.
 -opaque state() :: #hpack{}.
 
@@ -219,10 +278,27 @@ new() ->
 new(MaxSize) ->
     {ok, #hpack{max_size = MaxSize, configured_max_size = MaxSize}}.
 
+-doc """
+Create a new HPACK encoder state with a max size and an indexing policy.
+
+The policy names the fields that never enter the dynamic table. See the
+module documentation for the two literal forms and the sets that fit a
+deployment. A name in both lists resolves to `never_index`, and every name
+is lowercased.
+""".
+-spec new(MaxSize :: non_neg_integer(), Policy :: index_policy()) -> {ok, state()}.
+new(MaxSize, Policy) ->
+    {ok, #hpack{max_size = MaxSize, configured_max_size = MaxSize, policy = policy_map(Policy)}}.
+
 -doc "Update the maximum table size (from SETTINGS_HEADER_TABLE_SIZE). Immediately evicts entries if the new size is smaller than current table size.".
 -spec set_max_table_size(MaxSize :: non_neg_integer(), State :: state()) -> {ok, state()}.
 set_max_table_size(MaxSize, State) ->
     {ok, update_table_size(MaxSize, State#hpack{configured_max_size = MaxSize})}.
+
+-doc "Get the number of live entries in the dynamic table.".
+-spec table_entries(State :: state()) -> non_neg_integer().
+table_entries(#hpack{entries = Entries}) ->
+    map_size(Entries).
 
 -doc "Get the current dynamic table size in bytes.".
 -spec table_size(State :: state()) -> non_neg_integer().
@@ -417,20 +493,24 @@ decode_headers(_, _, _, _, _, _) ->
     {[iodata()], state()}.
 encode_headers([], State, _, Acc) ->
     {lists:reverse(Acc), State};
-encode_headers([{Name0, Value} = Header0 | Tail], State, UseHuffman, Acc) ->
+encode_headers(
+    [{Name0, Value} = Header0 | Tail], State = #hpack{policy = Policy}, UseHuffman, Acc
+) ->
     {Name, _} = Header = lower_name(Header0, Name0, Value),
     case find(Header, State) of
         {field, Index} ->
             Encoded = nhttp_int:enc7(Index, 2#1),
             encode_headers(Tail, State, UseHuffman, [Encoded | Acc]);
         {name, Index} ->
-            State2 = insert(Header, State),
-            Encoded = [nhttp_int:enc6(Index, 2#01) | nhttp_str:encode(Value, UseHuffman)],
+            Rule = maps:get(Name, Policy, index),
+            State2 = maybe_insert(Rule, Header, State),
+            Encoded = [name_ref_prefix(Rule, Index) | nhttp_str:encode(Value, UseHuffman)],
             encode_headers(Tail, State2, UseHuffman, [Encoded | Acc]);
         not_found ->
-            State2 = insert(Header, State),
+            Rule = maps:get(Name, Policy, index),
+            State2 = maybe_insert(Rule, Header, State),
             Encoded = [
-                <<2#01:2, 0:6>>
+                literal_prefix(Rule)
                 | [nhttp_str:encode(Name, UseHuffman) | nhttp_str:encode(Value, UseHuffman)]
             ],
             encode_headers(Tail, State2, UseHuffman, [Encoded | Acc])
@@ -644,6 +724,11 @@ insert({Name, Value}, Verdict, State = #hpack{max_size = MaxSize, next_seq = Nex
             }
     end.
 
+-spec literal_prefix(index_rule()) -> binary().
+literal_prefix(index) -> <<2#01:2, 0:6>>;
+literal_prefix(no_index) -> <<2#0000:4, 0:4>>;
+literal_prefix(never_index) -> <<2#0001:4, 0:4>>.
+
 -spec lookup(pos_integer(), state()) ->
     {ok, {binary(), binary()}, verdict()} | {error, decode_error()}.
 lookup(1, _) ->
@@ -810,9 +895,28 @@ maybe_emit_table_size_update(State0 = #hpack{configured_max_size = MaxSize}) ->
     State1 = update_table_size(MaxSize, State0#hpack{max_size = MaxSize}),
     {nhttp_int:enc5(MaxSize, 2#001), State1}.
 
+-spec maybe_insert(index_rule(), {binary(), binary()}, state()) -> state().
+maybe_insert(index, Header, State) -> insert(Header, State);
+maybe_insert(no_index, _Header, State) -> State;
+maybe_insert(never_index, _Header, State) -> State.
+
+-spec name_ref_prefix(index_rule(), pos_integer()) -> binary().
+name_ref_prefix(index, Index) -> nhttp_int:enc6(Index, 2#01);
+name_ref_prefix(no_index, Index) -> nhttp_int:enc4(Index, 2#0000);
+name_ref_prefix(never_index, Index) -> nhttp_int:enc4(Index, 2#0001).
+
 -spec name_verdict(verdict()) -> verdict().
 name_verdict({invalid_value, _}) -> valid;
 name_verdict(Verdict) -> Verdict.
+
+-spec policy_map(index_policy()) -> #{binary() => no_index | never_index}.
+policy_map(Policy) ->
+    NoIndex = maps:get(no_index, Policy, []),
+    NeverIndex = maps:get(never_index, Policy, []),
+    maps:from_list(
+        [{nhttp_headers:lower_field_name(Name), no_index} || Name <- NoIndex] ++
+            [{nhttp_headers:lower_field_name(Name), never_index} || Name <- NeverIndex]
+    ).
 
 -doc """
 Remove `Key` from `Index` when the index still binds it to `Seq`.
