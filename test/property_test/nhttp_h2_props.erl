@@ -583,6 +583,60 @@ prop_send_data_conserves_body() ->
         end
     ).
 
+-spec prop_send_queue_round_robin() -> triq:property().
+prop_send_queue_round_robin() ->
+    ?FORALL(
+        {Sizes, Grants},
+        {non_empty(list(int(1, 60000))), list(int(1, 70000))},
+        begin
+            Bodies = lists:sublist(Sizes, 8),
+            Conn0 = queued_conn(),
+            {Conn1, Ids} = open_credited_streams(Conn0, length(Bodies)),
+            Conn2 = exhaust_connection_window(Conn1),
+            Conn3 = lists:foldl(
+                fun({Id, Size}, Conn) ->
+                    {queued, NewConn, [], Size} =
+                        nhttp_h2:send_data(Conn, Id, numbered_parent(Size, 0), fin),
+                    NewConn
+                end,
+                Conn2,
+                lists:zip(Ids, Bodies)
+            ),
+            every_pending_stream_gets_a_turn(Conn3, Ids, Grants)
+        end
+    ).
+
+-spec prop_send_queue_conserves_offers() -> triq:property().
+prop_send_queue_conserves_offers() ->
+    ?FORALL(
+        Ops,
+        list(queue_op_gen()),
+        begin
+            #{conn := Conn, offered := Offered, emitted := Emitted, ids := Ids} =
+                flush_queue(run_queue_ops(Ops)),
+            nhttp_h2:send_buffer_bytes(Conn) =:= 0 andalso
+                nhttp_h2:queued_streams(Conn) =:= 0 andalso
+                lists:all(
+                    fun(Id) ->
+                        iolist_to_binary(lists:reverse(maps:get(Id, Offered))) =:=
+                            iolist_to_binary(lists:reverse(maps:get(Id, Emitted)))
+                    end,
+                    Ids
+                )
+        end
+    ).
+
+-spec prop_send_queue_respects_credit() -> triq:property().
+prop_send_queue_respects_credit() ->
+    ?FORALL(
+        Ops,
+        list(queue_op_gen()),
+        begin
+            #{violations := Violations} = flush_queue(run_queue_ops(Ops)),
+            Violations =:= []
+        end
+    ).
+
 -spec body_gen() -> triq_dom:domain().
 body_gen() ->
     ?LET(
@@ -678,3 +732,225 @@ remainder_retention(Rest, Parent, Body) ->
 -spec own_size(binary()) -> non_neg_integer().
 own_size(Bin) ->
     binary:referenced_byte_size(binary:copy(Bin)).
+
+-spec queued_conn() -> nhttp_h2:conn().
+queued_conn() ->
+    nhttp_h2:new(client, #{
+        send_queue => true, max_send_buffer => infinity, max_queued_streams => infinity
+    }).
+
+-spec open_credited_streams(nhttp_h2:conn(), non_neg_integer()) ->
+    {nhttp_h2:conn(), [nhttp_lib:stream_id()]}.
+open_credited_streams(Conn, Count) ->
+    lists:foldl(
+        fun(_, {ConnAcc, Ids}) ->
+            {ok, StreamId, Conn1} = nhttp_h2:open_stream(ConnAcc),
+            Headers = [
+                {<<":method">>, <<"POST">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}
+            ],
+            {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, nofin),
+            {_, _, _, Conn3} = apply_flow_op({stream_credit, 1 bsl 20}, StreamId, {0, 0, 0, Conn2}),
+            {Conn3, Ids ++ [StreamId]}
+        end,
+        {Conn, []},
+        lists:seq(1, Count)
+    ).
+
+-spec exhaust_connection_window(nhttp_h2:conn()) -> nhttp_h2:conn().
+exhaust_connection_window(Conn0) ->
+    {Conn1, [StreamId]} = open_credited_streams(Conn0, 1),
+    Window = nhttp_h2:connection_send_window(Conn1),
+    {ok, Conn2, _} = nhttp_h2:send_data(Conn1, StreamId, binary:copy(<<0>>, Window), nofin),
+    0 = nhttp_h2:connection_send_window(Conn2),
+    Conn2.
+
+-spec every_pending_stream_gets_a_turn(
+    nhttp_h2:conn(), [nhttp_lib:stream_id()], [pos_integer()]
+) -> boolean().
+every_pending_stream_gets_a_turn(_Conn, _Ids, []) ->
+    true;
+every_pending_stream_gets_a_turn(Conn, Ids, [Grant | Grants]) ->
+    Pending = [Id || Id <- Ids, nhttp_h2:send_buffer_bytes(Conn, Id) > 0],
+    FullPass = lists:sum([min(nhttp_h2:send_buffer_bytes(Conn, Id), 16384) || Id <- Pending]),
+    {ok, Frame} = nhttp_h2_frame:window_update(Grant),
+    {Events, NewConn, Out} =
+        case nhttp_h2:recv(Conn, iolist_to_binary(Frame)) of
+            {ok, Evs, C} -> {Evs, C, <<>>};
+            {ok, Evs, C, O} -> {Evs, C, iolist_to_binary(O)}
+        end,
+    Decoded = decode_data_frames(Out),
+    FrameIds = [Id || {Id, _, _} <- Decoded],
+    Turns = min(length(FrameIds), length(Pending)),
+    {Firsts, _} = lists:split(Turns, FrameIds),
+    Sent = [
+        {Id, lists:sum([byte_size(P) || {I, _, P} <- Decoded, I =:= Id])}
+     || Id <- lists:usort(FrameIds)
+    ],
+    DataSent = lists:sort([{Id, Bytes} || {data_sent, Id, Bytes, _} <- Events]),
+    length(lists:usort(Firsts)) =:= Turns andalso
+        lists:usort(FrameIds) -- Pending =:= [] andalso
+        (Grant < FullPass orelse Pending -- lists:usort(FrameIds) =:= []) andalso
+        lists:all(fun({_, _, P}) -> byte_size(P) =< 16384 end, Decoded) andalso
+        Sent =:= DataSent andalso
+        every_pending_stream_gets_a_turn(NewConn, Ids, Grants).
+
+-spec queue_op_gen() -> triq_dom:domain().
+queue_op_gen() ->
+    oneof([
+        {offer, int(1, 4), offer_gen()},
+        {stream_credit, int(1, 4), int(1, 100000)},
+        {connection_credit, int(1, 100000)}
+    ]).
+
+-spec offer_gen() -> triq_dom:domain().
+offer_gen() ->
+    ?LET(
+        {Size, Seed, Cuts, Form},
+        {int(0, 30000), int(0, 255), list(int(0, 30000)), oneof([binary, flat, nested])},
+        begin
+            Parent = numbered_parent(Size, Seed),
+            {Parent, body_form(Form, Parent, lists:usort([Cut || Cut <- Cuts, Cut < Size]))}
+        end
+    ).
+
+-type queue_run() :: #{
+    conn := nhttp_h2:conn(),
+    ids := [nhttp_lib:stream_id()],
+    offered := #{nhttp_lib:stream_id() => [binary()]},
+    emitted := #{nhttp_lib:stream_id() => [binary()]},
+    connection_credit := non_neg_integer(),
+    stream_credit := #{nhttp_lib:stream_id() => non_neg_integer()},
+    violations := [term()]
+}.
+
+-spec run_queue_ops([term()]) -> queue_run().
+run_queue_ops(Ops) ->
+    Conn0 = queued_conn(),
+    {Conn1, Ids} = lists:foldl(
+        fun(_, {ConnAcc, Acc}) ->
+            {ok, StreamId, ConnA} = nhttp_h2:open_stream(ConnAcc),
+            Headers = [
+                {<<":method">>, <<"POST">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}
+            ],
+            {ok, ConnB, _} = nhttp_h2:send_headers(ConnA, StreamId, Headers, nofin),
+            {ConnB, Acc ++ [StreamId]}
+        end,
+        {Conn0, []},
+        lists:seq(1, 4)
+    ),
+    Empty = maps:from_list([{Id, []} || Id <- Ids]),
+    Run0 = #{
+        conn => Conn1,
+        ids => Ids,
+        offered => Empty,
+        emitted => Empty,
+        connection_credit => 65535,
+        stream_credit => maps:from_list([{Id, 65535} || Id <- Ids]),
+        violations => []
+    },
+    lists:foldl(fun apply_queue_op/2, Run0, Ops).
+
+-spec apply_queue_op(term(), queue_run()) -> queue_run().
+apply_queue_op({offer, Index, {Parent, Body}}, #{conn := Conn, ids := Ids, offered := Offered} = Run) ->
+    StreamId = lists:nth(Index, Ids),
+    {NewConn, Frames} =
+        case nhttp_h2:send_data(Conn, StreamId, Body, nofin) of
+            {ok, C, F} -> {C, F};
+            {queued, C, F, _} -> {C, F}
+        end,
+    Run1 = Run#{conn => NewConn, offered => Offered#{StreamId => [Parent | maps:get(StreamId, Offered)]}},
+    check_run(record_frames(Frames, [], Run1));
+apply_queue_op({stream_credit, Index, Increment}, #{conn := Conn, ids := Ids, stream_credit := Credit} = Run) ->
+    StreamId = lists:nth(Index, Ids),
+    {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
+    {Events, NewConn, Out} = recv_out(Conn, Frame),
+    Run1 = Run#{conn => NewConn, stream_credit => Credit#{StreamId => maps:get(StreamId, Credit) + Increment}},
+    check_run(record_frames(Out, Events, Run1));
+apply_queue_op({connection_credit, Increment}, #{conn := Conn, connection_credit := Credit} = Run) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(Increment),
+    {Events, NewConn, Out} = recv_out(Conn, Frame),
+    Run1 = Run#{conn => NewConn, connection_credit => Credit + Increment},
+    check_run(record_frames(Out, Events, Run1)).
+
+-spec recv_out(nhttp_h2:conn(), iodata()) -> {[nhttp_h2:event()], nhttp_h2:conn(), iodata()}.
+recv_out(Conn, Frame) ->
+    case nhttp_h2:recv(Conn, iolist_to_binary(Frame)) of
+        {ok, Events, NewConn} -> {Events, NewConn, []};
+        {ok, Events, NewConn, Out} -> {Events, NewConn, Out}
+    end.
+
+-spec record_frames(iodata(), [nhttp_h2:event()], queue_run()) -> queue_run().
+record_frames(Frames, Events, #{emitted := Emitted, violations := Violations} = Run) ->
+    Decoded = decode_data_frames(Frames),
+    NewEmitted = lists:foldl(
+        fun({Id, _, Payload}, Acc) -> Acc#{Id => [Payload | maps:get(Id, Acc)]} end,
+        Emitted,
+        Decoded
+    ),
+    Oversize = [byte_size(P) || {_, _, P} <- Decoded, byte_size(P) > 16384],
+    Fins = [Id || {Id, fin, _} <- Decoded],
+    PerStream = lists:sort([
+        {Id, lists:sum([byte_size(P) || {I, _, P} <- Decoded, I =:= Id])}
+     || Id <- lists:usort([Id || {Id, _, _} <- Decoded])
+    ]),
+    DataSent = lists:sort([{Id, Bytes} || {data_sent, Id, Bytes, _} <- Events]),
+    EventMismatch =
+        case Events =:= [] orelse PerStream =:= DataSent of
+            true -> [];
+            false -> [{data_sent_mismatch, PerStream, DataSent}]
+        end,
+    Run#{
+        emitted => NewEmitted,
+        violations => [{oversize, S} || S <- Oversize] ++ [{fin, F} || F <- Fins] ++ EventMismatch ++ Violations
+    }.
+
+-spec check_run(queue_run()) -> queue_run().
+check_run(
+    #{
+        conn := Conn,
+        ids := Ids,
+        offered := Offered,
+        emitted := Emitted,
+        connection_credit := ConnCredit,
+        stream_credit := StreamCredit,
+        violations := Violations
+    } = Run
+) ->
+    OfferedBytes = fun(Id) -> lists:sum([byte_size(B) || B <- maps:get(Id, Offered)]) end,
+    EmittedBytes = fun(Id) -> lists:sum([byte_size(B) || B <- maps:get(Id, Emitted)]) end,
+    TotalEmitted = lists:sum([EmittedBytes(Id) || Id <- Ids]),
+    TotalOffered = lists:sum([OfferedBytes(Id) || Id <- Ids]),
+    ConnWindow = nhttp_h2:connection_send_window(Conn),
+    Checks =
+        [
+            {connection_window, ConnWindow, ConnCredit - TotalEmitted}
+         || ConnWindow =/= ConnCredit - TotalEmitted orelse ConnWindow < 0
+        ] ++
+            [
+                {buffered, nhttp_h2:send_buffer_bytes(Conn), TotalOffered - TotalEmitted}
+             || nhttp_h2:send_buffer_bytes(Conn) =/= TotalOffered - TotalEmitted
+            ] ++
+            lists:append([
+                begin
+                    {ok, Window} = nhttp_h2:stream_send_window(Conn, Id),
+                    Expected = maps:get(Id, StreamCredit) - EmittedBytes(Id),
+                    Held = nhttp_h2:send_buffer_bytes(Conn, Id),
+                    [{stream_window, Id, Window, Expected} || Window =/= Expected orelse Window < 0] ++
+                        [
+                            {stream_buffered, Id, Held, OfferedBytes(Id) - EmittedBytes(Id)}
+                         || Held =/= OfferedBytes(Id) - EmittedBytes(Id)
+                        ]
+                end
+             || Id <- Ids
+            ]),
+    Run#{violations => Checks ++ Violations}.
+
+-spec flush_queue(queue_run()) -> queue_run().
+flush_queue(#{ids := Ids, offered := Offered} = Run0) ->
+    Total = lists:sum([byte_size(B) || Id <- Ids, B <- maps:get(Id, Offered)]) + 1,
+    Run1 = lists:foldl(
+        fun(Index, Run) -> apply_queue_op({stream_credit, Index, Total}, Run) end,
+        Run0,
+        lists:seq(1, length(Ids))
+    ),
+    apply_queue_op({connection_credit, Total}, Run1).

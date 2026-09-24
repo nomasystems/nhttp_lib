@@ -48,7 +48,8 @@ Tests RFC 9113 compliance for:
     settings_initial_window_size_update/1,
     peer_settings_reports_peer_values/1,
     settings_hpack_index_policy_reaches_encoder/1,
-    encoder_table_accessors_report_encoder_state/1
+    encoder_table_accessors_report_encoder_state/1,
+    settings_send_queue_keys_keep_the_preface_bytes/1
 ]).
 
 -export([
@@ -64,6 +65,30 @@ Tests RFC 9113 compliance for:
     send_data_stops_at_stream_window/1,
     send_data_empty_fin_at_zero_window_stays_first/1,
     send_data_remainder_does_not_retain_a_large_parent/1
+]).
+
+-export([
+    queue_body_above_max_frame_size_on_full_window_is_ok/1,
+    queue_body_above_connection_window_drains_on_connection_credit/1,
+    queue_stream_blocked_resumes_on_stream_credit_only/1,
+    queue_connection_blocked_resumes_on_connection_credit_only/1,
+    queue_two_offers_on_one_stream_leave_in_offer_order/1,
+    queue_round_robin_gives_every_stream_a_turn/1,
+    queue_octet_bound_refuses_without_side_effects/1,
+    queue_stream_bound_refuses_without_side_effects/1,
+    queue_stream_bound_defaults_to_a_quarter_of_peer_max/1,
+    queue_rst_stream_in_either_direction_purges_pending_data/1,
+    queue_goaway_purges_local_streams_above_last_good_id/1,
+    queue_goaway_keeps_server_responses/1,
+    queue_empty_payloads/1,
+    queue_settings_shrink_holds_until_window_positive/1,
+    queue_fin_leaves_stream_open_until_emitted/1,
+    queue_blocked_stream_progresses_under_fresh_offers/1,
+    queue_drains_on_recv_without_control_frames/1,
+    queue_drains_on_recv_of_a_partial_frame/1,
+    queue_fresh_offer_drains_from_send_data/1,
+    queue_trailers_behind_pending_data_are_refused/1,
+    queue_off_keeps_partial_at_zero_window/1
 ]).
 
 -export([
@@ -182,6 +207,7 @@ all() ->
         {group, stream_states},
         {group, settings},
         {group, flow_control},
+        {group, send_queue},
         {group, header_processing},
         {group, error_handling},
         {group, integration},
@@ -214,7 +240,8 @@ groups() ->
             settings_initial_window_size_update,
             peer_settings_reports_peer_values,
             settings_hpack_index_policy_reaches_encoder,
-            encoder_table_accessors_report_encoder_state
+            encoder_table_accessors_report_encoder_state,
+            settings_send_queue_keys_keep_the_preface_bytes
         ]},
         {flow_control, [parallel], [
             connection_window_update,
@@ -229,6 +256,29 @@ groups() ->
             send_data_stops_at_stream_window,
             send_data_empty_fin_at_zero_window_stays_first,
             send_data_remainder_does_not_retain_a_large_parent
+        ]},
+        {send_queue, [parallel], [
+            queue_body_above_max_frame_size_on_full_window_is_ok,
+            queue_body_above_connection_window_drains_on_connection_credit,
+            queue_stream_blocked_resumes_on_stream_credit_only,
+            queue_connection_blocked_resumes_on_connection_credit_only,
+            queue_two_offers_on_one_stream_leave_in_offer_order,
+            queue_round_robin_gives_every_stream_a_turn,
+            queue_octet_bound_refuses_without_side_effects,
+            queue_stream_bound_refuses_without_side_effects,
+            queue_stream_bound_defaults_to_a_quarter_of_peer_max,
+            queue_rst_stream_in_either_direction_purges_pending_data,
+            queue_goaway_purges_local_streams_above_last_good_id,
+            queue_goaway_keeps_server_responses,
+            queue_empty_payloads,
+            queue_settings_shrink_holds_until_window_positive,
+            queue_fin_leaves_stream_open_until_emitted,
+            queue_blocked_stream_progresses_under_fresh_offers,
+            queue_drains_on_recv_without_control_frames,
+            queue_drains_on_recv_of_a_partial_frame,
+            queue_fresh_offer_drains_from_send_data,
+            queue_trailers_behind_pending_data_are_refused,
+            queue_off_keeps_partial_at_zero_window
         ]},
         {header_processing, [parallel], [
             headers_single_frame,
@@ -526,6 +576,22 @@ encoder_table_accessors_report_encoder_state(_Config) ->
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, fin),
     ?assertEqual(2, nhttp_h2:encoder_table_entries(Conn2)),
     ?assertEqual(39 + 36, nhttp_h2:encoder_table_size(Conn2)).
+
+-doc "The three send queue keys are local policy: the preface is byte-identical with and without them.".
+settings_send_queue_keys_keep_the_preface_bytes(_Config) ->
+    Keys = #{send_queue => true, max_send_buffer => 1 bsl 20, max_queued_streams => 8},
+    ClientPreface = iolist_to_binary(nhttp_h2:preface(nhttp_h2:new(client))),
+    ?assertEqual(ClientPreface, iolist_to_binary(nhttp_h2:preface(nhttp_h2:new(client, Keys)))),
+    ?assertEqual(
+        iolist_to_binary(nhttp_h2:preface(nhttp_h2:new(server))),
+        iolist_to_binary(nhttp_h2:preface(nhttp_h2:new(server, Keys)))
+    ),
+    <<_:24/binary, SettingsFrame/binary>> = ClientPreface,
+    {ok, {settings, Settings}, _} = nhttp_h2_frame:decode(SettingsFrame),
+    ?assertEqual([], [Key || Key <- maps:keys(Keys), maps:is_key(Key, Settings)]),
+    ?assertEqual(0, nhttp_h2:queued_streams(nhttp_h2:new(client, Keys))),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(nhttp_h2:new(client, Keys))),
+    ok.
 
 peer_settings_reports_peer_values(_Config) ->
     Conn0 = nhttp_h2:new(client),
@@ -893,12 +959,492 @@ send_data_remainder_does_not_retain_a_large_parent(_Config) ->
     ?assertEqual(own_size(HeapRest), binary:referenced_byte_size(HeapRest)),
     ok.
 
+-doc "A 64 KiB body on a full window is four DATA frames in one call, and the queue holds nothing.".
+queue_body_above_max_frame_size_on_full_window_is_ok(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(credit(Conn0, connection, 1), StreamId, 1),
+    Body = numbered_body(65536),
+    {ok, Conn2, Frames} = nhttp_h2:send_data(Conn1, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16384], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, fin], fins(Decoded)),
+    ?assertEqual(Body, payloads(Decoded)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn2)),
+    ?assertEqual(0, nhttp_h2:queued_streams(Conn2)),
+    ok.
+
+-doc "A body above the connection window is queued and leaves on a connection WINDOW_UPDATE.".
+queue_body_above_connection_window_drains_on_connection_credit(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    Body = numbered_body(100000),
+    {queued, Conn2, Frames, 34465} = nhttp_h2:send_data(Conn1, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16383], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, nofin], fins(Decoded)),
+    ?assertEqual(34465, nhttp_h2:send_buffer_bytes(Conn2)),
+    ?assertEqual(34465, nhttp_h2:send_buffer_bytes(Conn2, StreamId)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn2)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn2)),
+    {Events, Conn3, Out} = grant(Conn2, connection, 34465),
+    ?assertEqual([{window_update, 0, 34465}, {data_sent, StreamId, 34465, fin}], Events),
+    Drained = decode_data_frames(Out),
+    ?assertEqual([16384, 16384, 1697], payload_sizes(Drained)),
+    ?assertEqual([nofin, nofin, fin], fins(Drained)),
+    ?assertEqual(Body, <<(payloads(Decoded))/binary, (payloads(Drained))/binary>>),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn3)),
+    ?assertEqual(0, nhttp_h2:queued_streams(Conn3)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn3)),
+    ?assertEqual({ok, 65535}, nhttp_h2:stream_send_window(Conn3, StreamId)),
+    ?assertEqual(
+        {error, {stream_closed, StreamId}}, nhttp_h2:send_data(Conn3, StreamId, <<"x">>, nofin)
+    ),
+    ok.
+
+-doc "A stream blocked on its own window ignores connection credit and resumes on stream credit.".
+queue_stream_blocked_resumes_on_stream_credit_only(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, connection, 100000),
+    {queued, Conn2, _, 34465} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(100000), fin),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn2, StreamId)),
+    ?assertEqual(100000, nhttp_h2:connection_send_window(Conn2)),
+    {[{window_update, 0, 50000}], Conn3, <<>>} = grant(Conn2, connection, 50000),
+    ?assertEqual(34465, nhttp_h2:send_buffer_bytes(Conn3, StreamId)),
+    {Events, Conn4, Out} = grant(Conn3, StreamId, 34465),
+    ?assertEqual([{window_update, StreamId, 34465}, {data_sent, StreamId, 34465, fin}], Events),
+    ?assertEqual([16384, 16384, 1697], payload_sizes(decode_data_frames(Out))),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn4)),
+    ?assertEqual(150000 - 34465, nhttp_h2:connection_send_window(Conn4)),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn4, StreamId)),
+    ok.
+
+-doc "A stream blocked on the connection window ignores stream credit and resumes on connection credit.".
+queue_connection_blocked_resumes_on_connection_credit_only(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    {queued, Conn2, _, 34465} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(100000), fin),
+    ?assertEqual({ok, 100000}, nhttp_h2:stream_send_window(Conn2, StreamId)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn2)),
+    {[{window_update, StreamId, 50000}], Conn3, <<>>} = grant(Conn2, StreamId, 50000),
+    ?assertEqual(34465, nhttp_h2:send_buffer_bytes(Conn3, StreamId)),
+    {Events, Conn4, Out} = grant(Conn3, connection, 34465),
+    ?assertEqual([{window_update, 0, 34465}, {data_sent, StreamId, 34465, fin}], Events),
+    ?assertEqual([16384, 16384, 1697], payload_sizes(decode_data_frames(Out))),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn4)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn4)),
+    ?assertEqual({ok, 150000 - 34465}, nhttp_h2:stream_send_window(Conn4, StreamId)),
+    ok.
+
+-doc "Two offers on a blocked stream leave in offer order, and END_STREAM rides the last frame.".
+queue_two_offers_on_one_stream_leave_in_offer_order(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    First = numbered_body(70000),
+    {queued, Conn2, _, 4465} = nhttp_h2:send_data(Conn1, StreamId, First, nofin),
+    Second = binary:copy(<<"second">>, 100),
+    {queued, Conn3, [], 5065} = nhttp_h2:send_data(Conn2, StreamId, [Second], fin),
+    ?assertEqual(5065, nhttp_h2:send_buffer_bytes(Conn3, StreamId)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn3)),
+    {Events, Conn4, Out} = grant(Conn3, connection, 10000),
+    ?assertEqual([{window_update, 0, 10000}, {data_sent, StreamId, 5065, fin}], Events),
+    Drained = decode_data_frames(Out),
+    ?assertEqual(<<(binary:part(First, 65535, 4465))/binary, Second/binary>>, payloads(Drained)),
+    ?assertEqual([fin], fins(Drained)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn4)),
+    ok.
+
+-doc "Round-robin: one frame per turn, so two small streams complete while a large one takes the rest.".
+queue_round_robin_gives_every_stream_a_turn(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{max_send_buffer => infinity})),
+    {ConnB, B} = open_post_stream(ConnA),
+    {ConnC, C} = open_post_stream(ConnB),
+    {queued, Conn1, _, 983041} = nhttp_h2:send_data(ConnC, A, numbered_body(1048576), fin),
+    {queued, Conn2, [], 1024} = nhttp_h2:send_data(Conn1, B, numbered_body(1024), fin),
+    {queued, Conn3, [], 1024} = nhttp_h2:send_data(Conn2, C, numbered_body(1024), fin),
+    ?assertEqual(3, nhttp_h2:queued_streams(Conn3)),
+    ?assertEqual(983041 + 2048, nhttp_h2:send_buffer_bytes(Conn3)),
+    {[{window_update, A, 49152}], Conn4, <<>>} = grant(Conn3, A, 3 * 16384),
+    {Events, Conn5, Out} = grant(Conn4, connection, 3 * 16384),
+    Drained = decode_data_frames(Out),
+    ?assertEqual(
+        [{A, 16384}, {B, 1024}, {C, 1024}, {A, 16384}, {A, 14336}],
+        [{Id, byte_size(Payload)} || {Id, _, Payload} <- Drained]
+    ),
+    ?assertEqual([nofin, fin, fin, nofin, nofin], fins(Drained)),
+    ?assertEqual(
+        [
+            {window_update, 0, 49152},
+            {data_sent, A, 47104, nofin},
+            {data_sent, B, 1024, fin},
+            {data_sent, C, 1024, fin}
+        ],
+        Events
+    ),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn5)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn5)),
+    ?assertEqual(983041 - 47104, nhttp_h2:send_buffer_bytes(Conn5, A)),
+    ok.
+
+-doc "The octet bound refuses the offer that would cross it and leaves the queue as it was.".
+queue_octet_bound_refuses_without_side_effects(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{max_send_buffer => 1000})),
+    {ConnB, B} = open_post_stream(ConnA),
+    ?assertEqual(
+        {error, send_buffer_full}, nhttp_h2:send_data(ConnB, A, numbered_body(65535 + 1001), nofin)
+    ),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(ConnB)),
+    ?assertEqual(65535, nhttp_h2:connection_send_window(ConnB)),
+    {queued, Conn1, _, 1000} = nhttp_h2:send_data(ConnB, A, numbered_body(65535 + 1000), nofin),
+    ?assertEqual({error, send_buffer_full}, nhttp_h2:send_data(Conn1, A, <<"x">>, nofin)),
+    ?assertEqual({error, send_buffer_full}, nhttp_h2:send_data(Conn1, B, <<"x">>, nofin)),
+    ?assertEqual(1000, nhttp_h2:send_buffer_bytes(Conn1)),
+    ?assertEqual(1000, nhttp_h2:send_buffer_bytes(Conn1, A)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn1)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn1)),
+    ok.
+
+-doc "The stream bound refuses a new entry, and an existing entry still accepts an append.".
+queue_stream_bound_refuses_without_side_effects(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{max_queued_streams => 1})),
+    {ConnB, B} = open_post_stream(ConnA),
+    {queued, Conn1, _, 4465} = nhttp_h2:send_data(ConnB, A, numbered_body(70000), nofin),
+    ?assertEqual({error, send_buffer_full}, nhttp_h2:send_data(Conn1, B, <<"x">>, nofin)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn1)),
+    ?assertEqual(4465, nhttp_h2:send_buffer_bytes(Conn1)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn1, B)),
+    {queued, Conn2, [], 4466} = nhttp_h2:send_data(Conn1, A, <<"x">>, nofin),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn2)),
+    ok.
+
+-doc "Without the key the stream bound is a quarter of the peer max_concurrent_streams, and infinity lifts it.".
+queue_stream_bound_defaults_to_a_quarter_of_peer_max(_Config) ->
+    {Conn0, [First | Rest]} = open_post_streams(queued_conn(#{}), 26),
+    {queued, Conn1, _, 4465} = nhttp_h2:send_data(Conn0, First, numbered_body(70000), nofin),
+    {Accepted, [Last]} = lists:split(24, Rest),
+    Conn2 = queue_one_octet_each(Conn1, Accepted),
+    ?assertEqual(25, nhttp_h2:queued_streams(Conn2)),
+    ?assertEqual({error, send_buffer_full}, nhttp_h2:send_data(Conn2, Last, <<"x">>, nofin)),
+    ?assertEqual(25, nhttp_h2:queued_streams(Conn2)),
+    {Conn3, [First3 | Rest3]} = open_post_streams(
+        queued_conn(#{max_queued_streams => infinity}), 30
+    ),
+    {queued, Conn4, _, 4465} = nhttp_h2:send_data(Conn3, First3, numbered_body(70000), nofin),
+    ?assertEqual(30, nhttp_h2:queued_streams(queue_one_octet_each(Conn4, Rest3))),
+    ok.
+
+-doc "RST_STREAM in either direction purges the entry, and the purge restores no credit.".
+queue_rst_stream_in_either_direction_purges_pending_data(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{})),
+    {ConnB, B} = open_post_stream(ConnA),
+    {queued, Conn1, _, 4465} = nhttp_h2:send_data(ConnB, A, numbered_body(70000), fin),
+    {queued, Conn2, [], 100} = nhttp_h2:send_data(Conn1, B, numbered_body(100), fin),
+    ?assertEqual(2, nhttp_h2:queued_streams(Conn2)),
+    ?assertEqual(2, maps:get(active, nhttp_h2:stream_stats(Conn2))),
+    {ok, Conn3, _Rst} = nhttp_h2:send_rst_stream(Conn2, A, cancel),
+    ?assertEqual(100, nhttp_h2:send_buffer_bytes(Conn3)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn3, A)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn3)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn3)),
+    {ok, PeerRst} = nhttp_h2_frame:rst_stream(B, cancel),
+    {ok, [{stream_reset, B, cancel}], Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(PeerRst)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn4)),
+    ?assertEqual(0, nhttp_h2:queued_streams(Conn4)),
+    ?assertEqual(0, maps:get(active, nhttp_h2:stream_stats(Conn4))),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn4)),
+    {[{window_update, 0, 10000}], Conn5, <<>>} = grant(Conn4, connection, 10000),
+    ?assertEqual(10000, nhttp_h2:connection_send_window(Conn5)),
+    ok.
+
+-doc "GOAWAY purges the entries of local streams above the last stream id and keeps the rest.".
+queue_goaway_purges_local_streams_above_last_good_id(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{})),
+    {ConnB, B} = open_post_stream(ConnA),
+    {ConnC, C} = open_post_stream(ConnB),
+    Conn0 = credit(ConnC, A, 100000),
+    {queued, Conn1, _, 4465} = nhttp_h2:send_data(Conn0, A, numbered_body(70000), nofin),
+    {queued, Conn2, [], 100} = nhttp_h2:send_data(Conn1, B, numbered_body(100), fin),
+    {queued, Conn3, [], 200} = nhttp_h2:send_data(Conn2, C, numbered_body(200), fin),
+    {ok, Goaway} = nhttp_h2_frame:goaway(B, no_error, <<>>),
+    {ok, [{goaway, B, no_error, <<>>}], Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(Goaway)),
+    ?assertEqual(2, nhttp_h2:queued_streams(Conn4)),
+    ?assertEqual(4565, nhttp_h2:send_buffer_bytes(Conn4)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn4, C)),
+    ?assertEqual(0, nhttp_h2:connection_send_window(Conn4)),
+    {Events, Conn5, Out} = grant(Conn4, connection, 10000),
+    ?assertEqual(
+        [{window_update, 0, 10000}, {data_sent, A, 4465, nofin}, {data_sent, B, 100, fin}], Events
+    ),
+    ?assertEqual([A, B], frame_ids(decode_data_frames(Out))),
+    ?assertEqual(0, nhttp_h2:queued_streams(Conn5)),
+    ok.
+
+-doc "GOAWAY from the client keeps the queued responses of a server draining.".
+queue_goaway_keeps_server_responses(_Config) ->
+    Conn0 = server_with_preface(nhttp_h2:new(server, #{send_queue => true})),
+    HeaderBlock = encode_headers(minimal_request_headers()),
+    {ok, F1} = nhttp_h2_frame:headers(1, fin, fin, HeaderBlock),
+    {ok, [{request, 1, _, fin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(F1)),
+    {ok, F3} = nhttp_h2_frame:headers(3, fin, fin, HeaderBlock),
+    {ok, [{request, 3, _, fin}], Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(F3)),
+    {ok, Conn3, _} = nhttp_h2:send_headers(Conn2, 1, minimal_response_headers(), nofin),
+    {ok, Conn4, _} = nhttp_h2:send_headers(Conn3, 3, minimal_response_headers(), nofin),
+    Conn5 = credit(Conn4, 1, 100000),
+    {queued, Conn6, _, 4465} = nhttp_h2:send_data(Conn5, 1, numbered_body(70000), fin),
+    {queued, Conn7, [], 100} = nhttp_h2:send_data(Conn6, 3, numbered_body(100), fin),
+    {ok, Goaway} = nhttp_h2_frame:goaway(0, no_error, <<>>),
+    {ok, [{goaway, 0, no_error, <<>>}], Conn8} = nhttp_h2:recv(Conn7, iolist_to_binary(Goaway)),
+    ?assertEqual(2, nhttp_h2:queued_streams(Conn8)),
+    {Events, Conn9, Out} = grant(Conn8, connection, 10000),
+    ?assertEqual(
+        [{window_update, 0, 10000}, {data_sent, 1, 4465, fin}, {data_sent, 3, 100, fin}], Events
+    ),
+    ?assertEqual([1, 3], frame_ids(decode_data_frames(Out))),
+    ?assertEqual(0, nhttp_h2:queued_streams(Conn9)),
+    ?assertEqual(0, maps:get(active, nhttp_h2:stream_stats(Conn9))),
+    ok.
+
+-doc "An empty nofin holds nothing, an empty fin with nothing pending leaves at once, and with pending data it waits.".
+queue_empty_payloads(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{})),
+    Conn0 = credit(ConnA, A, 100000),
+    {ok, Conn0, []} = nhttp_h2:send_data(Conn0, A, <<>>, nofin),
+    {queued, Conn1, _, 4465} = nhttp_h2:send_data(Conn0, A, numbered_body(70000), nofin),
+    {ok, Conn1, []} = nhttp_h2:send_data(Conn1, A, <<>>, nofin),
+    {ok, Conn1, []} = nhttp_h2:send_data(Conn1, A, [], nofin),
+    {ConnB, B} = open_post_stream(Conn1),
+    {ok, Conn2, Frame} = nhttp_h2:send_data(ConnB, B, <<>>, fin),
+    {ok, {data, B, fin, <<>>}, _} = nhttp_h2_frame:decode(iolist_to_binary(Frame)),
+    ?assertEqual({error, {stream_closed, B}}, nhttp_h2:send_data(Conn2, B, <<"x">>, nofin)),
+    {queued, Conn3, [], 4465} = nhttp_h2:send_data(Conn2, A, <<>>, fin),
+    ?assertEqual({error, {stream_closed, A}}, nhttp_h2:send_data(Conn3, A, <<"x">>, nofin)),
+    ?assertEqual({error, {stream_closed, A}}, nhttp_h2:send_data(Conn3, A, <<>>, fin)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn3)),
+    {Events, Conn4, Out} = grant(Conn3, connection, 10000),
+    ?assertEqual([{window_update, 0, 10000}, {data_sent, A, 4465, fin}], Events),
+    ?assertEqual([{A, fin, 4465}], [
+        {Id, Fin, byte_size(P)}
+     || {Id, Fin, P} <- decode_data_frames(Out)
+    ]),
+    ?assertEqual({error, {stream_closed, A}}, nhttp_h2:send_data(Conn4, A, <<>>, fin)),
+    ok.
+
+-doc "A SETTINGS shrink that drives the stream window negative holds the entry until the window is positive.".
+queue_settings_shrink_holds_until_window_positive(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, connection, 100000),
+    {ok, Conn2, _} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(16384), nofin),
+    {ok, Shrink} = nhttp_h2_frame:settings(#{initial_window_size => 1}),
+    {ok, [{settings, _}], Conn3, _Ack} = nhttp_h2:recv(Conn2, iolist_to_binary(Shrink)),
+    ?assertEqual({ok, 1 - 16384}, nhttp_h2:stream_send_window(Conn3, StreamId)),
+    Tail = numbered_body(100),
+    {queued, Conn4, [], 100} = nhttp_h2:send_data(Conn3, StreamId, Tail, fin),
+    {[{window_update, StreamId, 16383}], Conn5, <<>>} = grant(Conn4, StreamId, 16383),
+    ?assertEqual({ok, 0}, nhttp_h2:stream_send_window(Conn5, StreamId)),
+    ?assertEqual(100, nhttp_h2:send_buffer_bytes(Conn5, StreamId)),
+    {Events, Conn6, Out} = grant(Conn5, StreamId, 1),
+    ?assertEqual([{window_update, StreamId, 1}, {data_sent, StreamId, 1, nofin}], Events),
+    ?assertEqual([{StreamId, nofin, binary:part(Tail, 0, 1)}], decode_data_frames(Out)),
+    ?assertEqual(99, nhttp_h2:send_buffer_bytes(Conn6, StreamId)),
+    {Events2, Conn7, Out2} = grant(Conn6, StreamId, 99),
+    ?assertEqual([{window_update, StreamId, 99}, {data_sent, StreamId, 99, fin}], Events2),
+    ?assertEqual([{StreamId, fin, binary:part(Tail, 1, 99)}], decode_data_frames(Out2)),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn7)),
+    ok.
+
+-doc "An offer with fin that queues leaves the stream open, and the stream moves when the FIN frame leaves.".
+queue_fin_leaves_stream_open_until_emitted(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    ?assertEqual(1, maps:get(active, nhttp_h2:stream_stats(Conn1))),
+    {queued, Conn2, _, 4465} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(70000), fin),
+    Trailers = [{<<"x-checksum">>, <<"1">>}],
+    ?assertEqual(
+        {error, {data_pending, StreamId}}, nhttp_h2:send_headers(Conn2, StreamId, Trailers, fin)
+    ),
+    ?assertEqual(1, maps:get(active, nhttp_h2:stream_stats(Conn2))),
+    {Events, Conn3, Out} = grant(Conn2, connection, 10000),
+    ?assertEqual([{window_update, 0, 10000}, {data_sent, StreamId, 4465, fin}], Events),
+    ?assertEqual([fin], fins(decode_data_frames(Out))),
+    ?assertEqual(1, maps:get(active, nhttp_h2:stream_stats(Conn3))),
+    ?assertEqual({ok, 100000 - 4465}, nhttp_h2:stream_send_window(Conn3, StreamId)),
+    ?assertEqual(
+        {error, {stream_closed, StreamId}}, nhttp_h2:send_headers(Conn3, StreamId, Trailers, fin)
+    ),
+    ?assertEqual(
+        {error, {stream_closed, StreamId}}, nhttp_h2:send_data(Conn3, StreamId, <<>>, fin)
+    ),
+    ok.
+
+-doc "A blocked stream keeps its turn under a continuous arrival of fresh offers on other streams.".
+queue_blocked_stream_progresses_under_fresh_offers(_Config) ->
+    {ConnA, A} = open_post_stream(
+        queued_conn(#{max_send_buffer => infinity, max_queued_streams => infinity})
+    ),
+    Conn0 = credit(ConnA, A, 1000000),
+    {queued, Conn1, _, 934465} = nhttp_h2:send_data(Conn0, A, numbered_body(1000000), nofin),
+    Final = lists:foldl(
+        fun(_, Conn) ->
+            {ConnS, S} = open_post_stream(Conn),
+            {queued, ConnQ, [], 1000} = nhttp_h2:send_data(ConnS, S, numbered_body(1000), fin),
+            Before = nhttp_h2:send_buffer_bytes(ConnQ, A),
+            {Events, ConnG, Out} = grant(ConnQ, connection, 2 * 16384),
+            ?assertMatch(
+                [{window_update, 0, _}, {data_sent, A, _, nofin}, {data_sent, S, 1000, fin}], Events
+            ),
+            ?assertEqual([A, S, A], frame_ids(decode_data_frames(Out))),
+            ?assertEqual(Before - 2 * 16384 + 1000, nhttp_h2:send_buffer_bytes(ConnG, A)),
+            ?assertEqual(0, nhttp_h2:send_buffer_bytes(ConnG, S)),
+            ConnG
+        end,
+        Conn1,
+        lists:seq(1, 20)
+    ),
+    ?assertEqual(934465 - 20 * (2 * 16384 - 1000), nhttp_h2:send_buffer_bytes(Final, A)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Final)),
+    ok.
+
+-doc "The drain runs on a recv that carries no control frame, and a control frame precedes the DATA.".
+queue_drains_on_recv_without_control_frames(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    {queued, Conn2, _, 34465} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(100000), fin),
+    {ok, Wu} = nhttp_h2_frame:window_update(1000),
+    {ok, [{window_update, 0, 1000}, {data_sent, StreamId, 1000, nofin}], Conn3, Out} =
+        nhttp_h2:recv(Conn2, iolist_to_binary(Wu)),
+    ?assertEqual([1000], payload_sizes(decode_data_frames(iolist_to_binary(Out)))),
+    Opaque = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    {ok, Ping} = nhttp_h2_frame:ping(Opaque),
+    {ok, [{ping, Opaque}, {window_update, 0, 1000}, {data_sent, StreamId, 1000, nofin}], _Conn4,
+        Out2} =
+        nhttp_h2:recv(Conn3, iolist_to_binary([Ping, Wu])),
+    Bin = iolist_to_binary(Out2),
+    {ok, {ping_ack, Opaque}, Consumed} = nhttp_h2_frame:decode(Bin),
+    <<_:Consumed/binary, Rest/binary>> = Bin,
+    ?assertEqual([1000], payload_sizes(decode_data_frames(Rest))),
+    ok.
+
+-doc "The drain runs on a recv whose tail is an incomplete frame, and the tail stays buffered.".
+queue_drains_on_recv_of_a_partial_frame(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    {queued, Conn2, _, 34465} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(100000), fin),
+    {ok, Wu} = nhttp_h2_frame:window_update(1000),
+    WuBin = iolist_to_binary(Wu),
+    <<Head:5/binary, Tail/binary>> = WuBin,
+    {ok, [{window_update, 0, 1000}, {data_sent, StreamId, 1000, nofin}], Conn3, Out} =
+        nhttp_h2:recv(Conn2, <<WuBin/binary, Head/binary>>),
+    ?assertEqual([1000], payload_sizes(decode_data_frames(iolist_to_binary(Out)))),
+    {ok, [{window_update, 0, 1000}, {data_sent, StreamId, 1000, nofin}], _Conn4, Out2} =
+        nhttp_h2:recv(Conn3, Tail),
+    ?assertEqual([1000], payload_sizes(decode_data_frames(iolist_to_binary(Out2)))),
+    ok.
+
+-doc "A fresh offer beside a stream blocked on its own window leaves from send_data/4 with no recv/2 call.".
+queue_fresh_offer_drains_from_send_data(_Config) ->
+    {ConnA, A} = open_post_stream(queued_conn(#{})),
+    Conn0 = credit(ConnA, connection, 100000),
+    {queued, Conn1, _, 34465} = nhttp_h2:send_data(Conn0, A, numbered_body(100000), fin),
+    ?assertEqual(100000, nhttp_h2:connection_send_window(Conn1)),
+    {ConnB, B} = open_post_stream(Conn1),
+    {ok, Conn2, FramesB} = nhttp_h2:send_data(ConnB, B, numbered_body(20000), fin),
+    DecodedB = decode_data_frames(iolist_to_binary(FramesB)),
+    ?assertEqual([B, B], frame_ids(DecodedB)),
+    ?assertEqual([16384, 3616], payload_sizes(DecodedB)),
+    ?assertEqual([nofin, fin], fins(DecodedB)),
+    ?assertEqual(34465, nhttp_h2:send_buffer_bytes(Conn2, A)),
+    ?assertEqual(1, nhttp_h2:queued_streams(Conn2)),
+    ?assertEqual(80000, nhttp_h2:connection_send_window(Conn2)),
+    {ConnC, C} = open_post_stream(Conn2),
+    {queued, Conn3, FramesC, 4465} = nhttp_h2:send_data(ConnC, C, numbered_body(70000), fin),
+    DecodedC = decode_data_frames(iolist_to_binary(FramesC)),
+    ?assertEqual([C, C, C, C], frame_ids(DecodedC)),
+    ?assertEqual([16384, 16384, 16384, 16383], payload_sizes(DecodedC)),
+    ?assertEqual(2, nhttp_h2:queued_streams(Conn3)),
+    ?assertEqual(80000 - 65535, nhttp_h2:connection_send_window(Conn3)),
+    ok.
+
+-doc "Trailers wait behind nothing: HEADERS on a stream with pending octets is refused until the queue empties.".
+queue_trailers_behind_pending_data_are_refused(_Config) ->
+    {Conn0, StreamId} = open_post_stream(queued_conn(#{})),
+    Conn1 = credit(Conn0, StreamId, 100000),
+    {queued, Conn2, _, 4465} = nhttp_h2:send_data(Conn1, StreamId, numbered_body(70000), nofin),
+    Trailers = [{<<"x-checksum">>, <<"abc">>}],
+    ?assertEqual(
+        {error, {data_pending, StreamId}}, nhttp_h2:send_headers(Conn2, StreamId, Trailers, fin)
+    ),
+    {_, Conn3, _} = grant(Conn2, connection, 10000),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn3, StreamId)),
+    {ok, _Conn4, Frame} = nhttp_h2:send_headers(Conn3, StreamId, Trailers, fin),
+    {ok, {headers, StreamId, fin, fin, _}, _} = nhttp_h2_frame:decode(iolist_to_binary(Frame)),
+    {ConnOff, Off} = open_post_stream(nhttp_h2:new(client)),
+    {partial, ConnOff1, _, _, nofin, 0} = nhttp_h2:send_data(
+        ConnOff, Off, numbered_body(70000), nofin
+    ),
+    {ok, _, OffFrame} = nhttp_h2:send_headers(ConnOff1, Off, Trailers, fin),
+    {ok, {headers, Off, fin, fin, _}, _} = nhttp_h2_frame:decode(iolist_to_binary(OffFrame)),
+    ok.
+
+-doc "An explicit send_queue => false keeps the partial return at a zero window.".
+queue_off_keeps_partial_at_zero_window(_Config) ->
+    {Conn0, StreamId} = open_post_stream(nhttp_h2:new(client, #{send_queue => false})),
+    Body = numbered_body(65536),
+    {partial, Conn1, Frames, Rest, fin, 0} = nhttp_h2:send_data(Conn0, StreamId, Body, fin),
+    Decoded = decode_data_frames(iolist_to_binary(Frames)),
+    ?assertEqual([16384, 16384, 16384, 16383], payload_sizes(Decoded)),
+    ?assertEqual([nofin, nofin, nofin, nofin], fins(Decoded)),
+    ?assertEqual(binary:part(Body, 65535, 1), Rest),
+    ?assertEqual(0, nhttp_h2:send_buffer_bytes(Conn1)),
+    ?assertEqual(0, nhttp_h2:queued_streams(Conn1)),
+    {partial, Conn1, [], <<>>, nofin, 0} = nhttp_h2:send_data(Conn1, StreamId, <<>>, nofin),
+    ok.
+
+queued_conn(Settings) ->
+    nhttp_h2:new(client, Settings#{send_queue => true}).
+
 open_post_stream() ->
-    Conn0 = nhttp_h2:new(client),
+    open_post_stream(nhttp_h2:new(client)).
+
+open_post_stream(Conn0) ->
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     Headers = [{<<":method">>, <<"POST">>}, {<<":path">>, <<"/">>}],
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, nofin),
     {Conn2, StreamId}.
+
+open_post_streams(Conn, Count) ->
+    lists:foldl(
+        fun(_, {ConnAcc, Ids}) ->
+            {NewConn, StreamId} = open_post_stream(ConnAcc),
+            {NewConn, Ids ++ [StreamId]}
+        end,
+        {Conn, []},
+        lists:seq(1, Count)
+    ).
+
+queue_one_octet_each(Conn, Ids) ->
+    lists:foldl(
+        fun(Id, ConnAcc) ->
+            {queued, NewConn, [], 1} = nhttp_h2:send_data(ConnAcc, Id, <<"x">>, nofin),
+            NewConn
+        end,
+        Conn,
+        Ids
+    ).
+
+grant(Conn, connection, Increment) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(Increment),
+    recv_out(Conn, Frame);
+grant(Conn, StreamId, Increment) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
+    recv_out(Conn, Frame).
+
+recv_out(Conn, Frame) ->
+    case nhttp_h2:recv(Conn, iolist_to_binary(Frame)) of
+        {ok, Events, NewConn} -> {Events, NewConn, <<>>};
+        {ok, Events, NewConn, Out} -> {Events, NewConn, iolist_to_binary(Out)}
+    end.
+
+frame_ids(Decoded) ->
+    [StreamId || {StreamId, _, _} <- Decoded].
 
 credit(Conn, connection, Increment) ->
     {ok, Frame} = nhttp_h2_frame:window_update(Increment),

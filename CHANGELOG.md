@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nhttp_hpack:table_entries/1`, `nhttp_h2:encoder_table_entries/1` and
   `nhttp_h2:encoder_table_size/1` read the live entry count and the octets
   of the encoder dynamic table
+- An opt-in send queue in `nhttp_h2`. With `send_queue => true`,
+  `send_data/4` holds what the credit cannot take and answers
+  `{queued, Conn, Frames, Buffered}`, and `recv/2` drains it round-robin
+  as credit arrives, with a `{data_sent, StreamId, Bytes, Fin}` event per
+  stream. `max_send_buffer` and `max_queued_streams` bound the queue and
+  refuse an offer as `{error, send_buffer_full}`. `send_headers/4` on a
+  stream with queued octets answers `{error, {data_pending, StreamId}}`.
+  `send_buffer_bytes/1,2` and `queued_streams/1` read the queue. Without
+  the key nothing changes
 
 ### Changed
 
