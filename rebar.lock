@@ -1,4 +1,4 @@
 [{<<"nquic">>,
-  {git,"git@github.com:nomasystems/nquic.git",
+  {git,"https://github.com/nomasystems/nquic.git",
        {ref,"302d4abd285990c83bdd16c66fb720fbdf6c0d9c"}},
   0}].
