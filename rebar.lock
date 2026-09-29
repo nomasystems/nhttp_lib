@@ -1,4 +1,4 @@
 [{<<"nquic">>,
   {git,"git@github.com:nomasystems/nquic.git",
-       {ref,"d02860973be017cc3cd8afe2d35eba947444c3fc"}},
+       {ref,"302d4abd285990c83bdd16c66fb720fbdf6c0d9c"}},
   0}].
