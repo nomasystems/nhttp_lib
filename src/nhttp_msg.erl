@@ -74,6 +74,18 @@ error format (atom for H2, descriptive binary for H3).
     headers := nhttp_lib:headers()
 }.
 
+-type shape_state() :: #{
+    phase := pseudo | regular,
+    method := binary() | undefined,
+    scheme := binary() | undefined,
+    path := binary() | undefined,
+    authority := binary() | undefined,
+    host := binary() | undefined,
+    protocol := binary() | undefined,
+    seen_pseudo := #{binary() => true},
+    acc := nhttp_lib:headers()
+}.
+
 -type request_shape_error() ::
     duplicate_pseudo
     | unknown_pseudo
@@ -213,7 +225,7 @@ decode_status(<<D1, D2, D3>>) when
 decode_status(_) ->
     {error, invalid_status}.
 
--spec do_validate_shape(nhttp_lib:headers(), map()) ->
+-spec do_validate_shape(nhttp_lib:headers(), shape_state()) ->
     {ok, request_shape()} | {error, request_shape_error()}.
 do_validate_shape([], State) ->
     finalise_request_shape(State);
@@ -356,45 +368,27 @@ extract_response_pseudo([{<<":", _/binary>>, _} | Rest], Status, Acc) ->
 extract_response_pseudo([Header | Rest], Status, Acc) ->
     extract_response_pseudo(Rest, Status, [Header | Acc]).
 
--spec finalise_request_shape(map()) ->
+-spec finalise_request_shape(shape_state()) ->
     {ok, request_shape()} | {error, request_shape_error()}.
-finalise_request_shape(State) ->
-    #{
-        method := Method,
-        scheme := Scheme,
-        path := Path,
-        authority := Authority,
-        host := Host,
-        protocol := Protocol,
-        acc := Acc
-    } = State,
-    case
-        Method =/= undefined andalso Scheme =/= undefined andalso Path =/= undefined andalso
-            Path =/= <<>>
-    of
-        false ->
-            {error, missing_required_pseudo};
-        true ->
-            case validate_wire_scheme(Scheme) of
-                {error, protocol_error} ->
-                    {error, bad_wire_scheme};
-                ok ->
-                    case check_authority_host_match(Authority, Host) of
-                        {error, protocol_error} ->
-                            {error, authority_host_mismatch};
-                        ok ->
-                            {ok, #{
-                                method => Method,
-                                scheme => Scheme,
-                                path => Path,
-                                authority => Authority,
-                                host => Host,
-                                protocol => Protocol,
-                                headers => lists:reverse(Acc)
-                            }}
-                    end
-            end
-    end.
+finalise_request_shape(#{method := Method, scheme := Scheme, path := Path} = State) when
+    is_binary(Method), is_binary(Scheme), is_binary(Path), Path =/= <<>>
+->
+    #{authority := Authority, host := Host, protocol := Protocol, acc := Acc} = State,
+    maybe
+        ok ?= shape_wire_scheme(Scheme),
+        ok ?= shape_authority_host(Authority, Host),
+        {ok, #{
+            method => Method,
+            scheme => Scheme,
+            path => Path,
+            authority => Authority,
+            host => Host,
+            protocol => Protocol,
+            headers => lists:reverse(Acc)
+        }}
+    end;
+finalise_request_shape(_State) ->
+    {error, missing_required_pseudo}.
 
 -doc """
 Return the `host` header value or `<<>>` when missing. Used as the
@@ -435,12 +429,27 @@ parse_content_length(Bin) ->
         false -> undefined
     end.
 
--spec set_pseudo_field(binary(), binary(), map()) -> map().
+-spec set_pseudo_field(binary(), binary(), shape_state()) -> shape_state().
 set_pseudo_field(<<":method">>, V, S) -> S#{method => V};
 set_pseudo_field(<<":scheme">>, V, S) -> S#{scheme => V};
 set_pseudo_field(<<":path">>, V, S) -> S#{path => V};
 set_pseudo_field(<<":authority">>, V, S) -> S#{authority => V};
 set_pseudo_field(<<":protocol">>, V, S) -> S#{protocol => V}.
+
+-spec shape_authority_host(binary() | undefined, binary() | undefined) ->
+    ok | {error, authority_host_mismatch}.
+shape_authority_host(Authority, Host) ->
+    case check_authority_host_match(Authority, Host) of
+        ok -> ok;
+        {error, protocol_error} -> {error, authority_host_mismatch}
+    end.
+
+-spec shape_wire_scheme(binary()) -> ok | {error, bad_wire_scheme}.
+shape_wire_scheme(Scheme) ->
+    case validate_wire_scheme(Scheme) of
+        ok -> ok;
+        {error, protocol_error} -> {error, bad_wire_scheme}
+    end.
 
 -doc """
 Check that the bytes received so far are consistent with the

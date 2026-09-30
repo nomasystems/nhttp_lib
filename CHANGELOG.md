@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1]
+
+### Fixed
+
+- The request validation in `nhttp_msg` typed its state as `map()`, so a
+  type checker could not prove that the returned headers are a list. The
+  state now has a precise type
+
+### Changed
+
+- Requires nquic 1.1.0
+
 ## [1.2.0]
 
 ### Fixed
