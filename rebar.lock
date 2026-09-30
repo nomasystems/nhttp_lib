@@ -1,4 +1,8 @@
-[{<<"nquic">>,
-  {git,"https://github.com/nomasystems/nquic.git",
-       {ref,"302d4abd285990c83bdd16c66fb720fbdf6c0d9c"}},
-  0}].
+{"1.2.0",
+[{<<"nquic">>,{pkg,<<"nquic">>,<<"1.1.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"nquic">>, <<"26516E2D3FAC1A54EEDB8179ADCB30001F42D23602FD31C73E7F58D19E74559E">>}]},
+{pkg_hash_ext,[
+ {<<"nquic">>, <<"D03E339D97251BF0E0BDA97826D9FE116337B9A5A56A242E86ED9C0DCA3D1F5B">>}]}
+].
