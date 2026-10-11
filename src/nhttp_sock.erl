@@ -113,6 +113,7 @@ application protocol was negotiated (e.g., `<<"h2">>` or `<<"http/1.1">>`).
     verify => verify_none | verify_peer,
     server_name_indication => inet:hostname() | disable,
     tls_versions => ['tlsv1.2' | 'tlsv1.3'],
+    supported_groups => [ssl:group()],
     wildcard_hostname => boolean()
 }.
 
@@ -214,6 +215,7 @@ build_client_ssl_opts(Opts) ->
     AlpnProtocols = maps:get(alpn_advertised_protocols, Opts, [<<"h2">>, <<"http/1.1">>]),
     Verify = maps:get(verify, Opts, verify_peer),
     Versions = maps:get(tls_versions, Opts, ['tlsv1.2', 'tlsv1.3']),
+    Groups = maps:get(supported_groups, Opts, undefined),
 
     BaseOpts = [
         {verify, Verify},
@@ -246,7 +248,8 @@ build_client_ssl_opts(Opts) ->
         maybe_add_opt(customize_hostname_check, HostnameCheck, WithCacert),
     WithCert = maybe_add_opt(certfile, Certfile, WithHostnameCheck),
     WithKey = maybe_add_opt(keyfile, Keyfile, WithCert),
-    maybe_add_opt(certs_keys, CertsKeys, WithKey).
+    WithCertsKeys = maybe_add_opt(certs_keys, CertsKeys, WithKey),
+    maybe_add_opt(supported_groups, Groups, WithCertsKeys).
 
 -doc "Build SSL options from opts map. Accepts any map containing SSL-related keys.".
 -spec build_ssl_opts(map()) -> [ssl:tls_server_option()].

@@ -50,7 +50,8 @@
     error_connect_refused/1,
     ssl_pre_handshake_ops/1,
     ssl_accept_error/1,
-    ssl_connect_with_sni/1
+    ssl_connect_with_sni/1,
+    ssl_connect_supported_groups/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -95,7 +96,8 @@ groups() ->
             ssl_connect_client_certs_keys,
             ssl_pre_handshake_ops,
             ssl_accept_error,
-            ssl_connect_with_sni
+            ssl_connect_with_sni,
+            ssl_connect_supported_groups
         ]},
         {opts, [parallel], [
             build_ssl_opts_variants,
@@ -1370,3 +1372,41 @@ ssl_connect_with_sni(Config) ->
 
     nhttp_sock:close(ListenSock),
     ok.
+
+ssl_connect_supported_groups(Config) ->
+    CertFile = ?config(certfile, Config),
+    KeyFile = ?config(keyfile, Config),
+
+    {ok, ListenSock} = nhttp_sock:listen(#{
+        port => 0,
+        transport => ssl,
+        certfile => CertFile,
+        keyfile => KeyFile
+    }),
+    {ok, {_, Port}} = nhttp_sock:sockname(ListenSock),
+
+    SslOpts = nhttp_sock:build_ssl_opts(#{
+        certfile => CertFile,
+        keyfile => KeyFile
+    }),
+
+    spawn_link(fun() ->
+        {ok, PreSock} = nhttp_sock:accept(ListenSock, 5000),
+        {ok, ServerSock} = nhttp_sock:handshake(PreSock, 5000, SslOpts),
+        {error, closed} = nhttp_sock:recv(ServerSock, 0, 5000)
+    end),
+
+    {ok, {ssl, ClientSock} = Sock} = nhttp_sock:connect("127.0.0.1", Port, #{
+        transport => ssl,
+        verify => verify_none,
+        tls_versions => ['tlsv1.3'],
+        supported_groups => [secp256r1],
+        alpn_advertised_protocols => []
+    }),
+    ?assertEqual(
+        {ok, [{selected_group, secp256r1}]},
+        ssl:connection_information(ClientSock, [selected_group])
+    ),
+
+    nhttp_sock:close(Sock),
+    nhttp_sock:close(ListenSock).
