@@ -50,7 +50,8 @@
     error_connect_refused/1,
     ssl_pre_handshake_ops/1,
     ssl_accept_error/1,
-    ssl_connect_with_sni/1
+    ssl_connect_with_sni/1,
+    ssl_connect_supported_groups/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -95,7 +96,8 @@ groups() ->
             ssl_connect_client_certs_keys,
             ssl_pre_handshake_ops,
             ssl_accept_error,
-            ssl_connect_with_sni
+            ssl_connect_with_sni,
+            ssl_connect_supported_groups
         ]},
         {opts, [parallel], [
             build_ssl_opts_variants,
@@ -1370,3 +1372,44 @@ ssl_connect_with_sni(Config) ->
 
     nhttp_sock:close(ListenSock),
     ok.
+
+ssl_connect_supported_groups(Config) ->
+    CertFile = ?config(certfile, Config),
+    KeyFile = ?config(keyfile, Config),
+
+    {ok, ListenSock} = nhttp_sock:listen(#{
+        port => 0,
+        transport => ssl,
+        certfile => CertFile,
+        keyfile => KeyFile
+    }),
+    {ok, {_, Port}} = nhttp_sock:sockname(ListenSock),
+
+    SslOpts = [
+        {supported_groups, [x25519]}
+        | nhttp_sock:build_ssl_opts(#{certfile => CertFile, keyfile => KeyFile})
+    ],
+
+    Self = self(),
+    spawn_link(fun() ->
+        {ok, PreSock} = nhttp_sock:accept(ListenSock, 5000),
+        Self ! {server_handshake, nhttp_sock:handshake(PreSock, 5000, SslOpts)}
+    end),
+
+    ?assertMatch(
+        {error, {tls_error, {tls_alert, {insufficient_security, _}}}},
+        nhttp_sock:connect("127.0.0.1", Port, #{
+            transport => ssl,
+            verify => verify_none,
+            tls_versions => ['tlsv1.3'],
+            supported_groups => [secp256r1],
+            alpn_advertised_protocols => []
+        })
+    ),
+    receive
+        {server_handshake, Result} ->
+            ?assertMatch({error, {tls_alert, {insufficient_security, _}}}, Result)
+    after 5000 -> ct:fail("timeout")
+    end,
+
+    nhttp_sock:close(ListenSock).

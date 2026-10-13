@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `nhttp_sock:connect_opts()` accepts `supported_groups`. It sets the key
+  exchange groups that a TLS client offers, in order of preference. The OTP
+  29 default offers only an `x25519mlkem768` key share. A server without
+  ML-KEM then sends a HelloRetryRequest. If the server sends no
+  change_cipher_spec after it, the OTP client stops the handshake with
+  `unexpected_message`.
+
 ## [1.2.1]
 
 ### Fixed
