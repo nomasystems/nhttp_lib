@@ -176,6 +176,8 @@ a length, a type, or a token field.
 -spec structured(nhttp_fuzz_target:target(), state()) -> {binary(), state()}.
 structured(ws_frame, S0) ->
     ws_frame(S0);
+structured(ws_feed, S0) ->
+    ws_frames(S0);
 structured(h2_frame, S0) ->
     h2_frame(S0);
 structured(h3_frame, S0) ->
@@ -203,6 +205,22 @@ ws_frame(S0) ->
     {MaskKey, S9} = ws_mask_key(Mask, S8),
     Header = ws_header(Kind, Fin, Rsv, Opcode, Mask, Declared),
     {<<Header/binary, MaskKey/binary, Payload/binary>>, S9}.
+
+-doc """
+One to three frames back to back, so that one input carries a frame boundary
+and the tail of one frame reaches the decoder with the head of the next.
+""".
+-spec ws_frames(state()) -> {binary(), state()}.
+ws_frames(S0) ->
+    {Count, S1} = uniform0(3, S0),
+    ws_frames(Count + 1, S1, []).
+
+-spec ws_frames(non_neg_integer(), state(), [binary()]) -> {binary(), state()}.
+ws_frames(0, S, Acc) ->
+    {iolist_to_binary(lists:reverse(Acc)), S};
+ws_frames(N, S0, Acc) ->
+    {Frame, S1} = ws_frame(S0),
+    ws_frames(N - 1, S1, [Frame | Acc]).
 
 -spec ws_declared(short | ext16 | ext64, non_neg_integer(), state()) ->
     {non_neg_integer(), state()}.

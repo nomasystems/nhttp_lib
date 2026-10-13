@@ -2,7 +2,7 @@
 -module(nhttp_fuzz_target).
 
 -moduledoc """
-Oracles and corpus storage for the five wire-facing parsers.
+Oracles and corpus storage for the wire-facing parsers.
 
 The library is pure, so the oracle is simple. For any binary input, a parser
 returns one of the shapes that its `-spec` declares. It does not raise, and it
@@ -46,7 +46,7 @@ artefact readable in a diff.
 
 -export_type([target/0, outcome/0, finding/0]).
 
--type target() :: h1 | h2_frame | h3_frame | hpack | qpack | ws_frame.
+-type target() :: h1 | h2_frame | h3_frame | hpack | qpack | ws_frame | ws_feed.
 
 -doc """
 Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
@@ -93,7 +93,7 @@ Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
 -doc "Every target the harness drives, in the order the task file lists them.".
 -spec all() -> [target(), ...].
 all() ->
-    [h1, h2_frame, h3_frame, hpack, qpack, ws_frame].
+    [h1, h2_frame, h3_frame, hpack, qpack, ws_frame, ws_feed].
 
 -doc """
 Drive one target with `Bin` and check every return against its `-spec`.
@@ -143,6 +143,14 @@ check(ws_frame, Bin) ->
         fun() -> ws_raw(Bin, server, #{}, infinity) end,
         fun() -> ws_raw(Bin, client, Capped, Bound) end,
         fun() -> ws_raw(Bin, server, Capped, Bound) end
+    ]);
+check(ws_feed, Bin) ->
+    Capped = #{max_message_size => ?WS_CAP},
+    combine([
+        fun() -> ws_feed(Bin, client, #{}) end,
+        fun() -> ws_feed(Bin, server, #{}) end,
+        fun() -> ws_feed(Bin, client, Capped) end,
+        fun() -> ws_feed(Bin, server, Capped) end
     ]).
 
 -spec h1_opts() -> nhttp_h1:opts().
@@ -338,6 +346,43 @@ ws_raw(Bin, Role, Limits, MoreBound) ->
         Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
     end.
 
+-doc """
+Check `nhttp_ws:feed/2`, which declares `{ok, Messages, Decoder}
+| {error, Reason, Messages}`.
+
+The decoder keeps the bytes of an unfinished frame, so the check feeds the
+same input twice and the decoder of the first call reaches the second. A call
+that returns no message is `incomplete`.
+""".
+-spec ws_feed(binary(), client | server, nhttp_ws:ws_runtime_opts()) -> result().
+ws_feed(Bin, Role, Opts) ->
+    maybe
+        {continue, Dec1, First} ?= ws_feed_call(Bin, nhttp_ws:decoder_new(Role, Opts)),
+        {continue, _Dec2, Second} ?= ws_feed_call(Bin, Dec1),
+        {ok, deepest(First, Second)}
+    end.
+
+-spec ws_feed_call(binary(), nhttp_ws:ws_decoder()) ->
+    {continue, nhttp_ws:ws_decoder(), outcome()} | result().
+ws_feed_call(Bin, Dec) ->
+    try nhttp_ws:feed(Bin, Dec) of
+        {ok, Msgs, Dec1} ->
+            case is_ws_messages(Msgs) of
+                true when Msgs =:= [] -> {continue, Dec1, incomplete};
+                true -> {continue, Dec1, parsed};
+                false -> {error, {bad_value_shape, Msgs}}
+            end;
+        {error, _Reason, Msgs} ->
+            case is_ws_messages(Msgs) of
+                true -> {ok, refused};
+                false -> {error, {bad_value_shape, Msgs}}
+            end;
+        Other ->
+            {error, {undeclared_return, Other}}
+    catch
+        Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
+    end.
+
 -doc "A `{more, N}` return must ask for at least one byte, and never for more than the bound.".
 -spec check_more(term(), bound()) -> result().
 check_more(N, infinity) when is_integer(N), N >= 1 ->
@@ -426,6 +471,21 @@ is_iodata(Term) ->
     catch
         _:_ -> false
     end.
+
+-spec is_ws_messages(term()) -> boolean().
+is_ws_messages(Msgs) when is_list(Msgs) -> lists:all(fun is_ws_message/1, Msgs);
+is_ws_messages(_) -> false.
+
+-spec is_ws_message(term()) -> boolean().
+is_ws_message({text, Payload}) -> is_binary(Payload);
+is_ws_message({binary, Payload}) -> is_binary(Payload);
+is_ws_message({ping, Payload}) -> is_binary(Payload);
+is_ws_message({pong, Payload}) -> is_binary(Payload);
+is_ws_message({close, Code, Reason}) -> is_integer(Code) andalso is_binary(Reason);
+is_ws_message(ping) -> true;
+is_ws_message(pong) -> true;
+is_ws_message(close) -> true;
+is_ws_message(_) -> false.
 
 -spec is_h3_frame(term()) -> boolean().
 is_h3_frame({data, Payload}) -> is_binary(Payload);

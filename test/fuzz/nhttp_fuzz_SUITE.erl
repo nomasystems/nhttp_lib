@@ -2,7 +2,7 @@
 -module(nhttp_fuzz_SUITE).
 
 -moduledoc """
-Fuzz harness for the five wire-facing parsers.
+Fuzz harness for the wire-facing parsers.
 
 The `oracle`, `corpus`, `mutation` and `structured` groups run in CI. They use
 a fixed seed, so a failure reproduces from the seed that the report prints.
@@ -54,7 +54,8 @@ groups() ->
             corpus_h3_frame,
             corpus_hpack,
             corpus_qpack,
-            corpus_ws_frame
+            corpus_ws_frame,
+            corpus_ws_feed
         ]},
         {mutation, [parallel], [
             mutate_h1,
@@ -62,7 +63,8 @@ groups() ->
             mutate_h3_frame,
             mutate_hpack,
             mutate_qpack,
-            mutate_ws_frame
+            mutate_ws_frame,
+            mutate_ws_feed
         ]},
         {structured, [parallel], [
             structured_h1,
@@ -70,7 +72,8 @@ groups() ->
             structured_h3_frame,
             structured_hpack,
             structured_qpack,
-            structured_ws_frame
+            structured_ws_frame,
+            structured_ws_feed
         ]},
         {campaign, [], [campaign]}
     ].
@@ -164,6 +167,7 @@ corpus_h3_frame(_Config) -> replay(h3_frame).
 corpus_hpack(_Config) -> replay(hpack).
 corpus_qpack(_Config) -> replay(qpack).
 corpus_ws_frame(_Config) -> replay(ws_frame).
+corpus_ws_feed(_Config) -> replay(ws_feed).
 
 %%%-----------------------------------------------------------------------------
 %%% SEEDED MUTATION
@@ -174,6 +178,7 @@ mutate_h3_frame(_Config) -> mutation_run(h3_frame).
 mutate_hpack(_Config) -> mutation_run(hpack).
 mutate_qpack(_Config) -> mutation_run(qpack).
 mutate_ws_frame(_Config) -> mutation_run(ws_frame).
+mutate_ws_feed(_Config) -> mutation_run(ws_feed).
 
 %%%-----------------------------------------------------------------------------
 %%% SEEDED STRUCTURE AWARE GENERATION
@@ -184,6 +189,7 @@ structured_h3_frame(_Config) -> structured_run(h3_frame).
 structured_hpack(_Config) -> structured_run(hpack).
 structured_qpack(_Config) -> structured_run(qpack).
 structured_ws_frame(_Config) -> structured_run(ws_frame).
+structured_ws_feed(_Config) -> structured_run(ws_feed).
 
 %%%-----------------------------------------------------------------------------
 %%% CAMPAIGN
@@ -272,7 +278,8 @@ declared_outcomes(h1) -> [parsed, incomplete, refused];
 declared_outcomes(h2_frame) -> [parsed, incomplete, refused];
 declared_outcomes(h3_frame) -> [parsed, incomplete, refused];
 declared_outcomes(qpack) -> [parsed, incomplete, refused];
-declared_outcomes(ws_frame) -> [parsed, incomplete, refused].
+declared_outcomes(ws_frame) -> [parsed, incomplete, refused];
+declared_outcomes(ws_feed) -> [parsed, incomplete, refused].
 
 -spec seeds(nhttp_fuzz_target:target()) -> [binary()].
 seeds(Target) ->

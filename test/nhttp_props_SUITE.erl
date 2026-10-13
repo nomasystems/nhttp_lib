@@ -164,7 +164,9 @@ groups() ->
             ws_new_message_mid_fragmentation_rejected,
             ws_max_message_size_cumulative,
             ws_frame_cap_bounds_more,
-            ws_incremental_utf8_matches_whole
+            ws_incremental_utf8_matches_whole,
+            ws_feed_matches_whole_buffer,
+            ws_feed_refuses_invalid_utf8_on_the_carrying_call
         ]},
         {cookie_props, [parallel], [
             cookie_roundtrip,
@@ -566,6 +568,12 @@ ws_frame_cap_bounds_more(Config) ->
 
 ws_incremental_utf8_matches_whole(Config) ->
     run_property(nhttp_ws_props, prop_ws_incremental_utf8_matches_whole, Config).
+
+ws_feed_matches_whole_buffer(Config) ->
+    run_property(nhttp_ws_props, prop_ws_feed_matches_whole_buffer, Config).
+
+ws_feed_refuses_invalid_utf8_on_the_carrying_call(Config) ->
+    run_property(nhttp_ws_props, prop_ws_feed_refuses_invalid_utf8_on_the_carrying_call, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% COOKIE PROPERTY TESTS
