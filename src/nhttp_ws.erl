@@ -442,6 +442,7 @@ decode_unmasked(Data) ->
 %%%-----------------------------------------------------------------------------
 %% STATEFUL DECODING (FRAGMENTATION SUPPORT, RFC 6455 SECTION 5.4)
 %%%-----------------------------------------------------------------------------
+-doc #{deprecated => "Use feed/2 instead"}.
 -doc """
 Decode one frame, reassembling fragments (RFC 6455 §5.4). Control frames
 between fragments are returned at once.
@@ -479,8 +480,9 @@ decoder_new(Role) ->
 Create a new stateful decoder honouring `max_message_size` from the runtime
 opts. The option defaults to 16 MiB and bounds two different things.
 The cumulative payload of a fragmented message, and the payload of a single
-non-control frame, are measured after the bytes arrive. Exceeding the option
-returns `{error, message_too_large}`.
+non-control frame, are measured after the bytes arrive. `feed/2` measures the
+cumulative payload at the header of each continuation frame. Exceeding the
+option returns `{error, message_too_large}`.
 The payload length that a frame header declares is refused before any payload
 is buffered (RFC 6455 §10.4). Exceeding the option returns
 `{error, {frame_too_large, DeclaredLength}}`, and the caller closes with
@@ -691,6 +693,20 @@ check_message_size(Size, #ws_decoder{max_message_size = Max}) when Size =< Max -
     ok;
 check_message_size(_Size, _Dec) ->
     {error, message_too_large}.
+
+-doc """
+Refuse a continuation frame whose declared length takes the message over
+`max_message_size`, before its payload arrives. `process_fragment/5` applies
+the same test to the same sizes.
+""".
+-spec check_continuation_size(0..15, non_neg_integer(), ws_decoder()) ->
+    ok | {error, message_too_large}.
+check_continuation_size(
+    ?OP_CONTINUATION, Len, #ws_decoder{frag_opcode = FragOp, frag_acc_size = AccSize} = Dec
+) when FragOp =/= undefined ->
+    check_message_size(AccSize + Len, Dec);
+check_continuation_size(_Opcode, _Len, _Dec) ->
+    ok.
 
 -spec feed(binary(), ws_decoder(), [ws_message()]) -> feed_result().
 feed(<<>>, Dec, Acc) ->
@@ -935,8 +951,11 @@ scans_as_text(_Opcode, _Dec) -> false.
 
 -spec start_frame(#ws_partial{}, binary(), ws_decoder(), [ws_message()]) -> feed_result().
 start_frame(#ws_partial{fin = Fin, opcode = Opcode, len = Len} = Partial, Rest, Dec, Acc) ->
-    case nhttp_ws_frame:validate_control_header(Fin, Opcode, Len) of
-        ok -> fill_frame(Rest, Partial, Dec, Acc);
+    maybe
+        ok ?= nhttp_ws_frame:validate_control_header(Fin, Opcode, Len),
+        ok ?= check_continuation_size(Opcode, Len, Dec),
+        fill_frame(Rest, Partial, Dec, Acc)
+    else
         {error, Reason} -> refuse(Reason, Acc)
     end.
 

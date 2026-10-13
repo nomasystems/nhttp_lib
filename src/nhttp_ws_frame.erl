@@ -111,7 +111,11 @@ code and reason.
 -type frame_too_large() :: {frame_too_large, DeclaredLength :: pos_integer()}.
 
 -type header_error() ::
-    reserved_bits_set | unmasked_client_frame | masked_server_frame | frame_too_large().
+    reserved_bits_set
+    | unmasked_client_frame
+    | masked_server_frame
+    | decode_failed
+    | frame_too_large().
 
 -type header_size() :: 2 | 4 | 6 | 8 | 10 | 14.
 
@@ -192,7 +196,8 @@ bytes. The role selects masked (server) or unmasked (client) frames, as in
 A declared payload length above `max_frame_size` returns
 `{error, {frame_too_large, DeclaredLength}}` as soon as the length bytes are
 present (RFC 6455 §10.4). That test comes first, then the reserved bits, then
-the mask bit, which is the order of `decode_raw/3`.
+the mask bit, then the most significant bit of a 64 bit length, which must be 0
+(§5.2) and gives `{error, decode_failed}`. This is the order of `decode_raw/3`.
 """.
 -spec decode_header(binary(), client | server, frame_limits()) ->
     {ok, Fin :: 0 | 1, Opcode :: 0..15, HeaderSize :: header_size(), Len :: non_neg_integer(),
@@ -552,9 +557,10 @@ decode_message_unmasked(_, _Cap) ->
 
 -doc """
 The complete frame clauses come first and cost one call. Any other input goes
-to `parse_header/3`, which applies the length cap, the reserved bits and the
-mask bit in that order. A complete frame passes all three tests, so the order
-of the refusals does not depend on which clause sees the input.
+to `parse_header/3`, which applies the length cap, the reserved bits, the mask
+bit and the top bit of a 64 bit length in that order. A complete frame passes
+all four tests, so the order of the refusals does not depend on which clause
+sees the input.
 """.
 -spec decode_raw_masked(binary(), frame_cap()) -> raw_decode_result().
 decode_raw_masked(
@@ -644,6 +650,8 @@ parse_header(<<_:8, 1:1, _:7, _/binary>>, client, _Cap) ->
     {error, masked_server_frame};
 parse_header(Data, _Role, _Cap) when byte_size(Data) < 2 ->
     {more, 2};
+parse_header(<<_:9, 127:7, 1:1, _/bitstring>>, _Role, _Cap) ->
+    {error, decode_failed};
 parse_header(<<Fin:1, 0:3, Opcode:4, _Mask:1, Len:7, Rest/binary>>, Role, _Cap) when Len < 126 ->
     with_key(Fin, Opcode, 2, Len, Rest, Role);
 parse_header(<<Fin:1, 0:3, Opcode:4, _Mask:1, 126:7, Len:16, Rest/binary>>, Role, _Cap) ->

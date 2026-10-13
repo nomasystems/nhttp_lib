@@ -97,6 +97,7 @@ decoding, and stateful fragmentation for both server and client roles.
     frag_single_frame_too_large/1,
     frag_max_message_size_infinity/1,
     frag_frame_cap_refuses_before_buffering/1,
+    frag_length_top_bit_refused/1,
     frag_frame_cap_infinity_buffers/1,
     frag_default_max_message_size_is_finite/1,
     partial_autobahn_6_4_3/1,
@@ -126,7 +127,7 @@ decoding, and stateful fragmentation for both server and client roles.
     feed_chunk_spans_two_frames/1,
     feed_many_frames_in_one_chunk/1,
     feed_frame_too_large_at_header/1,
-    feed_message_too_large_at_byte_count/1,
+    feed_message_too_large_at_continuation_header/1,
     feed_single_frame_too_large_at_byte_count/1,
     feed_control_frame_too_large_at_header/1,
     feed_fragmented_control_frame_at_header/1,
@@ -139,6 +140,7 @@ decoding, and stateful fragmentation for both server and client roles.
     feed_masked_frame_refused_by_client/1,
     feed_unmasked_frame_refused_by_server/1,
     feed_reserved_bits_refused/1,
+    feed_length_top_bit_refused/1,
     feed_expected_continuation/1,
     feed_close_frame_validated/1,
     feed_16mib_binary_in_16kib_chunks/1,
@@ -252,6 +254,7 @@ groups() ->
             frag_single_frame_too_large,
             frag_max_message_size_infinity,
             frag_frame_cap_refuses_before_buffering,
+            frag_length_top_bit_refused,
             frag_frame_cap_infinity_buffers,
             frag_default_max_message_size_is_finite
         ]},
@@ -287,7 +290,7 @@ groups() ->
             feed_chunk_spans_two_frames,
             feed_many_frames_in_one_chunk,
             feed_frame_too_large_at_header,
-            feed_message_too_large_at_byte_count,
+            feed_message_too_large_at_continuation_header,
             feed_single_frame_too_large_at_byte_count,
             feed_control_frame_too_large_at_header,
             feed_fragmented_control_frame_at_header,
@@ -300,6 +303,7 @@ groups() ->
             feed_masked_frame_refused_by_client,
             feed_unmasked_frame_refused_by_server,
             feed_reserved_bits_refused,
+            feed_length_top_bit_refused,
             feed_expected_continuation,
             feed_close_frame_validated
         ]},
@@ -827,6 +831,14 @@ frag_frame_cap_refuses_before_buffering(_Config) ->
         nhttp_ws:decode_with_state(Header, Dec0)
     ).
 
+frag_length_top_bit_refused(_Config) ->
+    Frame = <<16#82, 127, 1:1, 5:63, "hello">>,
+    Dec0 = nhttp_ws:decoder_new(client),
+    ?assertEqual({error, decode_failed}, nhttp_ws:decode_with_state(Frame, Dec0)),
+    ?assertEqual(
+        {error, decode_failed}, nhttp_ws:decode_with_state(binary:part(Frame, 0, 3), Dec0)
+    ).
+
 frag_frame_cap_infinity_buffers(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => infinity}),
     Header = <<16#82, 127, 0:1, (1 bsl 40):63>>,
@@ -1105,8 +1117,7 @@ partial_control_frame_not_scanned(_Config) ->
 
 -define(MIB16, 16777216).
 -define(KIB16, 16384).
--define(BINARY_BOUND_MS, 300).
--define(TEXT_BOUND_MS, 500).
+-define(MAX_CHUNKED_RATIO, 4).
 -define(TIMING_RUNS, 3).
 
 feed_empty_input(_Config) ->
@@ -1196,12 +1207,10 @@ feed_frame_too_large_at_header(_Config) ->
     {ok, [], Server1} = nhttp_ws:feed(<<16#82, 16#FE>>, Server),
     ?assertEqual({error, {frame_too_large, 2000}, []}, nhttp_ws:feed(<<2000:16>>, Server1)).
 
-feed_message_too_large_at_byte_count(_Config) ->
+feed_message_too_large_at_continuation_header(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => 1000}),
-    {ok, [], Dec1} = nhttp_ws:feed(client_frame(0, 2, payload(600)), Dec0),
-    {Head, Last} = split_binary(client_frame(1, 0, payload(600)), 603),
-    {ok, [], Dec2} = nhttp_ws:feed(Head, Dec1),
-    ?assertEqual({error, message_too_large, []}, nhttp_ws:feed(Last, Dec2)).
+    {ok, [], Dec1} = nhttp_ws:feed(client_frame(0, 2, payload(900)), Dec0),
+    ?assertEqual({error, message_too_large, []}, nhttp_ws:feed(<<16#80, 126, 900:16>>, Dec1)).
 
 feed_single_frame_too_large_at_byte_count(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => 50}),
@@ -1284,6 +1293,22 @@ feed_reserved_bits_refused(_Config) ->
         nhttp_ws:feed(<<16#C1, 0>>, nhttp_ws:decoder_new(client))
     ).
 
+feed_length_top_bit_refused(_Config) ->
+    Client = <<16#82, 127, 1:1, 5:63, "hello">>,
+    Server = <<16#82, 16#FF, 1:1, 5:63, 1, 2, 3, 4, "hello">>,
+    [
+        ?assertEqual(
+            {error, decode_failed, [{text, <<"hi">>}]},
+            nhttp_ws:feed(<<Hi/binary, Wire/binary>>, nhttp_ws:decoder_new(Role))
+        )
+     || {Role, Hi, Wire} <- [
+            {client, client_frame(1, 1, <<"hi">>), Client},
+            {server, server_frame(1, 1, <<"hi">>, <<1, 2, 3, 4>>), Server}
+        ]
+    ],
+    {ok, [], Dec1} = nhttp_ws:feed(<<16#82, 127>>, nhttp_ws:decoder_new(client)),
+    ?assertEqual({error, decode_failed, []}, nhttp_ws:feed(<<16#80>>, Dec1)).
+
 feed_expected_continuation(_Config) ->
     ?assertEqual(
         {error, expected_continuation, []},
@@ -1303,13 +1328,13 @@ feed_close_frame_validated(_Config) ->
 
 feed_16mib_binary_in_16kib_chunks(_Config) ->
     Payload = binary:copy(<<"0123456789abcdef">>, ?MIB16 div 16),
-    assert_feed_time({binary, Payload}, ?BINARY_BOUND_MS).
+    assert_feed_time({binary, Payload}).
 
 feed_16mib_text_in_16kib_chunks(_Config) ->
     Unit = <<"aé€😀"/utf8>>,
     Pad = binary:copy(<<"x">>, ?MIB16 rem byte_size(Unit)),
     Payload = <<(binary:copy(Unit, ?MIB16 div byte_size(Unit)))/binary, Pad/binary>>,
-    assert_feed_time({text, Payload}, ?TEXT_BOUND_MS).
+    assert_feed_time({text, Payload}).
 
 %%%-----------------------------------------------------------------------------
 %%% FEED HELPERS
@@ -1371,16 +1396,18 @@ fixed_chunks(Bin, Size) ->
     [Head | fixed_chunks(Rest, Size)].
 
 -doc """
-The best of a few runs, so that a scheduler hiccup on a shared runner does not
-fail the case. The single read time is printed next to it for the record.
+The chunked feed against one read of the same frame, each the best of a few
+runs. Both unmask and scan every byte once, so the ratio stays near 1 on any
+runner. A decoder that rescans its buffer on each read gives a ratio in the
+hundreds for 1024 chunks.
 """.
--spec assert_feed_time(nhttp_ws:ws_message(), pos_integer()) -> ok.
-assert_feed_time(Msg, BoundMs) ->
+-spec assert_feed_time(nhttp_ws:ws_message()) -> ok.
+assert_feed_time(Msg) ->
     Wire = iolist_to_binary(nhttp_ws:encode_masked(Msg)),
     Chunked = lists:min([time_feed(fixed_chunks(Wire, ?KIB16), Msg) || _ <- runs()]),
     Single = lists:min([time_feed([Wire], Msg) || _ <- runs()]),
     ct:pal("~p chunks ~p us, one read ~p us", [element(1, Msg), Chunked, Single]),
-    ?assert(Chunked < BoundMs * 1000, {Chunked, us, BoundMs, ms}).
+    ?assert(Chunked < ?MAX_CHUNKED_RATIO * Single, {Chunked, Single, ?MAX_CHUNKED_RATIO}).
 
 -spec runs() -> [pos_integer()].
 runs() ->

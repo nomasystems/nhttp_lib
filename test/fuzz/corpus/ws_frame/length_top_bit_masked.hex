@@ -1,0 +1,2 @@
+# A complete masked frame whose 64 bit length has the top bit set (RFC 6455 5.2).
+82ff80000000000000050102030469676f686e
