@@ -35,7 +35,9 @@ groups() ->
             decode_raw_more,
             decode_raw_invalid_mask,
             decode_raw_reserved_bits_masked,
-            decode_raw_reserved_bits_unmasked
+            decode_raw_reserved_bits_unmasked,
+            decode_raw_length_top_bit,
+            decode_header_length_top_bit
         ]},
         {frame_cap, [parallel], [
             cap_refuses_declared_64bit,
@@ -67,7 +69,8 @@ groups() ->
             partial_payload_64bit_length,
             partial_payload_short_header,
             partial_payload_no_new_bytes,
-            partial_payload_stops_at_declared_length
+            partial_payload_stops_at_declared_length,
+            partial_payload_length_top_bit
         ]}
     ].
 
@@ -128,6 +131,25 @@ decode_raw_reserved_bits_masked(_Config) ->
 decode_raw_reserved_bits_unmasked(_Config) ->
     Frame = <<1:1, 4:3, 1:4, 0:1, 0:7>>,
     ?assertEqual({error, reserved_bits_set}, nhttp_ws_frame:decode_raw(Frame, client)).
+
+decode_raw_length_top_bit(_Config) ->
+    Client = <<16#82, 127, 1:1, 5:63, "hello">>,
+    Server = <<16#82, 16#FF, 1:1, 5:63, 1, 2, 3, 4, "hello">>,
+    Capped = #{max_frame_size => 1000},
+    [
+        ?assertEqual({error, decode_failed}, nhttp_ws_frame:decode_raw(Frame, Role, Limits))
+     || {Role, Wire} <- [{client, Client}, {server, Server}],
+        Frame <- [binary:part(Wire, 0, 3), Wire, <<Wire/binary, "trailing">>],
+        Limits <- [#{}, Capped]
+    ].
+
+decode_header_length_top_bit(_Config) ->
+    ?assertEqual(
+        {error, decode_failed}, nhttp_ws_frame:decode_header(<<16#82, 127, 16#80>>, client, #{})
+    ),
+    ?assertEqual(
+        {error, decode_failed}, nhttp_ws_frame:decode_header(<<16#82, 16#FF, 16#80>>, server, #{})
+    ).
 
 %%%-----------------------------------------------------------------------------
 %%% FRAME LENGTH CAP TESTS (RFC 6455 Section 10.4)
@@ -304,3 +326,7 @@ partial_payload_no_new_bytes(_Config) ->
 partial_payload_stops_at_declared_length(_Config) ->
     Frame = <<16#81, 2, "ab", 16#88, 0>>,
     ?assertEqual({ok, 1, <<"ab">>}, nhttp_ws_frame:partial_payload(Frame, client, 0)).
+
+partial_payload_length_top_bit(_Config) ->
+    Frame = <<16#82, 127, 1:1, 70000:63, "xy">>,
+    ?assertEqual(none, nhttp_ws_frame:partial_payload(Frame, client, 0)).

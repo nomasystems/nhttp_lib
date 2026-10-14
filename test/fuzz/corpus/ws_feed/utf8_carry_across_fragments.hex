@@ -1,0 +1,2 @@
+# U+00E9 split across two fragments. The UTF-8 carry crosses the frame boundary.
+0101c38001a9

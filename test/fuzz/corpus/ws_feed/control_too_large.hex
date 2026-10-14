@@ -1,0 +1,2 @@
+# A ping that declares 126 octets, refused at the header (RFC 6455 5.5).
+897e007e

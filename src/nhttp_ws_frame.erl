@@ -28,7 +28,16 @@ length legal for every control frame and §5.5.1 uses it for the close
 code and reason.
 """.
 
--compile({inline, [{decode_complete, 6}, {decode_unmasked_complete, 5}, {effective_cap, 1}]}).
+-compile(
+    {inline, [
+        {decode_complete, 6},
+        {decode_unmasked_complete, 5},
+        {effective_cap, 1},
+        {incomplete, 2},
+        {validate_control_header, 3},
+        {with_key, 6}
+    ]}
+).
 
 %%%-----------------------------------------------------------------------------
 %% EXPORTS
@@ -36,6 +45,7 @@ code and reason.
 -export([
     decode/1,
     decode/2,
+    decode_header/3,
     decode_raw/2,
     decode_raw/3,
     decode_unmasked/1,
@@ -48,7 +58,9 @@ code and reason.
     partial_payload/3,
     scan_utf8/1,
     scan_utf8/2,
-    validate_control_frame/3
+    unmask_from/3,
+    validate_control_frame/3,
+    validate_control_header/3
 ]).
 
 -export_type([
@@ -57,6 +69,7 @@ code and reason.
     encode_opts/0,
     frame_limits/0,
     frame_too_large/0,
+    header_error/0,
     raw_decode_result/0,
     ws_message/0,
     ws_opcode/0
@@ -96,6 +109,22 @@ code and reason.
 -type frame_cap() :: pos_integer() | infinity.
 
 -type frame_too_large() :: {frame_too_large, DeclaredLength :: pos_integer()}.
+
+-type header_error() ::
+    reserved_bits_set
+    | unmasked_client_frame
+    | masked_server_frame
+    | decode_failed
+    | frame_too_large().
+
+-type header_size() :: 2 | 4 | 6 | 8 | 10 | 14.
+
+-type parsed_header() ::
+    {ok, Fin :: 0 | 1, Opcode :: 0..15, header_size(), Len :: non_neg_integer(),
+        MaskKey :: binary()}
+    | {key, header_size(), Len :: non_neg_integer()}
+    | {more, pos_integer()}
+    | {error, header_error()}.
 
 %%%-----------------------------------------------------------------------------
 %% MACROS
@@ -153,6 +182,33 @@ buffered (RFC 6455 §10.4).
 -spec decode(binary(), frame_limits()) -> decode_result().
 decode(Data, Limits) ->
     decode_message_masked(Data, effective_cap(Limits)).
+
+-doc """
+Parse the header of the frame at the start of `Data`.
+
+Returns `{ok, Fin, Opcode, HeaderSize, Len, MaskKey}` when the whole header,
+mask key included, is present. The payload starts at byte `HeaderSize` of
+`Data` and is `Len` bytes long. `MaskKey` is four bytes for the server role and
+`<<>>` for the client role. `{more, N}` means that the header needs `N` more
+bytes. The role selects masked (server) or unmasked (client) frames, as in
+`decode_raw/3`.
+
+A declared payload length above `max_frame_size` returns
+`{error, {frame_too_large, DeclaredLength}}` as soon as the length bytes are
+present (RFC 6455 §10.4). That test comes first, then the reserved bits, then
+the mask bit, then the most significant bit of a 64 bit length, which must be 0
+(§5.2) and gives `{error, decode_failed}`. This is the order of `decode_raw/3`.
+""".
+-spec decode_header(binary(), client | server, frame_limits()) ->
+    {ok, Fin :: 0 | 1, Opcode :: 0..15, HeaderSize :: header_size(), Len :: non_neg_integer(),
+        MaskKey :: binary()}
+    | {more, pos_integer()}
+    | {error, header_error()}.
+decode_header(Data, Role, Limits) ->
+    case parse_header(Data, Role, effective_cap(Limits)) of
+        {key, HeaderSize, _Len} -> {more, HeaderSize - byte_size(Data)};
+        Parsed -> Parsed
+    end.
 
 -doc """
 Decode a raw frame with no cap on the declared payload length.
@@ -266,11 +322,15 @@ arrived after `Scanned`.
 -spec partial_payload(binary(), client | server, non_neg_integer()) ->
     {ok, Opcode :: 0..15, New :: binary()} | none.
 partial_payload(Data, Role, Scanned) ->
-    case frame_header(Data, Role) of
-        {ok, Opcode, HeaderSize, Len, MaskKey} ->
+    case parse_header(Data, Role, infinity) of
+        {ok, _Fin, Opcode, HeaderSize, Len, MaskKey} ->
             Avail = min(byte_size(Data) - HeaderSize, Len),
             partial_slice(Opcode, Data, HeaderSize, MaskKey, Scanned, Avail);
-        none ->
+        {key, _HeaderSize, _Len} ->
+            none;
+        {more, _} ->
+            none;
+        {error, _} ->
             none
     end.
 
@@ -320,13 +380,22 @@ Validate that a control frame is not fragmented and not too large
 """.
 -spec validate_control_frame(0 | 1, 0..15, binary()) ->
     ok | {error, control_frame_too_large | fragmented_control_frame}.
-validate_control_frame(_Fin, Opcode, _Data) when Opcode < 8 ->
+validate_control_frame(Fin, Opcode, Data) ->
+    validate_control_header(Fin, Opcode, byte_size(Data)).
+
+-doc """
+Apply the control frame rules of `validate_control_frame/3` to the header
+fields alone, so that a decoder refuses the frame before its payload arrives.
+""".
+-spec validate_control_header(0 | 1, 0..15, non_neg_integer()) ->
+    ok | {error, control_frame_too_large | fragmented_control_frame}.
+validate_control_header(_Fin, Opcode, _Len) when Opcode < 8 ->
     ok;
-validate_control_frame(_Fin, _Opcode, Data) when byte_size(Data) > 125 ->
+validate_control_header(_Fin, _Opcode, Len) when Len > ?MAX_CONTROL_PAYLOAD ->
     {error, control_frame_too_large};
-validate_control_frame(0, _Opcode, _Data) ->
+validate_control_header(0, _Opcode, _Len) ->
     {error, fragmented_control_frame};
-validate_control_frame(_, _, _) ->
+validate_control_header(1, _Opcode, _Len) ->
     ok.
 
 %%%-----------------------------------------------------------------------------
@@ -486,104 +555,61 @@ decode_message_unmasked(<<_:8, 0:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
 decode_message_unmasked(_, _Cap) ->
     {error, invalid_frame}.
 
+-doc """
+The complete frame clauses come first and cost one call. Any other input goes
+to `parse_header/3`, which applies the length cap, the reserved bits, the mask
+bit and the top bit of a 64 bit length in that order. A complete frame passes
+all four tests, so the order of the refusals does not depend on which clause
+sees the input.
+""".
 -spec decode_raw_masked(binary(), frame_cap()) -> raw_decode_result().
-decode_raw_masked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
-    {error, {frame_too_large, Len}};
-decode_raw_masked(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
-    {error, {frame_too_large, Len}};
-decode_raw_masked(<<_Fin:1, Rsv:3, _Opcode:4, _/binary>>, _Cap) when Rsv =/= 0 ->
-    {error, reserved_bits_set};
 decode_raw_masked(
     <<Fin:1, 0:3, Opcode:4, 1:1, Len:7, MaskKey:4/binary, Data:Len/binary, Rest/binary>>, _Cap
 ) when Len < 126 ->
     {ok, Fin, Opcode, unmask(MaskKey, Data), Rest};
 decode_raw_masked(
     <<Fin:1, 0:3, Opcode:4, 1:1, 126:7, Len:16, MaskKey:4/binary, Data:Len/binary, Rest/binary>>,
-    _Cap
-) ->
+    Cap
+) when Len =< Cap ->
     {ok, Fin, Opcode, unmask(MaskKey, Data), Rest};
 decode_raw_masked(
     <<Fin:1, 0:3, Opcode:4, 1:1, 127:7, 0:1, Len:63, MaskKey:4/binary, Data:Len/binary,
         Rest/binary>>,
-    _Cap
-) ->
+    Cap
+) when Len =< Cap ->
     {ok, Fin, Opcode, unmask(MaskKey, Data), Rest};
-decode_raw_masked(<<_:8, 0:1, _:7, _/binary>>, _Cap) ->
-    {error, unmasked_client_frame};
-decode_raw_masked(Binary, _Cap) when byte_size(Binary) < 2 ->
-    {more, 2};
-decode_raw_masked(<<_:8, 1:1, Len:7, Rest/binary>>, _Cap) when Len < 126 ->
-    Needed = 4 + Len - byte_size(Rest),
-    case Needed > 0 of
-        true -> {more, Needed};
-        false -> {error, decode_failed}
-    end;
-decode_raw_masked(<<_:8, 1:1, 126:7, Rest/binary>>, _Cap) when byte_size(Rest) < 2 ->
-    {more, 2 - byte_size(Rest)};
-decode_raw_masked(<<_:8, 1:1, 126:7, Len:16, Rest/binary>>, _Cap) ->
-    Needed = 4 + Len - byte_size(Rest),
-    case Needed > 0 of
-        true -> {more, Needed};
-        false -> {error, decode_failed}
-    end;
-decode_raw_masked(<<_:8, 1:1, 127:7, Rest/binary>>, _Cap) when byte_size(Rest) < 8 ->
-    {more, 8 - byte_size(Rest)};
-decode_raw_masked(<<_:8, 1:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
-    Needed = 4 + Len - byte_size(Rest),
-    case Needed > 0 of
-        true -> {more, Needed};
-        false -> {error, decode_failed}
-    end;
-decode_raw_masked(_, _Cap) ->
-    {error, invalid_frame}.
+decode_raw_masked(Data, Cap) ->
+    incomplete(Data, parse_header(Data, server, Cap)).
 
 -spec decode_raw_unmasked(binary(), frame_cap()) -> raw_decode_result().
-decode_raw_unmasked(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, Cap) when Len > Cap ->
-    {error, {frame_too_large, Len}};
-decode_raw_unmasked(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, Cap) when Len > Cap ->
-    {error, {frame_too_large, Len}};
-decode_raw_unmasked(<<_:1, Rsv:3, _:4, _/binary>>, _Cap) when Rsv =/= 0 ->
-    {error, reserved_bits_set};
 decode_raw_unmasked(<<Fin:1, 0:3, Opcode:4, 0:1, Len:7, Data:Len/binary, Rest/binary>>, _Cap) when
     Len < 126
 ->
     {ok, Fin, Opcode, Data, Rest};
 decode_raw_unmasked(
-    <<Fin:1, 0:3, Opcode:4, 0:1, 126:7, Len:16, Data:Len/binary, Rest/binary>>, _Cap
-) ->
+    <<Fin:1, 0:3, Opcode:4, 0:1, 126:7, Len:16, Data:Len/binary, Rest/binary>>, Cap
+) when Len =< Cap ->
     {ok, Fin, Opcode, Data, Rest};
 decode_raw_unmasked(
-    <<Fin:1, 0:3, Opcode:4, 0:1, 127:7, 0:1, Len:63, Data:Len/binary, Rest/binary>>, _Cap
-) ->
+    <<Fin:1, 0:3, Opcode:4, 0:1, 127:7, 0:1, Len:63, Data:Len/binary, Rest/binary>>, Cap
+) when Len =< Cap ->
     {ok, Fin, Opcode, Data, Rest};
-decode_raw_unmasked(<<_:8, 1:1, _:7, _/binary>>, _Cap) ->
-    {error, masked_server_frame};
-decode_raw_unmasked(Binary, _Cap) when byte_size(Binary) < 2 ->
-    {more, 2};
-decode_raw_unmasked(<<_:8, 0:1, Len:7, Rest/binary>>, _Cap) when Len < 126 ->
-    Needed = Len - byte_size(Rest),
-    case Needed > 0 of
-        true -> {more, Needed};
-        false -> {error, decode_failed}
-    end;
-decode_raw_unmasked(<<_:8, 0:1, 126:7, Rest/binary>>, _Cap) when byte_size(Rest) < 2 ->
-    {more, 2 - byte_size(Rest)};
-decode_raw_unmasked(<<_:8, 0:1, 126:7, Len:16, Rest/binary>>, _Cap) ->
-    Needed = Len - byte_size(Rest),
-    case Needed > 0 of
-        true -> {more, Needed};
-        false -> {error, decode_failed}
-    end;
-decode_raw_unmasked(<<_:8, 0:1, 127:7, Rest/binary>>, _Cap) when byte_size(Rest) < 8 ->
-    {more, 8 - byte_size(Rest)};
-decode_raw_unmasked(<<_:8, 0:1, 127:7, _:1, Len:63, Rest/binary>>, _Cap) ->
-    Needed = Len - byte_size(Rest),
-    case Needed > 0 of
-        true -> {more, Needed};
-        false -> {error, decode_failed}
-    end;
-decode_raw_unmasked(_, _Cap) ->
-    {error, invalid_frame}.
+decode_raw_unmasked(Data, Cap) ->
+    incomplete(Data, parse_header(Data, client, Cap)).
+
+-doc """
+Map the header of a frame that is not complete to the `decode_raw/3` result.
+A known length gives the bytes missing to the end of the frame.
+""".
+-spec incomplete(binary(), parsed_header()) -> raw_decode_result().
+incomplete(Data, {ok, _Fin, _Opcode, HeaderSize, Len, _MaskKey}) ->
+    {more, HeaderSize + Len - byte_size(Data)};
+incomplete(Data, {key, HeaderSize, Len}) ->
+    {more, HeaderSize + Len - byte_size(Data)};
+incomplete(_Data, {more, _} = More) ->
+    More;
+incomplete(_Data, {error, _} = Err) ->
+    Err.
 
 -spec decode_unmasked_complete(0 | 1, 0..7, 0..15, binary(), binary()) -> decode_result().
 decode_unmasked_complete(_Fin, Rsv, _Opcode, _Data, _Rest) when Rsv =/= 0 ->
@@ -606,24 +632,45 @@ effective_cap(Limits) ->
         Cap -> max(Cap, ?MAX_CONTROL_PAYLOAD)
     end.
 
--spec frame_header(binary(), client | server) ->
-    {ok, Opcode :: 0..15, HeaderSize :: pos_integer(), Len :: non_neg_integer(),
-        MaskKey :: binary()}
-    | none.
-frame_header(<<_:1, 0:3, Op:4, 1:1, 127:7, 0:1, Len:63, Key:4/binary, _/binary>>, server) ->
-    {ok, Op, 14, Len, Key};
-frame_header(<<_:1, 0:3, Op:4, 1:1, 126:7, Len:16, Key:4/binary, _/binary>>, server) ->
-    {ok, Op, 8, Len, Key};
-frame_header(<<_:1, 0:3, Op:4, 1:1, Len:7, Key:4/binary, _/binary>>, server) when Len < 126 ->
-    {ok, Op, 6, Len, Key};
-frame_header(<<_:1, 0:3, Op:4, 0:1, 127:7, 0:1, Len:63, _/binary>>, client) ->
-    {ok, Op, 10, Len, <<>>};
-frame_header(<<_:1, 0:3, Op:4, 0:1, 126:7, Len:16, _/binary>>, client) ->
-    {ok, Op, 4, Len, <<>>};
-frame_header(<<_:1, 0:3, Op:4, 0:1, Len:7, _/binary>>, client) when Len < 126 ->
-    {ok, Op, 2, Len, <<>>};
-frame_header(_Data, _Role) ->
-    none.
+-doc """
+The one header parser of the module. `{key, HeaderSize, Len}` means that the
+length is known and the mask key is not complete yet, which `decode_raw/3`
+reports as the bytes missing to the end of the frame.
+""".
+-spec parse_header(binary(), client | server, frame_cap()) -> parsed_header().
+parse_header(<<_:8, _Mask:1, 126:7, Len:16, _/binary>>, _Role, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+parse_header(<<_:8, _Mask:1, 127:7, _:1, Len:63, _/binary>>, _Role, Cap) when Len > Cap ->
+    {error, {frame_too_large, Len}};
+parse_header(<<_Fin:1, Rsv:3, _Opcode:4, _/binary>>, _Role, _Cap) when Rsv =/= 0 ->
+    {error, reserved_bits_set};
+parse_header(<<_:8, 0:1, _:7, _/binary>>, server, _Cap) ->
+    {error, unmasked_client_frame};
+parse_header(<<_:8, 1:1, _:7, _/binary>>, client, _Cap) ->
+    {error, masked_server_frame};
+parse_header(Data, _Role, _Cap) when byte_size(Data) < 2 ->
+    {more, 2};
+parse_header(<<_:9, 127:7, 1:1, _/bitstring>>, _Role, _Cap) ->
+    {error, decode_failed};
+parse_header(<<Fin:1, 0:3, Opcode:4, _Mask:1, Len:7, Rest/binary>>, Role, _Cap) when Len < 126 ->
+    with_key(Fin, Opcode, 2, Len, Rest, Role);
+parse_header(<<Fin:1, 0:3, Opcode:4, _Mask:1, 126:7, Len:16, Rest/binary>>, Role, _Cap) ->
+    with_key(Fin, Opcode, 4, Len, Rest, Role);
+parse_header(<<_:9, 126:7, Rest/binary>>, _Role, _Cap) ->
+    {more, 2 - byte_size(Rest)};
+parse_header(<<Fin:1, 0:3, Opcode:4, _Mask:1, 127:7, _:1, Len:63, Rest/binary>>, Role, _Cap) ->
+    with_key(Fin, Opcode, 10, Len, Rest, Role);
+parse_header(<<_:9, 127:7, Rest/binary>>, _Role, _Cap) ->
+    {more, 8 - byte_size(Rest)}.
+
+-spec with_key(0 | 1, 0..15, 2 | 4 | 10, non_neg_integer(), binary(), client | server) ->
+    parsed_header().
+with_key(Fin, Opcode, LenSize, Len, _Rest, client) ->
+    {ok, Fin, Opcode, LenSize, Len, <<>>};
+with_key(Fin, Opcode, LenSize, Len, <<MaskKey:4/binary, _/binary>>, server) ->
+    {ok, Fin, Opcode, LenSize + 4, Len, MaskKey};
+with_key(_Fin, _Opcode, LenSize, Len, _Rest, server) ->
+    {key, LenSize + 4, Len}.
 
 -spec partial_slice(
     0..15, binary(), pos_integer(), binary(), non_neg_integer(), non_neg_integer()
@@ -673,6 +720,8 @@ is_valid_utf8(_) -> false.
 %% INTERNAL: MASK
 %%%-----------------------------------------------------------------------------
 -spec rotate_mask(MaskKey :: binary(), Offset :: non_neg_integer()) -> binary().
+rotate_mask(MaskKey, Offset) when Offset rem 4 =:= 0 ->
+    MaskKey;
 rotate_mask(MaskKey, Offset) ->
     Split = Offset rem 4,
     <<Head:Split/binary, Tail/binary>> = MaskKey,
@@ -686,6 +735,11 @@ unmask(<<Key:32>>, Data) when byte_size(Data) >= 64 ->
 unmask(<<Key:32>>, Data) ->
     unmask_loop(Key, 0, Data, <<>>).
 
+-doc """
+Unmask `Data` that starts at byte `Offset` of a frame payload (RFC 6455
+§5.3). A payload that arrives in pieces is unmasked piece by piece, each at
+the byte count received before it. An empty `MaskKey` returns `Data`.
+""".
 -spec unmask_from(MaskKey :: binary(), Offset :: non_neg_integer(), Data :: binary()) -> binary().
 unmask_from(<<>>, _Offset, Data) ->
     Data;

@@ -1,0 +1,2 @@
+# A complete unmasked frame with trailing octets whose 64 bit length has the top bit set (RFC 6455 5.2).
+827f800000000000000568656c6c6f7472

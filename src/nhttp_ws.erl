@@ -17,6 +17,8 @@ The pure per-frame primitives (`encode/1,2`, `decode/1`, `decode_unmasked/1`,
 for backwards compatibility.
 """.
 
+-compile({inline, [{next_frame, 2}, {refuse, 2}, {whole_frame, 6}]}).
+
 %%%-----------------------------------------------------------------------------
 %% SERVER HANDSHAKE
 %%%-----------------------------------------------------------------------------
@@ -73,7 +75,7 @@ for backwards compatibility.
 %% STATEFUL DECODING (FRAGMENTATION + INTERLEAVED CONTROL FRAMES)
 %%%-----------------------------------------------------------------------------
 -export([
-    decode_with_state/2, decoder_new/1, decoder_new/2
+    decode_with_state/2, decoder_new/1, decoder_new/2, feed/2
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -112,7 +114,9 @@ for backwards compatibility.
 %%%-----------------------------------------------------------------------------
 -export_type([
     close_code/0,
+    decode_error/0,
     decode_result/0,
+    feed_result/0,
     session/0,
     stateful_decode_result/0,
     ws_close_opts/0,
@@ -138,6 +142,22 @@ for backwards compatibility.
     | {pong, binary()}.
 
 -type ws_opcode() :: nhttp_ws_frame:ws_opcode().
+
+-type decode_error() ::
+    nhttp_ws_frame:header_error()
+    | control_frame_too_large
+    | fragmented_control_frame
+    | expected_continuation
+    | message_too_large
+    | invalid_utf8
+    | invalid_close_payload
+    | invalid_close_code
+    | invalid_close_reason
+    | {unknown_opcode, 0..15}.
+
+-type feed_result() ::
+    {ok, [ws_message()], ws_decoder()}
+    | {error, decode_error(), [ws_message()]}.
 
 -type stateful_decode_result() ::
     {ok, ws_message(), Rest :: binary(), ws_decoder()}
@@ -174,6 +194,7 @@ for backwards compatibility.
 %%%-----------------------------------------------------------------------------
 -define(WS_MAGIC, <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>).
 -define(WS_DEFAULT_MAX_MESSAGE_SIZE, 16777216).
+-define(WS_MAX_HEADER_SIZE, 14).
 -define(OP_CONTINUATION, 0).
 -define(OP_TEXT, 1).
 -define(OP_BINARY, 2).
@@ -195,6 +216,17 @@ for backwards compatibility.
 %%%-----------------------------------------------------------------------------
 %% RECORDS
 %%%-----------------------------------------------------------------------------
+-record(ws_partial, {
+    fin :: 0 | 1,
+    opcode :: 0..15,
+    mask_key :: binary(),
+    len :: non_neg_integer(),
+    got = 0 :: non_neg_integer(),
+    chunks = [] :: [binary()],
+    scan :: boolean(),
+    utf8_carry :: binary()
+}).
+
 -record(ws_decoder, {
     role :: client | server,
     frag_opcode :: 0..15 | undefined,
@@ -205,7 +237,9 @@ for backwards compatibility.
         nhttp_ws_frame:frame_limits(),
     utf8_carry = <<>> :: binary(),
     partial_carry = <<>> :: binary(),
-    partial_scanned = 0 :: non_neg_integer()
+    partial_scanned = 0 :: non_neg_integer(),
+    header_carry = <<>> :: binary(),
+    partial :: #ws_partial{} | undefined
 }).
 
 -opaque ws_decoder() :: #ws_decoder{}.
@@ -408,26 +442,17 @@ decode_unmasked(Data) ->
 %%%-----------------------------------------------------------------------------
 %% STATEFUL DECODING (FRAGMENTATION SUPPORT, RFC 6455 SECTION 5.4)
 %%%-----------------------------------------------------------------------------
+-doc #{deprecated => "Use feed/2 instead"}.
 -doc """
-Decode a frame with fragmentation support.
-Continuation frames are accumulated until FIN=1, then the complete
-message is delivered. Control frames (ping, pong, close) may appear
-between fragments and are delivered immediately.
-A successful return has three forms, and each one says what to keep:
-- `{ok, Message, Rest, Decoder}`: a frame was consumed and the message
-  is complete. Keep `Rest`.
-- `{continue, Rest, Decoder}`: a frame was consumed and buffered as a
-  non-final fragment. No message yet. Keep `Rest`.
-- `{more, MinBytes, Decoder}`: nothing was consumed. Keep the input
-  buffer and wait for `MinBytes` more bytes.
+Decode one frame, reassembling fragments (RFC 6455 §5.4). Control frames
+between fragments are returned at once.
+- `{ok, Message, Rest, Decoder}`: message complete. Keep `Rest`.
+- `{continue, Rest, Decoder}`: fragment buffered. Keep `Rest`.
+- `{more, MinBytes, Decoder}`: keep the input and the decoder, and wait.
 
-A text payload is scanned as UTF-8 while it arrives, so a broken byte
-gives `{error, invalid_utf8}` on the read that carries it and not on the
-read that completes the frame (RFC 6455 §5.6 and §8.1). The `{more, ...}`
-decoder holds how far that scan got, so keep it, or the next call scans
-the same bytes again.
-If you keep the whole buffer after a consumed frame, the next call
-decodes that frame again and fails with `expected_continuation`.
+Text is scanned as UTF-8 as it arrives (§8.1). Each call parses the buffer
+from its first byte, so a frame split over many reads costs quadratic time.
+Prefer `feed/2`.
 """.
 -spec decode_with_state(binary(), ws_decoder()) -> stateful_decode_result().
 decode_with_state(Data, #ws_decoder{role = Role, frame_limits = Limits} = Dec) ->
@@ -455,8 +480,9 @@ decoder_new(Role) ->
 Create a new stateful decoder honouring `max_message_size` from the runtime
 opts. The option defaults to 16 MiB and bounds two different things.
 The cumulative payload of a fragmented message, and the payload of a single
-non-control frame, are measured after the bytes arrive. Exceeding the option
-returns `{error, message_too_large}`.
+non-control frame, are measured after the bytes arrive. `feed/2` measures the
+cumulative payload at the header of each continuation frame. Exceeding the
+option returns `{error, message_too_large}`.
 The payload length that a frame header declares is refused before any payload
 is buffered (RFC 6455 §10.4). Exceeding the option returns
 `{error, {frame_too_large, DeclaredLength}}`, and the caller closes with
@@ -474,6 +500,19 @@ decoder_new(Role, Opts) ->
         max_message_size = Max,
         frame_limits = #{max_frame_size => Max}
     }.
+
+-doc """
+Decode the bytes of one read and return the messages they complete, in wire
+order. The decoder keeps any unfinished frame, so the caller keeps no buffer.
+An empty list means more bytes are needed.
+
+Each byte is unmasked and UTF-8 scanned once, on arrival. The limits of
+`decoder_new/2` apply. On error, `Messages` holds the messages completed
+before the violation. Do not mix with `decode_with_state/2` on one decoder.
+""".
+-spec feed(binary(), ws_decoder()) -> feed_result().
+feed(Data, Dec) ->
+    feed(Data, Dec, []).
 
 %%%-----------------------------------------------------------------------------
 %% SESSION CONSTRUCTOR + ACCESSORS
@@ -655,11 +694,122 @@ check_message_size(Size, #ws_decoder{max_message_size = Max}) when Size =< Max -
 check_message_size(_Size, _Dec) ->
     {error, message_too_large}.
 
+-doc """
+Refuse a continuation frame whose declared length takes the message over
+`max_message_size`, before its payload arrives. `process_fragment/5` applies
+the same test to the same sizes.
+""".
+-spec check_continuation_size(0..15, non_neg_integer(), ws_decoder()) ->
+    ok | {error, message_too_large}.
+check_continuation_size(
+    ?OP_CONTINUATION, Len, #ws_decoder{frag_opcode = FragOp, frag_acc_size = AccSize} = Dec
+) when FragOp =/= undefined ->
+    check_message_size(AccSize + Len, Dec);
+check_continuation_size(_Opcode, _Len, _Dec) ->
+    ok.
+
+-spec feed(binary(), ws_decoder(), [ws_message()]) -> feed_result().
+feed(<<>>, Dec, Acc) ->
+    {ok, lists:reverse(Acc), Dec};
+feed(
+    Data,
+    #ws_decoder{partial = undefined, header_carry = <<>>, role = Role, frame_limits = Limits} =
+        Dec,
+    Acc
+) ->
+    case nhttp_ws_frame:decode_raw(Data, Role, Limits) of
+        {ok, Fin, Opcode, Payload, Rest} -> whole_frame(Fin, Opcode, Payload, Rest, Dec, Acc);
+        {more, _} -> open_frame(Data, Dec, Acc);
+        {error, Reason} -> refuse(Reason, Acc)
+    end;
+feed(Data, #ws_decoder{partial = undefined} = Dec, Acc) ->
+    open_frame(Data, Dec, Acc);
+feed(Data, #ws_decoder{partial = Partial} = Dec, Acc) ->
+    fill_frame(Data, Partial, Dec, Acc).
+
+-spec fill_frame(binary(), #ws_partial{}, ws_decoder(), [ws_message()]) -> feed_result().
+fill_frame(Data, #ws_partial{len = Len, got = Got} = Partial, Dec, Acc) when
+    byte_size(Data) >= Len - Got
+->
+    {Piece, Rest} = split_binary(Data, Len - Got),
+    maybe
+        {ok, Full} ?= take_piece(Piece, Partial),
+        finish_frame(Full, Rest, Dec, Acc)
+    else
+        {error, Reason} -> refuse(Reason, Acc)
+    end;
+fill_frame(Data, Partial, Dec, Acc) ->
+    case take_piece(Data, Partial) of
+        {ok, Partial1} -> {ok, lists:reverse(Acc), Dec#ws_decoder{partial = Partial1}};
+        {error, Reason} -> refuse(Reason, Acc)
+    end.
+
+-doc """
+Hand a complete frame to `process_fragment/5`. The payload was scanned piece by
+piece, so `partial_scanned` covers all of it and `partial_carry` holds what the
+scan left.
+""".
+-spec finish_frame(#ws_partial{}, binary(), ws_decoder(), [ws_message()]) -> feed_result().
+finish_frame(
+    #ws_partial{fin = Fin, opcode = Opcode, len = Len, chunks = Chunks, utf8_carry = Carry},
+    Rest,
+    Dec,
+    Acc
+) ->
+    Scanned = Dec#ws_decoder{partial = undefined, partial_scanned = Len, partial_carry = Carry},
+    next_frame(process_fragment(Fin, Opcode, frame_payload(Chunks), Rest, Scanned), Acc).
+
+-spec frame_payload([binary()]) -> binary().
+frame_payload([]) -> <<>>;
+frame_payload([Chunk]) -> Chunk;
+frame_payload(Chunks) -> iolist_to_binary(lists:reverse(Chunks)).
+
 -spec get_websocket_key(nhttp_lib:headers()) -> {ok, binary()} | {error, missing_key}.
 get_websocket_key(Headers) ->
     case nhttp_headers:get(<<"sec-websocket-key">>, Headers) of
         undefined -> {error, missing_key};
         Key -> {ok, Key}
+    end.
+
+-spec header_bytes(binary(), binary()) -> binary().
+header_bytes(<<>>, Data) ->
+    Data;
+header_bytes(Carry, Data) ->
+    Take = min(?WS_MAX_HEADER_SIZE - byte_size(Carry), byte_size(Data)),
+    iolist_to_binary([Carry, binary_part(Data, 0, Take)]).
+
+-spec next_frame(stateful_decode_result(), [ws_message()]) -> feed_result().
+next_frame({ok, Msg, Rest, Dec}, Acc) -> feed(Rest, Dec, [Msg | Acc]);
+next_frame({continue, Rest, Dec}, Acc) -> feed(Rest, Dec, Acc);
+next_frame({error, Reason}, Acc) -> refuse(Reason, Acc).
+
+-doc """
+Parse the header of the next frame from the carried header bytes and the
+start of `Data`. An incomplete header is copied into the decoder, so the
+decoder does not keep the read that it came from.
+""".
+-spec open_frame(binary(), ws_decoder(), [ws_message()]) -> feed_result().
+open_frame(
+    Data, #ws_decoder{role = Role, frame_limits = Limits, header_carry = Carry} = Dec, Acc
+) ->
+    Head = header_bytes(Carry, Data),
+    case nhttp_ws_frame:decode_header(Head, Role, Limits) of
+        {ok, Fin, Opcode, HeaderSize, Len, MaskKey} ->
+            Used = HeaderSize - byte_size(Carry),
+            Rest = binary_part(Data, Used, byte_size(Data) - Used),
+            Partial = #ws_partial{
+                fin = Fin,
+                opcode = Opcode,
+                mask_key = MaskKey,
+                len = Len,
+                scan = scans_as_text(Opcode, Dec),
+                utf8_carry = Dec#ws_decoder.utf8_carry
+            },
+            start_frame(Partial, Rest, Dec#ws_decoder{header_carry = <<>>}, Acc);
+        {more, _} ->
+            {ok, lists:reverse(Acc), Dec#ws_decoder{header_carry = binary:copy(Head)}};
+        {error, Reason} ->
+            refuse(Reason, Acc)
     end.
 
 -spec partial_carry(ws_decoder()) -> binary().
@@ -751,6 +901,10 @@ process_fragment(
 process_fragment(_, _, _, _, _) ->
     {error, expected_continuation}.
 
+-spec refuse(decode_error(), [ws_message()]) -> {error, decode_error(), [ws_message()]}.
+refuse(Reason, Acc) ->
+    {error, Reason, lists:reverse(Acc)}.
+
 -spec reset_partial(ws_decoder()) -> ws_decoder().
 reset_partial(Dec) ->
     Dec#ws_decoder{partial_carry = <<>>, partial_scanned = 0}.
@@ -795,6 +949,31 @@ scans_as_text(?OP_TEXT, #ws_decoder{frag_opcode = undefined}) -> true;
 scans_as_text(?OP_CONTINUATION, #ws_decoder{frag_opcode = ?OP_TEXT}) -> true;
 scans_as_text(_Opcode, _Dec) -> false.
 
+-spec start_frame(#ws_partial{}, binary(), ws_decoder(), [ws_message()]) -> feed_result().
+start_frame(#ws_partial{fin = Fin, opcode = Opcode, len = Len} = Partial, Rest, Dec, Acc) ->
+    maybe
+        ok ?= nhttp_ws_frame:validate_control_header(Fin, Opcode, Len),
+        ok ?= check_continuation_size(Opcode, Len, Dec),
+        fill_frame(Rest, Partial, Dec, Acc)
+    else
+        {error, Reason} -> refuse(Reason, Acc)
+    end.
+
+-spec take_piece(binary(), #ws_partial{}) -> {ok, #ws_partial{}} | {error, invalid_utf8}.
+take_piece(Piece, Partial) when byte_size(Piece) =:= 0 ->
+    {ok, Partial};
+take_piece(Piece, #ws_partial{mask_key = MaskKey, got = Got, chunks = Chunks, scan = false} = P) ->
+    Clear = nhttp_ws_frame:unmask_from(MaskKey, Got, Piece),
+    {ok, P#ws_partial{got = Got + byte_size(Piece), chunks = [Clear | Chunks]}};
+take_piece(Piece, #ws_partial{mask_key = MaskKey, got = Got, chunks = Chunks} = P) ->
+    Clear = nhttp_ws_frame:unmask_from(MaskKey, Got, Piece),
+    maybe
+        {ok, Carry} ?= scan_run(P#ws_partial.utf8_carry, Clear),
+        {ok, P#ws_partial{
+            got = Got + byte_size(Piece), chunks = [Clear | Chunks], utf8_carry = Carry
+        }}
+    end.
+
 -spec text_or_binary_message(?OP_TEXT | ?OP_BINARY, binary()) -> ws_message().
 text_or_binary_message(?OP_TEXT, Payload) -> {text, Payload};
 text_or_binary_message(?OP_BINARY, Payload) -> {binary, Payload}.
@@ -832,4 +1011,17 @@ validate_websocket_version(Headers) ->
         <<"13">> -> ok;
         undefined -> {error, unsupported_version};
         _ -> {error, unsupported_version}
+    end.
+
+-doc """
+A frame that one read holds whole, unmasked by `nhttp_ws_frame:decode_raw/3`.
+`process_fragment/5` scans its text from the first byte, because no piece of
+it went through `take_piece/2`.
+""".
+-spec whole_frame(0 | 1, 0..15, binary(), binary(), ws_decoder(), [ws_message()]) ->
+    feed_result().
+whole_frame(Fin, Opcode, Payload, Rest, Dec, Acc) ->
+    case nhttp_ws_frame:validate_control_frame(Fin, Opcode, Payload) of
+        ok -> next_frame(process_fragment(Fin, Opcode, Payload, Rest, Dec), Acc);
+        {error, Reason} -> refuse(Reason, Acc)
     end.

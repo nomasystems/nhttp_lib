@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ML-KEM then sends a HelloRetryRequest. If the server sends no
   change_cipher_spec after it, the OTP client stops the handshake with
   `unexpected_message`.
+- `nhttp_ws:feed/2`, a streaming WebSocket decoder that keeps the unfinished
+  frame. It reads each byte once, where `decode_with_state/2` is quadratic in
+  the number of reads per frame. An error also returns the messages decoded
+  before it.
+- `nhttp_ws_frame:decode_header/3`, `unmask_from/3` and
+  `validate_control_header/3`.
+
+### Deprecated
+
+- `nhttp_ws:decode_with_state/2`. Use `nhttp_ws:feed/2`.
+
+### Fixed
+
+- `nhttp_ws_frame:decode_raw/2,3` and `nhttp_ws:decode_with_state/2` refuse a
+  64 bit payload length with the most significant bit set (RFC 6455 §5.2) at
+  the header, with `{error, decode_failed}`. Before, they returned `{more, N}`
+  until the whole frame arrived.
 
 ## [1.2.1]
 

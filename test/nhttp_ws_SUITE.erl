@@ -97,6 +97,7 @@ decoding, and stateful fragmentation for both server and client roles.
     frag_single_frame_too_large/1,
     frag_max_message_size_infinity/1,
     frag_frame_cap_refuses_before_buffering/1,
+    frag_length_top_bit_refused/1,
     frag_frame_cap_infinity_buffers/1,
     frag_default_max_message_size_is_finite/1,
     partial_autobahn_6_4_3/1,
@@ -117,7 +118,33 @@ decoding, and stateful fragmentation for both server and client roles.
     session_close_envelope/1,
     session_broadcast_to_session/1,
     session_broadcast_to_pid/1,
-    session_is_alive/1
+    session_is_alive/1,
+    feed_empty_input/1,
+    feed_header_split_at_every_boundary_unmasked/1,
+    feed_header_split_at_every_boundary_masked/1,
+    feed_header_one_byte_at_a_time/1,
+    feed_chunk_ends_at_frame_boundary/1,
+    feed_chunk_spans_two_frames/1,
+    feed_many_frames_in_one_chunk/1,
+    feed_frame_too_large_at_header/1,
+    feed_message_too_large_at_continuation_header/1,
+    feed_single_frame_too_large_at_byte_count/1,
+    feed_control_frame_too_large_at_header/1,
+    feed_fragmented_control_frame_at_header/1,
+    feed_control_frame_inside_fragmented_message/1,
+    feed_error_returns_earlier_messages/1,
+    feed_invalid_utf8_on_carrying_chunk/1,
+    feed_utf8_carry_across_chunks_and_fragments/1,
+    feed_truncated_utf8_at_fin/1,
+    feed_binary_not_utf8_checked/1,
+    feed_masked_frame_refused_by_client/1,
+    feed_unmasked_frame_refused_by_server/1,
+    feed_reserved_bits_refused/1,
+    feed_length_top_bit_refused/1,
+    feed_expected_continuation/1,
+    feed_close_frame_validated/1,
+    feed_16mib_binary_in_16kib_chunks/1,
+    feed_16mib_text_in_16kib_chunks/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -134,7 +161,9 @@ all() ->
         {group, client_decoding},
         {group, fragmentation},
         {group, partial_scan},
-        {group, session}
+        {group, session},
+        {group, feed},
+        {group, feed_timing}
     ].
 
 groups() ->
@@ -225,6 +254,7 @@ groups() ->
             frag_single_frame_too_large,
             frag_max_message_size_infinity,
             frag_frame_cap_refuses_before_buffering,
+            frag_length_top_bit_refused,
             frag_frame_cap_infinity_buffers,
             frag_default_max_message_size_is_finite
         ]},
@@ -250,6 +280,36 @@ groups() ->
             session_broadcast_to_session,
             session_broadcast_to_pid,
             session_is_alive
+        ]},
+        {feed, [parallel], [
+            feed_empty_input,
+            feed_header_split_at_every_boundary_unmasked,
+            feed_header_split_at_every_boundary_masked,
+            feed_header_one_byte_at_a_time,
+            feed_chunk_ends_at_frame_boundary,
+            feed_chunk_spans_two_frames,
+            feed_many_frames_in_one_chunk,
+            feed_frame_too_large_at_header,
+            feed_message_too_large_at_continuation_header,
+            feed_single_frame_too_large_at_byte_count,
+            feed_control_frame_too_large_at_header,
+            feed_fragmented_control_frame_at_header,
+            feed_control_frame_inside_fragmented_message,
+            feed_error_returns_earlier_messages,
+            feed_invalid_utf8_on_carrying_chunk,
+            feed_utf8_carry_across_chunks_and_fragments,
+            feed_truncated_utf8_at_fin,
+            feed_binary_not_utf8_checked,
+            feed_masked_frame_refused_by_client,
+            feed_unmasked_frame_refused_by_server,
+            feed_reserved_bits_refused,
+            feed_length_top_bit_refused,
+            feed_expected_continuation,
+            feed_close_frame_validated
+        ]},
+        {feed_timing, [], [
+            feed_16mib_binary_in_16kib_chunks,
+            feed_16mib_text_in_16kib_chunks
         ]}
     ].
 
@@ -771,6 +831,14 @@ frag_frame_cap_refuses_before_buffering(_Config) ->
         nhttp_ws:decode_with_state(Header, Dec0)
     ).
 
+frag_length_top_bit_refused(_Config) ->
+    Frame = <<16#82, 127, 1:1, 5:63, "hello">>,
+    Dec0 = nhttp_ws:decoder_new(client),
+    ?assertEqual({error, decode_failed}, nhttp_ws:decode_with_state(Frame, Dec0)),
+    ?assertEqual(
+        {error, decode_failed}, nhttp_ws:decode_with_state(binary:part(Frame, 0, 3), Dec0)
+    ).
+
 frag_frame_cap_infinity_buffers(_Config) ->
     Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => infinity}),
     Header = <<16#82, 127, 0:1, (1 bsl 40):63>>,
@@ -1042,3 +1110,312 @@ partial_control_frame_not_scanned(_Config) ->
     {ok, {ping, Payload}, <<>>, _Dec2} =
         nhttp_ws:decode_with_state(<<16#89, 2, 16#C0, 16#AF>>, Dec1),
     ?assertEqual(<<16#C0, 16#AF>>, Payload).
+
+%%%-----------------------------------------------------------------------------
+%%% FEED TESTS
+%%%-----------------------------------------------------------------------------
+
+-define(MIB16, 16777216).
+-define(KIB16, 16384).
+-define(MAX_CHUNKED_RATIO, 4).
+-define(TIMING_RUNS, 3).
+
+feed_empty_input(_Config) ->
+    {ok, [], Dec1} = nhttp_ws:feed(<<>>, nhttp_ws:decoder_new(server)),
+    Frame = server_frame(1, 1, <<"hi">>, <<1, 2, 3, 4>>),
+    ?assertMatch({ok, [{text, <<"hi">>}], _}, nhttp_ws:feed(Frame, Dec1)).
+
+feed_header_split_at_every_boundary_unmasked(_Config) ->
+    lists:foreach(
+        fun({Len, HeaderSize}) ->
+            Payload = payload(Len),
+            Frame = client_frame(1, 2, Payload),
+            [
+                ?assertEqual([{binary, Payload}], split_feed(client, Frame, I), {Len, I})
+             || I <- lists:seq(1, HeaderSize + 1)
+            ]
+        end,
+        [{5, 2}, {300, 4}, {70000, 10}]
+    ).
+
+feed_header_split_at_every_boundary_masked(_Config) ->
+    lists:foreach(
+        fun({Len, HeaderSize}) ->
+            Payload = payload(Len),
+            Frame = server_frame(1, 2, Payload, <<16#A1, 16#B2, 16#C3, 16#D4>>),
+            [
+                ?assertEqual([{binary, Payload}], split_feed(server, Frame, I), {Len, I})
+             || I <- lists:seq(1, HeaderSize + 1)
+            ]
+        end,
+        [{5, 6}, {300, 8}, {70000, 14}]
+    ).
+
+feed_header_one_byte_at_a_time(_Config) ->
+    Payload = payload(70000),
+    Frame = server_frame(1, 2, Payload, <<9, 8, 7, 6>>),
+    <<Header:14/binary, Body/binary>> = Frame,
+    Dec = lists:foldl(
+        fun(Byte, D0) ->
+            {ok, [], D1} = nhttp_ws:feed(<<Byte>>, D0),
+            D1
+        end,
+        nhttp_ws:decoder_new(server),
+        binary_to_list(Header)
+    ),
+    ?assertMatch({ok, [{binary, Payload}], _}, nhttp_ws:feed(Body, Dec)).
+
+feed_chunk_ends_at_frame_boundary(_Config) ->
+    F1 = server_frame(1, 1, <<"first">>, <<1, 2, 3, 4>>),
+    F2 = server_frame(1, 2, payload(300), <<5, 6, 7, 8>>),
+    {ok, [{text, <<"first">>}], Dec1} = nhttp_ws:feed(F1, nhttp_ws:decoder_new(server)),
+    ?assertMatch({ok, [{binary, _}], _}, nhttp_ws:feed(F2, Dec1)).
+
+feed_chunk_spans_two_frames(_Config) ->
+    P1 = payload(300),
+    P2 = payload(301),
+    F1 = server_frame(1, 2, P1, <<1, 2, 3, 4>>),
+    F2 = server_frame(1, 2, P2, <<5, 6, 7, 8>>),
+    [
+        begin
+            {A, F1Tail} = split_binary(F1, Cut1),
+            {F2Head, B} = split_binary(F2, Cut2),
+            {ok, [], D1} = nhttp_ws:feed(A, nhttp_ws:decoder_new(server)),
+            {ok, [{binary, P1}], D2} = nhttp_ws:feed(<<F1Tail/binary, F2Head/binary>>, D1),
+            ?assertMatch({ok, [{binary, P2}], _}, nhttp_ws:feed(B, D2), {Cut1, Cut2})
+        end
+     || Cut1 <- [1, 3, 8, 100, 307], Cut2 <- lists:seq(1, 9)
+    ].
+
+feed_many_frames_in_one_chunk(_Config) ->
+    Msgs = [{text, integer_to_binary(I)} || I <- lists:seq(1, 10)],
+    Frames = [server_frame(1, 1, T, <<I:32>>) || {I, {text, T}} <- lists:enumerate(Msgs)],
+    Last = server_frame(1, 2, payload(200), <<0:32>>),
+    {Head, Tail} = split_binary(Last, 100),
+    {ok, Got, Dec1} =
+        nhttp_ws:feed(iolist_to_binary([Frames, Head]), nhttp_ws:decoder_new(server)),
+    ?assertEqual(Msgs, Got),
+    ?assertMatch({ok, [{binary, _}], _}, nhttp_ws:feed(Tail, Dec1)).
+
+feed_frame_too_large_at_header(_Config) ->
+    Client = nhttp_ws:decoder_new(client, #{max_message_size => 1000}),
+    ?assertEqual(
+        {error, {frame_too_large, 2000}, []},
+        nhttp_ws:feed(<<16#82, 126, 2000:16>>, Client)
+    ),
+    Server = nhttp_ws:decoder_new(server, #{max_message_size => 1000}),
+    {ok, [], Server1} = nhttp_ws:feed(<<16#82, 16#FE>>, Server),
+    ?assertEqual({error, {frame_too_large, 2000}, []}, nhttp_ws:feed(<<2000:16>>, Server1)).
+
+feed_message_too_large_at_continuation_header(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => 1000}),
+    {ok, [], Dec1} = nhttp_ws:feed(client_frame(0, 2, payload(900)), Dec0),
+    ?assertEqual({error, message_too_large, []}, nhttp_ws:feed(<<16#80, 126, 900:16>>, Dec1)).
+
+feed_single_frame_too_large_at_byte_count(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(client, #{max_message_size => 50}),
+    {Head, Last} = split_binary(client_frame(1, 2, payload(100)), 101),
+    {ok, [], Dec1} = nhttp_ws:feed(Head, Dec0),
+    ?assertEqual({error, message_too_large, []}, nhttp_ws:feed(Last, Dec1)).
+
+feed_control_frame_too_large_at_header(_Config) ->
+    Dec = nhttp_ws:decoder_new(client),
+    ?assertEqual(
+        {error, control_frame_too_large, []},
+        nhttp_ws:feed(<<16#89, 126, 126:16>>, Dec)
+    ).
+
+feed_fragmented_control_frame_at_header(_Config) ->
+    Dec = nhttp_ws:decoder_new(client),
+    ?assertEqual({error, fragmented_control_frame, []}, nhttp_ws:feed(<<16#09, 5>>, Dec)).
+
+feed_control_frame_inside_fragmented_message(_Config) ->
+    Wire = iolist_to_binary([
+        server_frame(0, 1, <<"Hel">>, <<1, 2, 3, 4>>),
+        server_frame(1, 9, <<"p">>, <<5, 6, 7, 8>>),
+        server_frame(1, 0, <<"lo">>, <<9, 10, 11, 12>>)
+    ]),
+    Expected = [{ping, <<"p">>}, {text, <<"Hello">>}],
+    ?assertMatch({ok, Expected, _}, nhttp_ws:feed(Wire, nhttp_ws:decoder_new(server))),
+    ?assertEqual(Expected, feed_bytes(Wire, nhttp_ws:decoder_new(server))).
+
+feed_error_returns_earlier_messages(_Config) ->
+    Wire = <<16#81, 2, "hi", 16#89, 0, 16#85, 0>>,
+    ?assertEqual(
+        {error, {unknown_opcode, 5}, [{text, <<"hi">>}, ping]},
+        nhttp_ws:feed(Wire, nhttp_ws:decoder_new(client))
+    ).
+
+feed_invalid_utf8_on_carrying_chunk(_Config) ->
+    {ok, [], Dec1} = nhttp_ws:feed(<<16#81, 6, "Hel">>, nhttp_ws:decoder_new(client)),
+    ?assertEqual({error, invalid_utf8, []}, nhttp_ws:feed(<<16#C0>>, Dec1)),
+    Header = binary:decode_hex(<<"01951cad1226">>),
+    Chop1 = binary:decode_hex(<<"d217f39ba56291e8a063a7">>),
+    Chop2 = binary:decode_hex(<<"d28c2d92">>),
+    {ok, [], Dec2} = nhttp_ws:feed(<<Header/binary, Chop1/binary>>, nhttp_ws:decoder_new(server)),
+    ?assertEqual({error, invalid_utf8, []}, nhttp_ws:feed(Chop2, Dec2)).
+
+feed_utf8_carry_across_chunks_and_fragments(_Config) ->
+    Wire = <<16#01, 1, 16#E2, 16#00, 1, 16#82, 16#80, 2, 16#AC, $!>>,
+    Expected = [{text, <<"€!"/utf8>>}],
+    ?assertMatch({ok, Expected, _}, nhttp_ws:feed(Wire, nhttp_ws:decoder_new(client))),
+    ?assertEqual(Expected, feed_bytes(Wire, nhttp_ws:decoder_new(client))).
+
+feed_truncated_utf8_at_fin(_Config) ->
+    {ok, [], Dec1} = nhttp_ws:feed(<<16#01, 1, 16#C3>>, nhttp_ws:decoder_new(client)),
+    ?assertEqual({error, invalid_utf8, []}, nhttp_ws:feed(<<16#80, 0>>, Dec1)),
+    ?assertEqual(
+        {error, invalid_utf8, []},
+        nhttp_ws:feed(<<16#81, 1, 16#C3>>, nhttp_ws:decoder_new(client))
+    ).
+
+feed_binary_not_utf8_checked(_Config) ->
+    Wire = <<16#02, 2, 16#C0, 16#AF, 16#80, 1, 16#FF>>,
+    ?assertEqual(
+        [{binary, <<16#C0, 16#AF, 16#FF>>}], feed_bytes(Wire, nhttp_ws:decoder_new(client))
+    ).
+
+feed_masked_frame_refused_by_client(_Config) ->
+    ?assertEqual(
+        {error, masked_server_frame, []},
+        nhttp_ws:feed(<<16#81, 16#80, 0:32>>, nhttp_ws:decoder_new(client))
+    ).
+
+feed_unmasked_frame_refused_by_server(_Config) ->
+    ?assertEqual(
+        {error, unmasked_client_frame, []},
+        nhttp_ws:feed(<<16#81, 0>>, nhttp_ws:decoder_new(server))
+    ).
+
+feed_reserved_bits_refused(_Config) ->
+    ?assertEqual(
+        {error, reserved_bits_set, []},
+        nhttp_ws:feed(<<16#C1, 0>>, nhttp_ws:decoder_new(client))
+    ).
+
+feed_length_top_bit_refused(_Config) ->
+    Client = <<16#82, 127, 1:1, 5:63, "hello">>,
+    Server = <<16#82, 16#FF, 1:1, 5:63, 1, 2, 3, 4, "hello">>,
+    [
+        ?assertEqual(
+            {error, decode_failed, [{text, <<"hi">>}]},
+            nhttp_ws:feed(<<Hi/binary, Wire/binary>>, nhttp_ws:decoder_new(Role))
+        )
+     || {Role, Hi, Wire} <- [
+            {client, client_frame(1, 1, <<"hi">>), Client},
+            {server, server_frame(1, 1, <<"hi">>, <<1, 2, 3, 4>>), Server}
+        ]
+    ],
+    {ok, [], Dec1} = nhttp_ws:feed(<<16#82, 127>>, nhttp_ws:decoder_new(client)),
+    ?assertEqual({error, decode_failed, []}, nhttp_ws:feed(<<16#80>>, Dec1)).
+
+feed_expected_continuation(_Config) ->
+    ?assertEqual(
+        {error, expected_continuation, []},
+        nhttp_ws:feed(<<16#01, 1, "a", 16#81, 1, "b">>, nhttp_ws:decoder_new(client))
+    ),
+    ?assertMatch({error, _, []}, nhttp_ws:feed(<<16#80, 1, "x">>, nhttp_ws:decoder_new(client))).
+
+feed_close_frame_validated(_Config) ->
+    ?assertEqual(
+        {error, invalid_close_code, []},
+        nhttp_ws:feed(<<16#88, 2, 999:16>>, nhttp_ws:decoder_new(client))
+    ),
+    ?assertMatch(
+        {ok, [{close, 1000, <<"ok">>}], _},
+        nhttp_ws:feed(<<16#88, 4, 1000:16, "ok">>, nhttp_ws:decoder_new(client))
+    ).
+
+feed_16mib_binary_in_16kib_chunks(_Config) ->
+    Payload = binary:copy(<<"0123456789abcdef">>, ?MIB16 div 16),
+    assert_feed_time({binary, Payload}).
+
+feed_16mib_text_in_16kib_chunks(_Config) ->
+    Unit = <<"aé€😀"/utf8>>,
+    Pad = binary:copy(<<"x">>, ?MIB16 rem byte_size(Unit)),
+    Payload = <<(binary:copy(Unit, ?MIB16 div byte_size(Unit)))/binary, Pad/binary>>,
+    assert_feed_time({text, Payload}).
+
+%%%-----------------------------------------------------------------------------
+%%% FEED HELPERS
+%%%-----------------------------------------------------------------------------
+
+-spec payload(non_neg_integer()) -> binary().
+payload(Len) ->
+    <<<<(I rem 251)>> || I <- lists:seq(1, Len)>>.
+
+-spec client_frame(0 | 1, 0..15, binary()) -> binary().
+client_frame(Fin, Opcode, Payload) ->
+    <<(length_header(Fin, Opcode, 0, byte_size(Payload)))/binary, Payload/binary>>.
+
+-spec server_frame(0 | 1, 0..15, binary(), binary()) -> binary().
+server_frame(Fin, Opcode, Payload, Key) ->
+    Header = length_header(Fin, Opcode, 1, byte_size(Payload)),
+    <<Header/binary, Key/binary, (mask(Payload, Key))/binary>>.
+
+-spec length_header(0 | 1, 0..15, 0 | 1, non_neg_integer()) -> binary().
+length_header(Fin, Opcode, Mask, Len) when Len < 126 ->
+    <<Fin:1, 0:3, Opcode:4, Mask:1, Len:7>>;
+length_header(Fin, Opcode, Mask, Len) when Len < 65536 ->
+    <<Fin:1, 0:3, Opcode:4, Mask:1, 126:7, Len:16>>;
+length_header(Fin, Opcode, Mask, Len) ->
+    <<Fin:1, 0:3, Opcode:4, Mask:1, 127:7, Len:64>>.
+
+-spec split_feed(client | server, binary(), pos_integer()) -> [nhttp_ws:ws_message()].
+split_feed(Role, Frame, At) ->
+    {Head, Tail} = split_binary(Frame, At),
+    {ok, [], Dec1} = nhttp_ws:feed(Head, nhttp_ws:decoder_new(Role)),
+    {ok, Msgs, _Dec2} = nhttp_ws:feed(Tail, Dec1),
+    Msgs.
+
+-spec feed_bytes(binary(), nhttp_ws:ws_decoder()) -> [nhttp_ws:ws_message()].
+feed_bytes(Wire, Dec0) ->
+    {Msgs, _Dec} = lists:foldl(
+        fun(Byte, {Acc, D0}) ->
+            {ok, New, D1} = nhttp_ws:feed(<<Byte>>, D0),
+            {Acc ++ New, D1}
+        end,
+        {[], Dec0},
+        binary_to_list(Wire)
+    ),
+    Msgs.
+
+-spec feed_all([binary()], nhttp_ws:ws_decoder(), [[nhttp_ws:ws_message()]]) ->
+    [nhttp_ws:ws_message()].
+feed_all([], _Dec, Acc) ->
+    lists:append(lists:reverse(Acc));
+feed_all([Chunk | Rest], Dec, Acc) ->
+    {ok, Msgs, Dec1} = nhttp_ws:feed(Chunk, Dec),
+    feed_all(Rest, Dec1, [Msgs | Acc]).
+
+-spec fixed_chunks(binary(), pos_integer()) -> [binary()].
+fixed_chunks(Bin, Size) when byte_size(Bin) =< Size ->
+    [Bin];
+fixed_chunks(Bin, Size) ->
+    <<Head:Size/binary, Rest/binary>> = Bin,
+    [Head | fixed_chunks(Rest, Size)].
+
+-doc """
+The chunked feed against one read of the same frame, each the best of a few
+runs. Both unmask and scan every byte once, so the ratio stays near 1 on any
+runner. A decoder that rescans its buffer on each read gives a ratio in the
+hundreds for 1024 chunks.
+""".
+-spec assert_feed_time(nhttp_ws:ws_message()) -> ok.
+assert_feed_time(Msg) ->
+    Wire = iolist_to_binary(nhttp_ws:encode_masked(Msg)),
+    Chunked = lists:min([time_feed(fixed_chunks(Wire, ?KIB16), Msg) || _ <- runs()]),
+    Single = lists:min([time_feed([Wire], Msg) || _ <- runs()]),
+    ct:pal("~p chunks ~p us, one read ~p us", [element(1, Msg), Chunked, Single]),
+    ?assert(Chunked < ?MAX_CHUNKED_RATIO * Single, {Chunked, Single, ?MAX_CHUNKED_RATIO}).
+
+-spec runs() -> [pos_integer()].
+runs() ->
+    lists:seq(1, ?TIMING_RUNS).
+
+-spec time_feed([binary()], nhttp_ws:ws_message()) -> non_neg_integer().
+time_feed(Chunks, Msg) ->
+    true = erlang:garbage_collect(),
+    {Us, Msgs} = timer:tc(fun() -> feed_all(Chunks, nhttp_ws:decoder_new(server), []) end),
+    ?assert([Msg] =:= Msgs),
+    Us.

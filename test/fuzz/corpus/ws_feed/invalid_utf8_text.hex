@@ -1,0 +1,2 @@
+# A text frame that carries 0xC0, which no UTF-8 character starts with.
+8101c0

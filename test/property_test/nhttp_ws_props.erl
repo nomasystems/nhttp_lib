@@ -13,6 +13,10 @@ Properties:
 - Trailing bytes after the frame are returned as `Rest` unchanged.
 - Both decoders are total: arbitrary binary inputs return `{ok, _, _}`,
   `{more, _}` or `{error, _}` and never crash.
+- `nhttp_ws:feed/2` over any split of the wire into chunks returns the
+  messages that `decode_with_state/2` returns over the whole buffer.
+- `nhttp_ws:feed/2` refuses invalid UTF-8 on the call whose chunk carries the
+  invalid byte.
 
 Control-frame validation (J3) and fragment-size enforcement (J4) are
 covered by the dedicated CT cases in `nhttp_ws_SUITE`.
@@ -22,6 +26,7 @@ These properties are run via `nhttp_props_SUITE`.
 
 -include_lib("triq/include/triq.hrl").
 
+-define(FEED_NUMTESTS, 1000).
 
 
 -spec prop_unmasked_roundtrip() -> triq:property().
@@ -372,6 +377,268 @@ decode_frames_until_error([Frame | Rest], Dec) ->
         {ok, _Msg, _Rest, Dec1} -> decode_frames_until_error(Rest, Dec1);
         {continue, _, Dec1} -> decode_frames_until_error(Rest, Dec1);
         {error, _} = Err -> Err
+    end.
+
+-spec prop_ws_feed_matches_whole_buffer() -> triq:property().
+prop_ws_feed_matches_whole_buffer() ->
+    triq:numtests(
+        ?FEED_NUMTESTS,
+        ?FORALL(
+            {Role, Units, Base, Split},
+            {role_gen(), units_gen(), key_base_gen(), split_gen()},
+            begin
+                Frames = lists:append([F || {F, _} <- Units]),
+                Expected = lists:append([M || {_, M} <- Units]),
+                Wire = iolist_to_binary(wire(Role, Frames, Base)),
+                Whole = whole_buffer(Wire, nhttp_ws:decoder_new(Role)),
+                Fed = feed_chunks(chunks(Wire, Split), nhttp_ws:decoder_new(Role)),
+                ?WHENFAIL(
+                    ct:pal("expected ~P~nwhole ~P~nfed ~P", [Expected, 8, Whole, 8, Fed, 8]),
+                    Whole =:= Expected andalso Fed =:= Whole
+                )
+            end
+        )
+    ).
+
+-spec prop_ws_feed_refuses_invalid_utf8_on_the_carrying_call() -> triq:property().
+prop_ws_feed_refuses_invalid_utf8_on_the_carrying_call() ->
+    triq:numtests(
+        ?FEED_NUMTESTS,
+        ?FORALL(
+            {Role, Units, Before, Bad, After, Pieces, Base, Split},
+            {
+                role_gen(),
+                units_gen(),
+                feed_text_gen(),
+                invalid_lead_byte_gen(),
+                valid_utf8_gen(),
+                int(1, 4),
+                key_base_gen(),
+                split_gen()
+            },
+            begin
+                Prefix = lists:append([F || {F, _} <- Units]),
+                Text = fragment_frames(text, <<Before/binary, Bad, After/binary>>, Pieces, []),
+                Wires = wire(Role, Prefix ++ Text, Base),
+                {PrefixWires, TextWires} = lists:split(length(Prefix), Wires),
+                Offset =
+                    iolist_size(PrefixWires) +
+                        bad_byte_offset(TextWires, Text, byte_size(Before)),
+                Chunks = chunks(iolist_to_binary(Wires), Split),
+                refused_at(Chunks, Offset, 0, nhttp_ws:decoder_new(Role))
+            end
+        )
+    ).
+
+-type frame() :: {0 | 1, 0..15, binary()}.
+
+-spec role_gen() -> triq_dom:domain().
+role_gen() ->
+    oneof([server, client]).
+
+-spec key_base_gen() -> triq_dom:domain().
+key_base_gen() ->
+    int(0, 16#FFFFFFFF).
+
+-spec units_gen() -> triq_dom:domain().
+units_gen() ->
+    ?LET(N, int(0, 6), vector(N, unit_gen())).
+
+-spec unit_gen() -> triq_dom:domain().
+unit_gen() ->
+    frequency([
+        {4, ?LET(Msg, feed_message_gen(), {[message_frame(Msg)], [Msg]})},
+        {1, fragmented_unit_gen()}
+    ]).
+
+-spec fragmented_unit_gen() -> triq_dom:domain().
+fragmented_unit_gen() ->
+    ?LET(
+        {Kind, Payload, Pieces, Controls},
+        {oneof([text, binary]), feed_text_gen(), int(2, 5), list({int(1, 4), control_frame_gen()})},
+        begin
+            Placed = [{min(Pos, Pieces - 1), C} || {Pos, C} <- Controls],
+            Interleaved = [C || {_, C} <- lists:keysort(1, Placed)],
+            {fragment_frames(Kind, Payload, Pieces, Placed), Interleaved ++ [{Kind, Payload}]}
+        end
+    ).
+
+-spec feed_message_gen() -> triq_dom:domain().
+feed_message_gen() ->
+    frequency([
+        {8, ws_message_gen()},
+        {1, ?LET(D, large_text_gen(), {text, D})},
+        {1, ?LET(D, large_binary_gen(), {binary, D})}
+    ]).
+
+-spec feed_text_gen() -> triq_dom:domain().
+feed_text_gen() ->
+    frequency([{6, valid_utf8_gen()}, {1, large_text_gen()}]).
+
+-spec large_text_gen() -> triq_dom:domain().
+large_text_gen() ->
+    ?LET(
+        {Chars, Len},
+        {non_empty(list(unicode_codepoint_gen())), large_length_gen()},
+        repeat_to(unicode:characters_to_binary(Chars), Len)
+    ).
+
+-spec large_binary_gen() -> triq_dom:domain().
+large_binary_gen() ->
+    ?LET({Unit, Len}, {non_empty(binary()), large_length_gen()}, repeat_to(Unit, Len)).
+
+-doc "Lengths that select the 16 bit and the 64 bit length encodings (RFC 6455 5.2).".
+-spec large_length_gen() -> triq_dom:domain().
+large_length_gen() ->
+    oneof([int(126, 400), int(65536, 65800)]).
+
+-spec invalid_lead_byte_gen() -> triq_dom:domain().
+invalid_lead_byte_gen() ->
+    oneof([int(16#80, 16#BF), return(16#C0), return(16#C1), int(16#F5, 16#FF)]).
+
+-spec split_gen() -> triq_dom:domain().
+split_gen() ->
+    oneof([
+        whole,
+        {fixed, int(1, 4)},
+        {fixed, int(5, 200)},
+        {fraction, int(1, 100)},
+        {random, int(1, 64), int(1, 1 bsl 30)},
+        {random, int(1, 20000), int(1, 1 bsl 30)}
+    ]).
+
+-spec repeat_to(binary(), pos_integer()) -> binary().
+repeat_to(Unit, Len) ->
+    binary:copy(Unit, Len div byte_size(Unit) + 1).
+
+-spec message_frame(nhttp_ws_frame:ws_message()) -> frame().
+message_frame({text, D}) -> {1, 1, D};
+message_frame({binary, D}) -> {1, 2, D};
+message_frame(close) -> {1, 8, <<>>};
+message_frame({close, Code, Reason}) -> {1, 8, <<Code:16, Reason/binary>>};
+message_frame(ping) -> {1, 9, <<>>};
+message_frame({ping, D}) -> {1, 9, D};
+message_frame(pong) -> {1, 10, <<>>};
+message_frame({pong, D}) -> {1, 10, D}.
+
+-spec fragment_frames(
+    text | binary, binary(), pos_integer(), [{pos_integer(), nhttp_ws_frame:ws_message()}]
+) -> [frame()].
+fragment_frames(Kind, Payload, Pieces, Placed) ->
+    Split = split_into_n(Payload, Pieces),
+    Last = length(Split),
+    lists:append([
+        [
+            {fin(I, Last), fragment_opcode(Kind, I), Piece}
+            | [message_frame(C) || {P, C} <- Placed, P =:= I]
+        ]
+     || {I, Piece} <- lists:zip(lists:seq(1, Last), Split)
+    ]).
+
+-spec fin(pos_integer(), pos_integer()) -> 0 | 1.
+fin(Last, Last) -> 1;
+fin(_I, _Last) -> 0.
+
+-spec fragment_opcode(text | binary, pos_integer()) -> 0..2.
+fragment_opcode(text, 1) -> 1;
+fragment_opcode(binary, 1) -> 2;
+fragment_opcode(_Kind, _I) -> 0.
+
+-doc "Encode frames for the peer of a decoder in `Role`: masked toward a server.".
+-spec wire(client | server, [frame()], non_neg_integer()) -> [binary()].
+wire(Role, Frames, Base) ->
+    [
+        frame_wire(Role, Frame, <<((Base + I) band 16#FFFFFFFF):32>>)
+     || {I, Frame} <- lists:enumerate(Frames)
+    ].
+
+-spec frame_wire(client | server, frame(), binary()) -> binary().
+frame_wire(server, {Fin, Opcode, Payload}, Key) ->
+    Header = frame_header(Fin, Opcode, 1, byte_size(Payload)),
+    <<Header/binary, Key/binary, (xor_mask(Key, Payload))/binary>>;
+frame_wire(client, {Fin, Opcode, Payload}, _Key) ->
+    <<(frame_header(Fin, Opcode, 0, byte_size(Payload)))/binary, Payload/binary>>.
+
+-spec frame_header(0 | 1, 0..15, 0 | 1, non_neg_integer()) -> binary().
+frame_header(Fin, Opcode, Mask, Len) when Len < 126 ->
+    <<Fin:1, 0:3, Opcode:4, Mask:1, Len:7>>;
+frame_header(Fin, Opcode, Mask, Len) when Len < 65536 ->
+    <<Fin:1, 0:3, Opcode:4, Mask:1, 126:7, Len:16>>;
+frame_header(Fin, Opcode, Mask, Len) ->
+    <<Fin:1, 0:3, Opcode:4, Mask:1, 127:7, Len:64>>.
+
+-spec xor_mask(binary(), binary()) -> binary().
+xor_mask(Key, Payload) ->
+    Len = byte_size(Payload),
+    crypto:exor(Payload, binary:part(binary:copy(Key, Len div 4 + 1), 0, Len)).
+
+-spec chunks(binary(), term()) -> [binary()].
+chunks(Wire, whole) ->
+    [Wire];
+chunks(Wire, {fixed, Size}) ->
+    fixed_chunks(Wire, Size);
+chunks(Wire, {fraction, Percent}) ->
+    fixed_chunks(Wire, max(1, byte_size(Wire) * Percent div 100));
+chunks(Wire, {random, Max, Seed}) ->
+    random_chunks(Wire, Max, rand:seed_s(exsss, Seed)).
+
+-spec fixed_chunks(binary(), pos_integer()) -> [binary()].
+fixed_chunks(Bin, Size) when byte_size(Bin) =< Size ->
+    [Bin];
+fixed_chunks(Bin, Size) ->
+    <<Head:Size/binary, Rest/binary>> = Bin,
+    [Head | fixed_chunks(Rest, Size)].
+
+-spec random_chunks(binary(), pos_integer(), rand:state()) -> [binary()].
+random_chunks(Bin, Max, S0) ->
+    {Size, S1} = rand:uniform_s(Max, S0),
+    case Bin of
+        <<Head:Size/binary, Rest/binary>> when Rest =/= <<>> -> [Head | random_chunks(Rest, Max, S1)];
+        _ -> [Bin]
+    end.
+
+-spec whole_buffer(binary(), nhttp_ws:ws_decoder()) -> [nhttp_ws_frame:ws_message() | {error, term()}].
+whole_buffer(Wire, Dec) ->
+    case nhttp_ws:decode_with_state(Wire, Dec) of
+        {ok, Msg, Rest, Dec1} -> [Msg | whole_buffer(Rest, Dec1)];
+        {continue, Rest, Dec1} -> whole_buffer(Rest, Dec1);
+        {more, _, _} -> [];
+        {error, Reason} -> [{error, Reason}]
+    end.
+
+-spec feed_chunks([binary()], nhttp_ws:ws_decoder()) ->
+    [nhttp_ws_frame:ws_message() | {error, term()}].
+feed_chunks([], _Dec) ->
+    [];
+feed_chunks([Chunk | Rest], Dec) ->
+    case nhttp_ws:feed(Chunk, Dec) of
+        {ok, Msgs, Dec1} -> Msgs ++ feed_chunks(Rest, Dec1);
+        {error, Reason, Msgs} -> Msgs ++ [{error, Reason}]
+    end.
+
+-doc "Wire offset of payload byte `K` of a message sent as `Frames`.".
+-spec bad_byte_offset([binary()], [frame()], non_neg_integer()) -> non_neg_integer().
+bad_byte_offset([Wire | Wires], [{_, _, Payload} | Frames], K) when K >= byte_size(Payload) ->
+    byte_size(Wire) + bad_byte_offset(Wires, Frames, K - byte_size(Payload));
+bad_byte_offset([Wire | _], [{_, _, Payload} | _], K) ->
+    byte_size(Wire) - byte_size(Payload) + K.
+
+-doc """
+Every call before the chunk that carries wire byte `Offset` succeeds, and the
+call that carries it refuses the text as UTF-8.
+""".
+-spec refused_at([binary()], non_neg_integer(), non_neg_integer(), nhttp_ws:ws_decoder()) ->
+    boolean().
+refused_at([], _Offset, _Pos, _Dec) ->
+    false;
+refused_at([Chunk | Rest], Offset, Pos, Dec) ->
+    End = Pos + byte_size(Chunk),
+    case {nhttp_ws:feed(Chunk, Dec), Offset < End} of
+        {{ok, _Msgs, Dec1}, false} -> refused_at(Rest, Offset, End, Dec1);
+        {{error, invalid_utf8, _Msgs}, true} -> true;
+        {Other, Carries} ->
+            ct:pal("chunk at ~p carries the byte: ~p, result ~P", [Pos, Carries, Other, 8]),
+            false
     end.
 
 -spec prop_decode_never_crashes() -> triq:property().
