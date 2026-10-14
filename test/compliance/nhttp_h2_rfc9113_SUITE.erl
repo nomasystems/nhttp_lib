@@ -50,6 +50,8 @@ groups() ->
         ]},
         {section_5_streams, [parallel], [
             data_on_idle_stream_is_connection_error,
+            client_data_on_idle_stream_is_connection_error,
+            data_after_rst_stream_is_discarded_and_credited,
             headers_on_half_closed_remote_is_stream_error,
             rst_stream_on_idle_stream_is_connection_error,
             window_update_on_idle_stream_is_connection_error,
@@ -76,6 +78,10 @@ groups() ->
             padded_data_credits_its_padding,
             padded_data_counts_against_the_window,
             padded_data_credit_matches_every_pad_length,
+            discarded_data_counts_against_the_window,
+            data_on_half_closed_remote_credits_the_connection,
+            data_over_stream_window_credits_the_connection,
+            content_length_mismatch_credits_the_connection,
             goaway_transitions_to_closing
         ]},
         {section_8_http_semantics, [parallel], [
@@ -209,6 +215,32 @@ data_on_idle_stream_is_connection_error(_Config) ->
     {ok, DataFrame} = nhttp_h2_frame:data(1, fin, <<"hello">>),
     {error, {connection_error, protocol_error, _}} =
         nhttp_h2:recv(Conn0, iolist_to_binary(DataFrame)),
+    ok.
+
+%% A stream id at or above the next one the client opens, or an even one,
+%% names a stream that never existed.
+client_data_on_idle_stream_is_connection_error(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
+    {ok, Even} = nhttp_h2_frame:data(2, fin, <<"x">>),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn2, iolist_to_binary(Even)),
+    {ok, Next} = nhttp_h2_frame:data(StreamId + 2, fin, <<"x">>),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn2, iolist_to_binary(Next)),
+    ok.
+
+%% RFC 9113 Section 5.1: DATA that the peer sent before it saw our
+%% RST_STREAM is discarded, and Section 6.9 still counts it against the
+%% connection window. The codec returns that credit, answers with no
+%% RST_STREAM, and the connection stays up.
+data_after_rst_stream_is_discarded_and_credited(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
+    {ok, Conn3, _} = nhttp_h2:send_rst_stream(Conn2, StreamId, cancel),
+    Late = <<10:24, 16#00:8, 16#08:8, 0:1, StreamId:31, 3:8, "late!!", 0, 0, 0>>,
+    {ok, [], _Conn4, Out} = nhttp_h2:recv(Conn3, Late),
+    ?assertEqual({ok, [{window_update, 10}], 13}, nhttp_h2_frame:decode_all(iolist_to_binary(Out))),
     ok.
 
 headers_on_half_closed_remote_is_stream_error(_Config) ->
@@ -540,6 +572,72 @@ padded_data_credit_matches_every_pad_length(_Config) ->
             )
         end,
         lists:seq(0, 255)
+    ),
+    ok.
+
+%% RFC 9113 Section 6.9: discarded DATA still counts against the
+%% connection window. DATA on a reset stream that exceeds what is left of
+%% the window is a FLOW_CONTROL_ERROR, not a frame to ignore.
+discarded_data_counts_against_the_window(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, Open, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, Open, minimal_request_headers(), fin),
+    {ok, Reset, Conn3} = nhttp_h2:open_stream(Conn2),
+    {ok, Conn4, _} = nhttp_h2:send_headers(Conn3, Reset, minimal_request_headers(), fin),
+    {ok, Conn5, _} = nhttp_h2:send_rst_stream(Conn4, Reset, cancel),
+    {ok, Resp} = nhttp_h2_frame:headers(Open, nofin, fin, encode_headers([{<<":status">>, <<"200">>}])),
+    {ok, Full} = nhttp_h2_frame:data(Open, nofin, binary:copy(<<"x">>, 16384)),
+    {ok, _, Conn6} = nhttp_h2:recv(Conn5, iolist_to_binary([Resp, Full, Full, Full])),
+    {ok, Late} = nhttp_h2_frame:data(Reset, fin, binary:copy(<<"y">>, 16384)),
+    {error, {connection_error, flow_control_error, _}} =
+        nhttp_h2:recv(Conn6, iolist_to_binary(Late)),
+    ok.
+
+%% DATA after the peer's END_STREAM is a STREAM_CLOSED stream error
+%% (Section 5.1), and its octets still count against the connection
+%% window (Section 6.9): the RST_STREAM goes out with the credit.
+data_on_half_closed_remote_credits_the_connection(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, fin, fin, encode_headers(minimal_request_headers())),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, D} = nhttp_h2_frame:data(1, nofin, <<"extra">>),
+    {ok, [], _Conn2, Out} = nhttp_h2:recv(Conn1, iolist_to_binary(D)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, stream_closed}, {window_update, 5}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    ok.
+
+%% DATA that exceeds the stream window but fits the connection window is
+%% a FLOW_CONTROL_ERROR stream error (Section 6.9). The connection window
+%% was charged, so the RST_STREAM goes out with the credit.
+data_over_stream_window_credits_the_connection(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_window_update(Conn1, connection, 100000),
+    {ok, Full} = nhttp_h2_frame:data(1, nofin, binary:copy(<<"x">>, 16384)),
+    {ok, Events, _Conn3, Out} = nhttp_h2:recv(Conn2, iolist_to_binary([Full, Full, Full, Full])),
+    ?assertEqual(3, length(Events)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, flow_control_error}, {window_update, 16384}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    ok.
+
+%% A Content-Length mismatch is a PROTOCOL_ERROR stream error (Section
+%% 8.1.1), and the octets of the frame that revealed it still count
+%% against the connection window.
+content_length_mismatch_credits_the_connection(_Config) ->
+    Conn0 = server_with_preface(),
+    HeaderBlock = encode_headers(minimal_request_headers() ++ [{<<"content-length">>, <<"10">>}]),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, HeaderBlock),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, D} = nhttp_h2_frame:data(1, fin, <<"short">>),
+    {ok, [], _Conn2, Out} = nhttp_h2:recv(Conn1, iolist_to_binary(D)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, protocol_error}, {window_update, 5}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
     ),
     ok.
 
