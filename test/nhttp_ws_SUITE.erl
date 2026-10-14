@@ -119,6 +119,9 @@ decoding, and stateful fragmentation for both server and client roles.
     session_broadcast_to_session/1,
     session_broadcast_to_pid/1,
     session_is_alive/1,
+    session_direct_send_from_non_owner/1,
+    session_direct_send_gone_after_close/1,
+    session_h1_without_socket_routes_to_conn/1,
     feed_empty_input/1,
     feed_header_split_at_every_boundary_unmasked/1,
     feed_header_split_at_every_boundary_masked/1,
@@ -143,6 +146,7 @@ decoding, and stateful fragmentation for both server and client roles.
     feed_length_top_bit_refused/1,
     feed_expected_continuation/1,
     feed_close_frame_validated/1,
+    feed_frame_pending/1,
     feed_16mib_binary_in_16kib_chunks/1,
     feed_16mib_text_in_16kib_chunks/1
 ]).
@@ -279,7 +283,10 @@ groups() ->
             session_close_envelope,
             session_broadcast_to_session,
             session_broadcast_to_pid,
-            session_is_alive
+            session_is_alive,
+            session_direct_send_from_non_owner,
+            session_direct_send_gone_after_close,
+            session_h1_without_socket_routes_to_conn
         ]},
         {feed, [parallel], [
             feed_empty_input,
@@ -305,7 +312,8 @@ groups() ->
             feed_reserved_bits_refused,
             feed_length_top_bit_refused,
             feed_expected_continuation,
-            feed_close_frame_validated
+            feed_close_frame_validated,
+            feed_frame_pending
         ]},
         {feed_timing, [], [
             feed_16mib_binary_in_16kib_chunks,
@@ -956,6 +964,52 @@ session_is_alive(_Config) ->
     SessDead = make_session(h1, Probe, undefined),
     ?assertNot(nhttp_ws:is_alive(SessDead)).
 
+session_direct_send_from_non_owner(_Config) ->
+    {Server, Client} = tcp_pair(),
+    Sess = nhttp_ws:new_session(h1, dead_pid(), undefined, make_ref(), {tcp, Server}),
+    ?assertEqual(h1, nhttp_ws:transport(Sess)),
+    ?assertEqual(undefined, nhttp_ws:stream_id(Sess)),
+    Owner = self(),
+    Sender = spawn_probe(fun() ->
+        Sent = nhttp_ws:send(Sess, {text, <<"hi">>}),
+        SentAsync = nhttp_ws:send_async(Sess, {binary, <<1, 2, 3>>}),
+        Owner ! {sent, Sent, SentAsync}
+    end),
+    ?assertEqual({sent, ok, ok}, await({sent, ok, ok}, 1000)),
+    Expected = <<16#81, 2, "hi", 16#82, 3, 1, 2, 3>>,
+    ?assertEqual({ok, Expected}, gen_tcp:recv(Client, byte_size(Expected), 1000)),
+    stop_probe(Sender),
+    ok = gen_tcp:close(Server),
+    ok = gen_tcp:close(Client).
+
+session_direct_send_gone_after_close(_Config) ->
+    {Server, Client} = tcp_pair(),
+    Sess = nhttp_ws:new_session(h1, dead_pid(), undefined, make_ref(), {tcp, Server}),
+    ?assertEqual(ok, nhttp_ws:send(Sess, ping)),
+    ok = gen_tcp:close(Server),
+    ?assertEqual({error, gone}, nhttp_ws:send(Sess, {text, <<"late">>})),
+    ?assertEqual({error, gone}, nhttp_ws:send_async(Sess, {text, <<"late">>})),
+    ok = gen_tcp:close(Client).
+
+session_h1_without_socket_routes_to_conn(_Config) ->
+    Owner = self(),
+    Probe = spawn_probe(fun() ->
+        receive
+            {'$gen_call', From1, {ws_send, _, undefined, {text, <<"a">>}}} ->
+                gen_server:reply(From1, ok)
+        end,
+        receive
+            {'$gen_call', From2, {ws_send_async, _, undefined, {text, <<"b">>}}} ->
+                gen_server:reply(From2, {error, would_block})
+        end,
+        Owner ! routed
+    end),
+    Sess = make_session(h1, Probe, undefined, make_ref()),
+    ?assertEqual(ok, nhttp_ws:send(Sess, {text, <<"a">>})),
+    ?assertEqual({error, would_block}, nhttp_ws:send_async(Sess, {text, <<"b">>})),
+    ?assertEqual(routed, await(routed, 1000)),
+    stop_probe(Probe).
+
 %%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
@@ -1012,6 +1066,22 @@ make_session(Transport, Pid, StreamId) ->
     nhttp_ws:session().
 make_session(Transport, Pid, StreamId, Ref) ->
     nhttp_ws:new_session(Transport, Pid, StreamId, Ref).
+
+-spec tcp_pair() -> {gen_tcp:socket(), gen_tcp:socket()}.
+tcp_pair() ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {ip, loopback}]),
+    {ok, Port} = inet:port(Listen),
+    {ok, Client} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
+    {ok, Server} = gen_tcp:accept(Listen, 1000),
+    ok = gen_tcp:close(Listen),
+    {Server, Client}.
+
+-spec dead_pid() -> pid().
+dead_pid() ->
+    {Pid, MRef} = spawn_monitor(fun() -> ok end),
+    receive
+        {'DOWN', MRef, process, Pid, _} -> Pid
+    end.
 
 -spec await(term(), timeout()) -> term() | no_return().
 await(Expected, Timeout) ->
@@ -1325,6 +1395,21 @@ feed_close_frame_validated(_Config) ->
         {ok, [{close, 1000, <<"ok">>}], _},
         nhttp_ws:feed(<<16#88, 4, 1000:16, "ok">>, nhttp_ws:decoder_new(client))
     ).
+
+feed_frame_pending(_Config) ->
+    Dec0 = nhttp_ws:decoder_new(server),
+    ?assertNot(nhttp_ws:frame_pending(Dec0)),
+    Frame = server_frame(0, 2, payload(300), <<1, 2, 3, 4>>),
+    {Head, Tail} = split_binary(Frame, 1),
+    {ok, [], Dec1} = nhttp_ws:feed(Head, Dec0),
+    ?assert(nhttp_ws:frame_pending(Dec1)),
+    {Mid, Last} = split_binary(Tail, 100),
+    {ok, [], Dec2} = nhttp_ws:feed(Mid, Dec1),
+    ?assert(nhttp_ws:frame_pending(Dec2)),
+    {ok, [], Dec3} = nhttp_ws:feed(Last, Dec2),
+    ?assertNot(nhttp_ws:frame_pending(Dec3)),
+    {ok, [{binary, _}], Dec4} = nhttp_ws:feed(server_frame(1, 0, <<"end">>, <<5, 6, 7, 8>>), Dec3),
+    ?assertNot(nhttp_ws:frame_pending(Dec4)).
 
 feed_16mib_binary_in_16kib_chunks(_Config) ->
     Payload = binary:copy(<<"0123456789abcdef">>, ?MIB16 div 16),

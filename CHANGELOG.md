@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before it.
 - `nhttp_ws_frame:decode_header/3`, `unmask_from/3` and
   `validate_control_header/3`.
+- `nhttp_ws:frame_pending/1`. It tells if a `feed/2` decoder holds part of a
+  frame.
+- `nhttp_ws:new_session/5`, an HTTP/1.1 session that holds the socket.
+
+### Changed
+
+- `nhttp_ws:send/2,3` and `send_async/2` on a session from `new_session/5`
+  write to the socket from the caller, not through the connection process.
 
 ### Deprecated
 
