@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64 bit payload length with the most significant bit set (RFC 6455 §5.2) at
   the header, with `{error, decode_failed}`. Before, they returned `{more, N}`
   until the whole frame arrived.
+- `nhttp_h2:recv/2` counts DATA padding against the receive windows and
+  credits it back (RFC 9113 Section 6.1). Before, the padding leaked from
+  the peer send window, and a peer that pads every response, such as FCM,
+  stalled the connection.
 
 ## [1.2.1]
 

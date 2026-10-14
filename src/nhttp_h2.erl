@@ -1,66 +1,46 @@
 -module(nhttp_h2).
 
 -moduledoc """
-HTTP/2 protocol layer.
-
-This module implements RFC 9113 HTTP/2 connection and stream state machines.
-It sits between the framing layer (nhttp_h2_frame) and the application layer,
-providing:
-
-- Connection lifecycle management (preface, settings, shutdown)
-- Stream state machine (RFC 9113 Section 5.1)
-- Flow control (connection and stream level)
-- Header block assembly (CONTINUATION handling)
-- Error handling (connection vs stream errors)
-- Stream turnover accounting (RFC 9113 Section 10.5)
+HTTP/2 connection and stream state machine (RFC 9113), between
+`nhttp_h2_frame` and the application. It spawns no process. Each call
+takes a `t:conn/0` and returns the next one with the iodata to write.
 
 ## Usage
 
 ```erlang
 Conn0 = nhttp_h2:new(client),
-Preface = nhttp_h2:preface(Conn0),
-ok = ssl:send(Socket, Preface),
-
-{ok, Events, Conn1} = nhttp_h2:recv(Conn0, Data),
-lists:foreach(fun handle_event/1, Events),
-
-{ok, Conn2, Frames} = nhttp_h2:send_headers(Conn1, StreamId, Headers, fin),
-ok = ssl:send(Socket, Frames).
+ok = ssl:send(Socket, nhttp_h2:preface(Conn0)),
+{ok, Conn1, Frames} = nhttp_h2:send_headers(Conn0, StreamId, Headers, fin),
+ok = ssl:send(Socket, Frames),
+case nhttp_h2:recv(Conn1, Data) of
+    {ok, Events, Conn2} -> handle(Events, Conn2);
+    {ok, Events, Conn2, Out} -> ok = ssl:send(Socket, Out), handle(Events, Conn2);
+    {error, Reason} -> {error, Reason}
+end.
 ```
 
-## Sending bodies and trailers
+## Sending a message
 
-The HTTP/2 send surface is frame-oriented. The canonical
-`t:nhttp_lib:request/0` and `t:nhttp_lib:response/0` maps can carry a `body`
-and `trailers` field as a convenience for "everything is in memory", but
-this layer does not consume those maps directly: the caller breaks the
-exchange into discrete frame sends. The pattern is:
+Call `send_headers/4` with `nofin`, then `send_data/4` per chunk. Close the
+stream with `fin` on the last `send_data/4` or on a trailer `send_headers/4`.
+This module does not read the `body` and `trailers` keys of
+`t:nhttp_lib:request/0`.
 
-1. `send_headers(Conn, StreamId, Headers, nofin)` to emit pseudo-headers
-   plus regular headers (HEADERS + optional CONTINUATION).
-2. Zero or more `send_data(Conn, StreamId, Chunk, nofin)` calls.
-3. Either `send_data(Conn, StreamId, FinalChunk, fin)` to close on body,
-   or `send_headers(Conn, StreamId, Trailers, fin)` to close on trailers.
+## Receive flow control
 
-For a one-shot send when the body is already a single `iodata()`, call
-`send_headers/4` with `nofin` followed by `send_data/4` with `fin`.
-Flow-control and END_STREAM ride on the DATA frame.
+A DATA frame counts against the receive windows with its padding (RFC 9113
+Section 6.1). The caller credits the data of each `data` event with
+`send_window_update/3`. `recv/2` credits the padding itself.
 
 ## Send queue
 
-With `send_queue => true`, `send_data/4` holds what the credit cannot
-take and answers `{queued, Conn, Frames, Buffered}`. `recv/2` emits the
-held octets as credit arrives, after its control frames, round-robin
-with one frame per stream per turn, and reports
-`{data_sent, StreamId, Bytes, Fin}` per stream. The caller MUST write
-every iodata the codec returns, in order, from one process.
-
-`max_send_buffer` (128 KiB) and `max_queued_streams` (a quarter of the
-peer `SETTINGS_MAX_CONCURRENT_STREAMS`) refuse an offer as
-`{error, send_buffer_full}`. RST_STREAM in either direction and GOAWAY
-purge the queue without restoring credit. A queued `fin` leaves the
-stream `open` until the frame goes out, and `send_headers/4` behind
-queued data answers `{error, {data_pending, StreamId}}`.
+With `send_queue => true`, `recv/2` sends what `send_data/4` queued as credit
+arrives, after its control frames, one frame per stream per turn. The caller
+MUST write every iodata the codec returns, in order, from one process.
+`max_send_buffer` defaults to 128 KiB and `max_queued_streams` to a quarter
+of the peer `SETTINGS_MAX_CONCURRENT_STREAMS`. RST_STREAM and GOAWAY drop the
+queue without restoring credit. A queued `fin` keeps the stream `open` until
+its frame goes out.
 """.
 
 -include("nhttp_msg.hrl").
@@ -242,6 +222,10 @@ stream in this call, with `Fin` `fin` when the END_STREAM frame went out.
     {ok, conn(), [event()], iodata()}
     | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
     | {error, nhttp_h2_frame:decode_error()}.
+
+-type frame() ::
+    nhttp_h2_frame:t()
+    | {data, nhttp_lib:stream_id(), fin(), Payload :: binary(), FlowLength :: non_neg_integer()}.
 
 -doc """
 Reasons a send function refuses a call.
@@ -1584,9 +1568,9 @@ process_continuation(#h2_conn{continuation_stream = Expected}, StreamId, _EndHea
             <<"CONTINUATION for stream ", (integer_to_binary(StreamId))/binary,
                 " while expecting stream ", (integer_to_binary(Expected))/binary>>}}.
 
--spec process_data(conn(), nhttp_lib:stream_id(), fin(), binary()) ->
+-spec process_data(conn(), nhttp_lib:stream_id(), fin(), binary(), non_neg_integer()) ->
     {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
-process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload) ->
+process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload, FlowLength) ->
     case maps:get(StreamId, Streams, undefined) of
         undefined ->
             {error,
@@ -1598,8 +1582,8 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload) -
                 ok ->
                     DataLen = byte_size(Payload),
                     NewRecvBodyLen = RecvBodyLen + DataLen,
-                    NewConnWindow = Conn#h2_conn.recv_window - DataLen,
-                    NewStreamWindow = Stream#h2_stream.recv_window - DataLen,
+                    NewConnWindow = Conn#h2_conn.recv_window - FlowLength,
+                    NewStreamWindow = Stream#h2_stream.recv_window - FlowLength,
                     case validate_recv_flow(NewConnWindow, NewStreamWindow, StreamId) of
                         ok ->
                             case
@@ -1625,8 +1609,11 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload) -
                                         recv_window = NewConnWindow,
                                         active_stream_count = NewActiveCount
                                     },
+                                    {CreditedConn, PaddingCredit} = credit_padding(
+                                        NewConn, StreamId, EndStream, FlowLength - DataLen
+                                    ),
                                     Events = [{data, StreamId, Payload, EndStream}],
-                                    {ok, NewConn, Events, []};
+                                    {ok, CreditedConn, Events, PaddingCredit};
                                 {error, content_length_mismatch} ->
                                     {error,
                                         {stream_error, StreamId, protocol_error,
@@ -1640,7 +1627,25 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload) -
             end
     end.
 
--spec process_frame(conn(), nhttp_h2_frame:t()) -> frame_result().
+-spec credit_padding(conn(), nhttp_lib:stream_id(), fin(), non_neg_integer()) ->
+    {conn(), iodata()}.
+credit_padding(Conn, _StreamId, _EndStream, 0) ->
+    {Conn, []};
+credit_padding(Conn, _StreamId, fin, Padding) ->
+    {ok, Conn1, ConnCredit} = send_window_update(Conn, connection, Padding),
+    {Conn1, ConnCredit};
+credit_padding(Conn, StreamId, nofin, Padding) ->
+    {ok, Conn1, ConnCredit} = send_window_update(Conn, connection, Padding),
+    {ok, Conn2, StreamCredit} = send_window_update(Conn1, StreamId, Padding),
+    {Conn2, [ConnCredit, StreamCredit]}.
+
+-spec with_flow_length(nhttp_h2_frame:t(), binary()) -> frame().
+with_flow_length({data, StreamId, EndStream, Payload}, <<FlowLength:24, _/binary>>) ->
+    {data, StreamId, EndStream, Payload, FlowLength};
+with_flow_length(Frame, _Data) ->
+    Frame.
+
+-spec process_frame(conn(), frame()) -> frame_result().
 process_frame(#h2_conn{continuation_stream = ExpectedId}, Frame) when
     ExpectedId =/= undefined,
     not (is_tuple(Frame) andalso
@@ -1744,8 +1749,8 @@ process_frame(#h2_conn{} = Conn, {goaway, LastStreamId, ErrorCode, DebugData}) -
     {ok, NewConn, [{goaway, LastStreamId, ErrorCode, DebugData}], []};
 process_frame(#h2_conn{} = Conn, {rst_stream, StreamId, ErrorCode}) ->
     process_rst_stream(Conn, StreamId, ErrorCode);
-process_frame(#h2_conn{} = Conn, {data, StreamId, EndStream, Payload}) ->
-    process_data(Conn, StreamId, EndStream, Payload);
+process_frame(#h2_conn{} = Conn, {data, StreamId, EndStream, Payload, FlowLength}) ->
+    process_data(Conn, StreamId, EndStream, Payload, FlowLength);
 process_frame(#h2_conn{} = Conn, {headers, StreamId, EndStream, EndHeaders, HeaderBlock}) ->
     process_headers(Conn, StreamId, EndStream, EndHeaders, HeaderBlock);
 process_frame(
@@ -1898,7 +1903,7 @@ recv_loop(Conn, Data, EventsAcc, ToSend) ->
     case nhttp_h2_frame:decode(Data, MaxFrameSize) of
         {ok, Frame, Consumed} ->
             Rest = nhttp_h2_frame:split_at(Data, Consumed),
-            case process_frame(Conn, Frame) of
+            case process_frame(Conn, with_flow_length(Frame, Data)) of
                 {ok, NewConn, [], []} ->
                     recv_loop(NewConn, Rest, EventsAcc, ToSend);
                 {ok, NewConn, NewEvents, []} ->
