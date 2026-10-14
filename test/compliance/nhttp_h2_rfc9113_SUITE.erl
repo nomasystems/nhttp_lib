@@ -73,6 +73,9 @@ groups() ->
             ping_ack_echoes_payload,
             connection_window_overflow_is_connection_error,
             stream_window_overflow_is_stream_error,
+            padded_data_credits_its_padding,
+            padded_data_counts_against_the_window,
+            padded_data_credit_matches_every_pad_length,
             goaway_transitions_to_closing
         ]},
         {section_8_http_semantics, [parallel], [
@@ -479,6 +482,65 @@ stream_window_overflow_is_stream_error(_Config) ->
     {ok, _Events, _Conn2, OutData} = Result,
     {ok, {rst_stream, 1, flow_control_error}, _} =
         nhttp_h2_frame:decode(iolist_to_binary(OutData)),
+    ok.
+
+%% RFC 9113 Section 6.1: the Pad Length field and the padding count
+%% against flow control. No caller ever sees the padding, so the codec
+%% returns its credit in the same recv/2 call: on the connection always,
+%% and on the stream while the peer can still send on it.
+padded_data_credits_its_padding(_Config) ->
+    Conn0 = server_with_preface(),
+    HeaderBlock = encode_headers(minimal_request_headers()),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, HeaderBlock),
+    {ok, H3} = nhttp_h2_frame:headers(3, nofin, fin, HeaderBlock),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary([H1, H3])),
+    Open = <<8:24, 16#00:8, 16#08:8, 0:1, 1:31, 5:8, "ab", 0, 0, 0, 0, 0>>,
+    {ok, [{data, 1, <<"ab">>, nofin}], Conn2, OpenOut} = nhttp_h2:recv(Conn1, Open),
+    ?assertEqual(
+        {ok, [{window_update, 6}, {window_update, 1, 6}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(OpenOut))
+    ),
+    Last = <<4:24, 16#00:8, 16#09:8, 0:1, 3:31, 2:8, "c", 0, 0>>,
+    {ok, [{data, 3, <<"c">>, fin}], _Conn3, LastOut} = nhttp_h2:recv(Conn2, Last),
+    ?assertEqual(
+        {ok, [{window_update, 3}], 13},
+        nhttp_h2_frame:decode_all(iolist_to_binary(LastOut))
+    ),
+    ok.
+
+%% RFC 9113 Sections 6.1 and 6.9: a padded DATA frame whose payload,
+%% padding included, exceeds the connection window is a FLOW_CONTROL_ERROR,
+%% even when its data alone would fit.
+padded_data_counts_against_the_window(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, Full} = nhttp_h2_frame:data(1, nofin, binary:copy(<<"x">>, 16384)),
+    {ok, Events, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary([H1, Full, Full, Full])),
+    ?assertEqual(3, length([D || {data, 1, _, nofin} = D <- Events])),
+    OverByPadding =
+        <<16384:24, 16#00:8, 16#08:8, 0:1, 1:31, 1:8, (binary:copy(<<"y">>, 16382))/binary, 0>>,
+    {error, {connection_error, flow_control_error, _}} = nhttp_h2:recv(Conn1, OverByPadding),
+    ok.
+
+%% Every Pad Length from 0 to 255: the codec reports the data alone and
+%% returns exactly the Pad Length field plus the padding, so a PADDED
+%% frame with a Pad Length of 0 still returns its one octet.
+padded_data_credit_matches_every_pad_length(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    lists:foreach(
+        fun(PadLength) ->
+            Len = 1 + 1 + PadLength,
+            Frame = <<Len:24, 16#00:8, 16#08:8, 0:1, 1:31, PadLength:8, "d", 0:(PadLength * 8)>>,
+            {ok, [{data, 1, <<"d">>, nofin}], _Conn, Out} = nhttp_h2:recv(Conn1, Frame),
+            ?assertEqual(
+                {ok, [{window_update, PadLength + 1}, {window_update, 1, PadLength + 1}], 26},
+                nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+            )
+        end,
+        lists:seq(0, 255)
+    ),
     ok.
 
 goaway_transitions_to_closing(_Config) ->
