@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credits it back (RFC 9113 Section 6.1). Before, the padding leaked from
   the peer send window, and a peer that pads every response, such as FCM,
   stalled the connection.
+- `nhttp_h2:recv/2` discards DATA on a closed stream (RFC 9113 Section 5.1).
+  Before, a late response to a cancelled request closed the connection.
+- `nhttp_h2:recv/2` credits back the connection window of DATA that no
+  stream takes (RFC 9113 Section 6.9). Before, each such frame shrank the
+  peer window for good.
 
 ## [1.2.1]
 

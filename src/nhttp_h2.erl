@@ -32,6 +32,13 @@ A DATA frame counts against the receive windows with its padding (RFC 9113
 Section 6.1). The caller credits the data of each `data` event with
 `send_window_update/3`. `recv/2` credits the padding itself.
 
+DATA that no stream takes still counts against the connection window
+(RFC 9113 Section 6.9), and `recv/2` returns that credit at once. DATA on
+a stream that this connection opened and closed is discarded. DATA after
+the peer `END_STREAM`, past the stream window, or against the
+Content-Length is a stream error, and the credit follows the RST_STREAM.
+DATA on an idle stream is a connection error.
+
 ## Send queue
 
 With `send_queue => true`, `recv/2` sends what `send_data/4` queued as credit
@@ -1573,9 +1580,14 @@ process_continuation(#h2_conn{continuation_stream = Expected}, StreamId, _EndHea
 process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload, FlowLength) ->
     case maps:get(StreamId, Streams, undefined) of
         undefined ->
-            {error,
-                {connection_error, protocol_error,
-                    <<"DATA frame on unknown stream (RFC 9113 Section 6.1)">>}};
+            case was_opened(Conn, StreamId) of
+                true ->
+                    discard_data(Conn, FlowLength);
+                false ->
+                    {error,
+                        {connection_error, protocol_error,
+                            <<"DATA frame on idle stream (RFC 9113 Section 5.1)">>}}
+            end;
         #h2_stream{state = State, content_length = ContentLength, recv_body_length = RecvBodyLen} =
                 Stream ->
             case validate_recv_data(State) of
@@ -1615,16 +1627,45 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload, F
                                     Events = [{data, StreamId, Payload, EndStream}],
                                     {ok, CreditedConn, Events, PaddingCredit};
                                 {error, content_length_mismatch} ->
-                                    {error,
-                                        {stream_error, StreamId, protocol_error,
-                                            <<"Content-Length mismatch (RFC 9113 Section 8.1.2.6)">>}}
+                                    reject_data(Conn, StreamId, protocol_error, FlowLength)
                             end;
-                        {error, _} = FlowError ->
+                        {error, {stream_error, StreamId, flow_control_error, _Reason}} ->
+                            reject_data(Conn, StreamId, flow_control_error, FlowLength);
+                        {error, {connection_error, flow_control_error, _Reason}} = FlowError ->
                             FlowError
                     end;
-                {error, Reason} ->
-                    {error, {stream_error, StreamId, stream_closed, Reason}}
+                {error, _Reason} ->
+                    reject_data(Conn, StreamId, stream_closed, FlowLength)
             end
+    end.
+
+-spec was_opened(conn(), nhttp_lib:stream_id()) -> boolean().
+was_opened(#h2_conn{role = client, next_stream_id = NextId}, StreamId) ->
+    StreamId band 1 =:= 1 andalso StreamId < NextId;
+was_opened(#h2_conn{role = server, last_peer_stream_id = LastPeer}, StreamId) ->
+    StreamId band 1 =:= 1 andalso StreamId =< LastPeer.
+
+-spec discard_data(conn(), non_neg_integer()) ->
+    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+discard_data(#h2_conn{recv_window = Window}, FlowLength) when FlowLength > Window ->
+    {error,
+        {connection_error, flow_control_error,
+            <<"DATA exceeds connection flow-control window (RFC 9113 Section 6.9)">>}};
+discard_data(Conn, 0) ->
+    {ok, Conn, [], []};
+discard_data(#h2_conn{recv_window = Window} = Conn, FlowLength) ->
+    {ok, Credited, Credit} = send_window_update(
+        Conn#h2_conn{recv_window = Window - FlowLength}, connection, FlowLength
+    ),
+    {ok, Credited, [], Credit}.
+
+-spec reject_data(conn(), nhttp_lib:stream_id(), error_code(), non_neg_integer()) ->
+    {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
+reject_data(Conn, StreamId, ErrorCode, FlowLength) ->
+    maybe
+        {ok, Credited, [], Credit} ?= discard_data(Conn, FlowLength),
+        {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
+        {ok, close_stream(Credited, StreamId), [], [RstFrame, Credit]}
     end.
 
 -spec credit_padding(conn(), nhttp_lib:stream_id(), fin(), non_neg_integer()) ->
