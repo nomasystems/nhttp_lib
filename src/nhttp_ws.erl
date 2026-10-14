@@ -75,8 +75,9 @@ for backwards compatibility.
 %% STATEFUL DECODING (FRAGMENTATION + INTERLEAVED CONTROL FRAMES)
 %%%-----------------------------------------------------------------------------
 -export([
-    decode_with_state/2, decoder_new/1, decoder_new/2, feed/2
+    decode_with_state/2, decoder_new/1, decoder_new/2, feed/2, frame_pending/1
 ]).
+-deprecated([{decode_with_state, 2, "use feed/2 instead"}]).
 
 %%%-----------------------------------------------------------------------------
 %% SESSION CONSTRUCTOR + ACCESSORS
@@ -85,6 +86,7 @@ for backwards compatibility.
     is_alive/1,
     new_session/3,
     new_session/4,
+    new_session/5,
     owner/1,
     session_ref/1,
     stream_id/1,
@@ -210,7 +212,8 @@ for backwards compatibility.
     transport :: h1 | h2 | h3,
     conn_pid :: pid(),
     stream_id :: undefined | nhttp_lib:stream_id(),
-    ref :: reference()
+    ref :: reference(),
+    socket :: nhttp_sock:t() | undefined
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -514,6 +517,14 @@ before the violation. Do not mix with `decode_with_state/2` on one decoder.
 feed(Data, Dec) ->
     feed(Data, Dec, []).
 
+-doc """
+Return `true` while the decoder holds the bytes of a frame that is not
+complete. A fragmented message between two complete frames is not pending.
+""".
+-spec frame_pending(ws_decoder()) -> boolean().
+frame_pending(#ws_decoder{partial = undefined, header_carry = <<>>}) -> false;
+frame_pending(#ws_decoder{}) -> true.
+
 %%%-----------------------------------------------------------------------------
 %% SESSION CONSTRUCTOR + ACCESSORS
 %%%-----------------------------------------------------------------------------
@@ -547,6 +558,17 @@ new_session(Transport, ConnPid, StreamId, Ref) when
 ->
     #nhttp_ws_session{
         transport = Transport, conn_pid = ConnPid, stream_id = StreamId, ref = Ref
+    }.
+
+-doc """
+Same as `new_session/4` for HTTP/1.1. Sends write to `Socket` from the caller.
+""".
+-spec new_session(h1, pid(), undefined, reference(), nhttp_sock:t()) -> session().
+new_session(h1, ConnPid, undefined, Ref, {Kind, _} = Socket) when
+    is_pid(ConnPid), is_reference(Ref), (Kind =:= tcp orelse Kind =:= ssl)
+->
+    #nhttp_ws_session{
+        transport = h1, conn_pid = ConnPid, stream_id = undefined, ref = Ref, socket = Socket
     }.
 
 -doc "Return the connection process pid for the session.".
@@ -631,34 +653,40 @@ ping(Session, Payload) when is_binary(Payload), byte_size(Payload) =< 125 ->
     send(Session, {ping, Payload}).
 
 -doc """
-Synchronously send a WebSocket message on the session. Returns once the
-frame has cleared the per-stream flow control (or the TCP send buffer for
-HTTP/1.1) or after `Opts#timeout` ms.
-Returns `{error, gone}` if the session has been closed, `{error, timeout}`
-if the deadline elapses before the write completes, or any error reported
-by the transport.
+Send a message and wait for the write. On a `new_session/5` session the
+caller writes to the socket and `Opts` is ignored. Otherwise the connection
+process writes it within `Opts#timeout` ms. Returns `{error, gone}` once the
+session is closed.
 """.
 -spec send(session(), ws_message()) -> ok | {error, term()}.
 send(Session, Msg) ->
     send(Session, Msg, #{}).
 
 -spec send(session(), ws_message(), ws_send_opts()) -> ok | {error, term()}.
-send(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId, ref = Ref}, Msg, Opts) when
+send(
+    #nhttp_ws_session{socket = undefined, conn_pid = Pid, stream_id = StreamId, ref = Ref},
+    Msg,
+    Opts
+) when
     is_map(Opts)
 ->
     Timeout = maps:get(timeout, Opts, 5000),
-    call_conn(Pid, {ws_send, Ref, StreamId, Msg}, Timeout).
+    call_conn(Pid, {ws_send, Ref, StreamId, Msg}, Timeout);
+send(#nhttp_ws_session{socket = Socket}, Msg, Opts) when is_map(Opts) ->
+    send_direct(Socket, Msg).
 
 -doc """
-Asynchronously enqueue a WebSocket message. Returns `{error, would_block}`
-immediately if the session's outbox has crossed its high-water mark, leaving
-the caller free to drop, retry, or close. Never blocks waiting for the
-transport, only for the connection process to ack the enqueue (or reject
-it).
+Enqueue a message on the connection process, or `{error, would_block}` when
+its outbox is full. On a `new_session/5` session it is a blocking socket
+write from the caller and never returns `would_block`.
 """.
 -spec send_async(session(), ws_message()) -> ok | {error, would_block | gone | term()}.
-send_async(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId, ref = Ref}, Msg) ->
-    call_conn(Pid, {ws_send_async, Ref, StreamId, Msg}, 5000).
+send_async(
+    #nhttp_ws_session{socket = undefined, conn_pid = Pid, stream_id = StreamId, ref = Ref}, Msg
+) ->
+    call_conn(Pid, {ws_send_async, Ref, StreamId, Msg}, 5000);
+send_async(#nhttp_ws_session{socket = Socket}, Msg) ->
+    send_direct(Socket, Msg).
 
 -doc "Send a binary message.".
 -spec send_binary(session(), iodata()) -> ok | {error, term()}.
@@ -683,6 +711,16 @@ call_conn(Pid, Request, Timeout) ->
         exit:{shutdown, _} -> {error, gone};
         exit:{timeout, _} -> {error, timeout};
         exit:{Reason, _} -> {error, Reason}
+    end.
+
+-spec send_direct(nhttp_sock:t(), ws_message()) ->
+    ok | {error, gone | nhttp_sock:socket_error()}.
+send_direct(Socket, Msg) ->
+    case nhttp_sock:send(Socket, nhttp_ws_frame:encode(Msg)) of
+        ok -> ok;
+        {error, closed} -> {error, gone};
+        {error, einval} -> {error, gone};
+        {error, _} = Error -> Error
     end.
 
 -spec check_message_size(non_neg_integer(), ws_decoder()) ->
