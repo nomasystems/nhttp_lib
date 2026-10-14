@@ -268,19 +268,14 @@ decode_frame(Type, Payload) ->
 decode_settings_payload(<<>>, Settings) ->
     {ok, Settings};
 decode_settings_payload(Bin, Settings) ->
-    case nquic_varint:decode(Bin) of
-        {ok, Id, Rest0} ->
-            case nquic_varint:decode(Rest0) of
-                {ok, Value, Rest1} ->
-                    case apply_setting(Id, Value, Settings) of
-                        {ok, Settings1} -> decode_settings_payload(Rest1, Settings1);
-                        {error, _} = E -> E
-                    end;
-                {error, incomplete_binary} ->
-                    {error, h3_frame_error}
-            end;
-        {error, incomplete_binary} ->
-            {error, h3_frame_error}
+    maybe
+        {ok, Id, Rest0} ?= nquic_varint:decode(Bin),
+        {ok, Value, Rest1} ?= nquic_varint:decode(Rest0),
+        {ok, Settings1} ?= apply_setting(Id, Value, Settings),
+        decode_settings_payload(Rest1, Settings1)
+    else
+        {error, incomplete_binary} -> {error, h3_frame_error};
+        {error, h3_settings_error} = SettingsError -> SettingsError
     end.
 
 -spec encode_setting(atom(), non_neg_integer() | boolean() | infinity, iodata()) -> iodata().

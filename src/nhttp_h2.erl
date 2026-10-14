@@ -64,6 +64,12 @@ its frame goes out.
 -compile({inline, [recv_result/3]}).
 -compile({inline, [transition_on_recv_end_stream/2]}).
 -compile({inline, [transition_on_send_end_stream/2]}).
+-compile({inline, [validate_recv_data/2]}).
+-compile({inline, [validate_recv_length/4]}).
+-compile({inline, [decode_header_block/3]}).
+-compile({inline, [validate_recv_headers/2]}).
+-compile({inline, [validate_header_sequence/3]}).
+-compile({inline, [validate_decoded_headers/5]}).
 
 %%%-----------------------------------------------------------------------------
 %% INITIALIZATION
@@ -813,121 +819,78 @@ continuation_flood_error() ->
 decode_and_emit_headers(
     #h2_conn{hpack_dec = HpackDec, streams = Streams} = Conn, StreamId, EndStream, HeaderBlock
 ) ->
-    DecodeOpts = hpack_decode_opts(Conn),
     case maps:is_key(StreamId, Streams) of
         true ->
             decode_headers_internal(Conn, StreamId, EndStream, HeaderBlock);
         false ->
-            case validate_peer_stream_id(Conn, StreamId) of
-                ok ->
-                    case check_stream_concurrency(Conn) of
-                        ok ->
-                            decode_headers_internal(Conn, StreamId, EndStream, HeaderBlock);
-                        {error, at_limit} ->
-                            _ = nhttp_hpack:decode(HeaderBlock, HpackDec, DecodeOpts),
-                            {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, refused_stream),
-                            {ok, Conn, [{stream_refused, StreamId}], RstFrame}
-                    end;
-                {error, _} = Error ->
-                    _ = nhttp_hpack:decode(HeaderBlock, HpackDec, DecodeOpts),
+            maybe
+                ok ?= validate_peer_stream_id(Conn, StreamId),
+                ok ?= check_stream_concurrency(Conn),
+                decode_headers_internal(Conn, StreamId, EndStream, HeaderBlock)
+            else
+                {error, at_limit} ->
+                    _ = nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)),
+                    {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, refused_stream),
+                    {ok, Conn, [{stream_refused, StreamId}], RstFrame};
+                {error, {connection_error, _ErrorCode, _Reason}} = Error ->
+                    _ = nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)),
                     Error
             end
     end.
 
 -spec decode_headers_internal(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
 decode_headers_internal(
-    #h2_conn{role = Role, hpack_dec = HpackDec, streams = Streams} = Conn,
+    #h2_conn{role = Role, streams = Streams, local_settings = Settings} = Conn,
     StreamId,
     EndStream,
     HeaderBlock
 ) ->
-    DecodeOpts = hpack_decode_opts(Conn),
-    case nhttp_hpack:decode(HeaderBlock, HpackDec, DecodeOpts) of
-        {ok, Headers, NewHpackDec} ->
+    maybe
+        {ok, Headers, NewHpackDec} ?= decode_header_block(Conn, StreamId, HeaderBlock),
+        #h2_stream{state = OldState, headers_received = IsTrailers} =
             Stream = get_or_create_stream(Conn, StreamId),
-            StreamState = Stream#h2_stream.state,
-            case StreamState of
-                half_closed_remote ->
-                    {error,
-                        {stream_error, StreamId, stream_closed,
-                            <<"HEADERS on half-closed (remote) stream (RFC 9113 Section 5.1)">>}};
-                closed ->
-                    {error,
-                        {connection_error, stream_closed,
-                            <<"HEADERS on closed stream (RFC 9113 Section 5.1)">>}};
-                _ ->
-                    IsTrailers = Stream#h2_stream.headers_received,
-                    case IsTrailers andalso EndStream =:= nofin of
-                        true ->
-                            {error,
-                                {stream_error, StreamId, protocol_error,
-                                    <<"Second HEADERS without END_STREAM (RFC 9113 Section 8.1)">>}};
-                        false ->
-                            ValidationResult = validate_decoded_headers(
-                                Role, Headers, IsTrailers, Conn#h2_conn.local_settings
-                            ),
-                            case ValidationResult of
-                                ok ->
-                                    OldState = Stream#h2_stream.state,
-                                    NewState = transition_on_recv_headers(OldState, EndStream),
-                                    ContentLength =
-                                        case IsTrailers of
-                                            true -> Stream#h2_stream.content_length;
-                                            false -> nhttp_msg:extract_content_length(Headers)
-                                        end,
-                                    NewStream = Stream#h2_stream{
-                                        state = NewState,
-                                        header_buffer = <<>>,
-                                        header_end_stream = false,
-                                        content_length = ContentLength,
-                                        headers_received = true
-                                    },
-                                    ActiveCount = Conn#h2_conn.active_stream_count,
-                                    NewActiveCount = update_active_count_on_transition(
-                                        OldState, NewState, ActiveCount
-                                    ),
-                                    OpenedCount = Conn#h2_conn.peer_streams_opened,
-                                    NewOpenedCount = update_peer_opened_count(
-                                        Role, StreamId, OldState, NewState, OpenedCount
-                                    ),
-                                    NewConn = Conn#h2_conn{
-                                        hpack_dec = NewHpackDec,
-                                        streams = store_or_remove_stream(
-                                            Streams, StreamId, NewStream
-                                        ),
-                                        last_peer_stream_id = max(
-                                            Conn#h2_conn.last_peer_stream_id, StreamId
-                                        ),
-                                        active_stream_count = NewActiveCount,
-                                        peer_streams_opened = NewOpenedCount
-                                    },
-                                    case
-                                        build_headers_event(
-                                            Role,
-                                            IsTrailers,
-                                            StreamId,
-                                            Headers,
-                                            EndStream,
-                                            NewConn
-                                        )
-                                    of
-                                        {ok, Events} ->
-                                            {ok, NewConn, Events, []};
-                                        {error, _} ->
-                                            {error,
-                                                {stream_error, StreamId, protocol_error, <<
-                                                    "Malformed response: :status is not three "
-                                                    "digits in 100-599 (RFC 9113 Section 8.1.1, "
-                                                    "Section 8.3.2)"
-                                                >>}}
-                                    end;
-                                {error, protocol_error} ->
-                                    {error,
-                                        {stream_error, StreamId, protocol_error,
-                                            <<"Invalid header field (RFC 9113 Section 8.1)">>}}
-                            end
-                    end
-            end;
+        ok ?= validate_recv_headers(OldState, StreamId),
+        ok ?= validate_header_sequence(IsTrailers, EndStream, StreamId),
+        ok ?= validate_decoded_headers(Role, Headers, IsTrailers, Settings, StreamId),
+        NewState = transition_on_recv_headers(OldState, EndStream),
+        ContentLength =
+            case IsTrailers of
+                true -> Stream#h2_stream.content_length;
+                false -> nhttp_msg:extract_content_length(Headers)
+            end,
+        NewStream = Stream#h2_stream{
+            state = NewState,
+            header_buffer = <<>>,
+            header_end_stream = false,
+            content_length = ContentLength,
+            headers_received = true
+        },
+        ActiveCount = Conn#h2_conn.active_stream_count,
+        NewActiveCount = update_active_count_on_transition(OldState, NewState, ActiveCount),
+        OpenedCount = Conn#h2_conn.peer_streams_opened,
+        NewOpenedCount = update_peer_opened_count(
+            Role, StreamId, OldState, NewState, OpenedCount
+        ),
+        NewConn = Conn#h2_conn{
+            hpack_dec = NewHpackDec,
+            streams = store_or_remove_stream(Streams, StreamId, NewStream),
+            last_peer_stream_id = max(Conn#h2_conn.last_peer_stream_id, StreamId),
+            active_stream_count = NewActiveCount,
+            peer_streams_opened = NewOpenedCount
+        },
+        {ok, Events} ?=
+            build_headers_event(Role, IsTrailers, StreamId, Headers, EndStream, NewConn),
+        {ok, NewConn, Events, []}
+    end.
+
+-spec decode_header_block(conn(), nhttp_lib:stream_id(), binary()) ->
+    {ok, nhttp_lib:headers(), nhttp_hpack:state()}
+    | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
+    | {error, nhttp_h2_frame:decode_error()}.
+decode_header_block(#h2_conn{hpack_dec = HpackDec} = Conn, StreamId, HeaderBlock) ->
+    case nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)) of
+        {ok, _Headers, _NewHpackDec} = Decoded ->
+            Decoded;
         {invalid_field, Reason, NewHpackDec} ->
             {stream_error, Conn#h2_conn{hpack_dec = NewHpackDec}, StreamId, protocol_error,
                 invalid_field_reason(Reason)};
@@ -942,6 +905,27 @@ decode_headers_internal(
                 {connection_error, compression_error,
                     iolist_to_binary(io_lib:format("HPACK decode error: ~p", [HpackError]))}}
     end.
+
+-spec validate_recv_headers(stream_state(), nhttp_lib:stream_id()) ->
+    ok | {error, nhttp_h2_frame:decode_error()}.
+validate_recv_headers(half_closed_remote, StreamId) ->
+    {error,
+        {stream_error, StreamId, stream_closed,
+            <<"HEADERS on half-closed (remote) stream (RFC 9113 Section 5.1)">>}};
+validate_recv_headers(closed, _StreamId) ->
+    {error,
+        {connection_error, stream_closed, <<"HEADERS on closed stream (RFC 9113 Section 5.1)">>}};
+validate_recv_headers(_State, _StreamId) ->
+    ok.
+
+-spec validate_header_sequence(boolean(), fin(), nhttp_lib:stream_id()) ->
+    ok | {error, nhttp_h2_frame:decode_error()}.
+validate_header_sequence(true, nofin, StreamId) ->
+    {error,
+        {stream_error, StreamId, protocol_error,
+            <<"Second HEADERS without END_STREAM (RFC 9113 Section 8.1)">>}};
+validate_header_sequence(_IsTrailers, _EndStream, _StreamId) ->
+    ok.
 
 -spec default_settings() -> settings().
 default_settings() ->
@@ -1590,52 +1574,36 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload, F
             end;
         #h2_stream{state = State, content_length = ContentLength, recv_body_length = RecvBodyLen} =
                 Stream ->
-            case validate_recv_data(State) of
-                ok ->
-                    DataLen = byte_size(Payload),
-                    NewRecvBodyLen = RecvBodyLen + DataLen,
-                    NewConnWindow = Conn#h2_conn.recv_window - FlowLength,
-                    NewStreamWindow = Stream#h2_stream.recv_window - FlowLength,
-                    case validate_recv_flow(NewConnWindow, NewStreamWindow, StreamId) of
-                        ok ->
-                            case
-                                nhttp_msg:validate_content_length(
-                                    ContentLength, NewRecvBodyLen, EndStream
-                                )
-                            of
-                                ok ->
-                                    NewState = transition_on_recv_end_stream(State, EndStream),
-                                    NewStream = Stream#h2_stream{
-                                        state = NewState,
-                                        recv_window = NewStreamWindow,
-                                        recv_body_length = NewRecvBodyLen
-                                    },
-                                    ActiveCount = Conn#h2_conn.active_stream_count,
-                                    NewActiveCount = update_active_count_on_transition(
-                                        State, NewState, ActiveCount
-                                    ),
-                                    NewConn = Conn#h2_conn{
-                                        streams = store_or_remove_stream(
-                                            Streams, StreamId, NewStream
-                                        ),
-                                        recv_window = NewConnWindow,
-                                        active_stream_count = NewActiveCount
-                                    },
-                                    {CreditedConn, PaddingCredit} = credit_padding(
-                                        NewConn, StreamId, EndStream, FlowLength - DataLen
-                                    ),
-                                    Events = [{data, StreamId, Payload, EndStream}],
-                                    {ok, CreditedConn, Events, PaddingCredit};
-                                {error, content_length_mismatch} ->
-                                    reject_data(Conn, StreamId, protocol_error, FlowLength)
-                            end;
-                        {error, {stream_error, StreamId, flow_control_error, _Reason}} ->
-                            reject_data(Conn, StreamId, flow_control_error, FlowLength);
-                        {error, {connection_error, flow_control_error, _Reason}} = FlowError ->
-                            FlowError
-                    end;
-                {error, _Reason} ->
-                    reject_data(Conn, StreamId, stream_closed, FlowLength)
+            maybe
+                ok ?= validate_recv_data(State, StreamId),
+                DataLen = byte_size(Payload),
+                NewRecvBodyLen = RecvBodyLen + DataLen,
+                NewConnWindow = Conn#h2_conn.recv_window - FlowLength,
+                NewStreamWindow = Stream#h2_stream.recv_window - FlowLength,
+                ok ?= validate_recv_flow(NewConnWindow, NewStreamWindow, StreamId),
+                ok ?= validate_recv_length(ContentLength, NewRecvBodyLen, EndStream, StreamId),
+                NewState = transition_on_recv_end_stream(State, EndStream),
+                NewStream = Stream#h2_stream{
+                    state = NewState,
+                    recv_window = NewStreamWindow,
+                    recv_body_length = NewRecvBodyLen
+                },
+                ActiveCount = Conn#h2_conn.active_stream_count,
+                NewActiveCount = update_active_count_on_transition(State, NewState, ActiveCount),
+                NewConn = Conn#h2_conn{
+                    streams = store_or_remove_stream(Streams, StreamId, NewStream),
+                    recv_window = NewConnWindow,
+                    active_stream_count = NewActiveCount
+                },
+                {CreditedConn, PaddingCredit} = credit_padding(
+                    NewConn, StreamId, EndStream, FlowLength - DataLen
+                ),
+                {ok, CreditedConn, [{data, StreamId, Payload, EndStream}], PaddingCredit}
+            else
+                {error, {stream_error, StreamId, ErrorCode, _Reason}} ->
+                    reject_data(Conn, StreamId, ErrorCode, FlowLength);
+                {error, {connection_error, flow_control_error, _Reason}} = FlowError ->
+                    FlowError
             end
     end.
 
@@ -2046,13 +2014,27 @@ update_peer_opened_count(Role, StreamId, OldState, NewState, Count) ->
         false -> Count
     end.
 
--spec validate_decoded_headers(role(), nhttp_lib:headers(), boolean(), settings()) ->
+-spec validate_decoded_headers(
+    role(), nhttp_lib:headers(), boolean(), settings(), nhttp_lib:stream_id()
+) ->
+    ok | {error, nhttp_h2_frame:decode_error()}.
+validate_decoded_headers(Role, Headers, IsTrailers, Settings, StreamId) ->
+    case validate_section(Role, Headers, IsTrailers, Settings) of
+        ok ->
+            ok;
+        {error, protocol_error} ->
+            {error,
+                {stream_error, StreamId, protocol_error,
+                    <<"Invalid header field (RFC 9113 Section 8.1)">>}}
+    end.
+
+-spec validate_section(role(), nhttp_lib:headers(), boolean(), settings()) ->
     ok | {error, protocol_error}.
-validate_decoded_headers(_, Headers, true, _Settings) ->
+validate_section(_, Headers, true, _Settings) ->
     validate_trailers(Headers);
-validate_decoded_headers(server, Headers, false, Settings) ->
+validate_section(server, Headers, false, Settings) ->
     validate_request_headers(Headers, Settings);
-validate_decoded_headers(client, Headers, false, _Settings) ->
+validate_section(client, Headers, false, _Settings) ->
     validate_response_headers(Headers).
 
 -spec validate_peer_stream_id(conn(), nhttp_lib:stream_id()) ->
@@ -2093,10 +2075,28 @@ validate_preface_buffer(Data) ->
         _ -> invalid_preface_error()
     end.
 
--spec validate_recv_data(stream_state()) -> ok | {error, binary()}.
-validate_recv_data(open) -> ok;
-validate_recv_data(half_closed_local) -> ok;
-validate_recv_data(_) -> {error, <<"DATA on closed or half-closed stream">>}.
+-spec validate_recv_data(stream_state(), nhttp_lib:stream_id()) ->
+    ok | {error, nhttp_h2_frame:decode_error()}.
+validate_recv_data(open, _StreamId) ->
+    ok;
+validate_recv_data(half_closed_local, _StreamId) ->
+    ok;
+validate_recv_data(_State, StreamId) ->
+    {error, {stream_error, StreamId, stream_closed, <<"DATA on closed or half-closed stream">>}}.
+
+-spec validate_recv_length(
+    non_neg_integer() | undefined, non_neg_integer(), fin(), nhttp_lib:stream_id()
+) ->
+    ok | {error, nhttp_h2_frame:decode_error()}.
+validate_recv_length(ContentLength, RecvBodyLen, EndStream, StreamId) ->
+    case nhttp_msg:validate_content_length(ContentLength, RecvBodyLen, EndStream) of
+        ok ->
+            ok;
+        {error, content_length_mismatch} ->
+            {error,
+                {stream_error, StreamId, protocol_error,
+                    <<"Content-Length mismatch (RFC 9113 Section 8.1.1)">>}}
+    end.
 
 -spec validate_recv_flow(integer(), integer(), nhttp_lib:stream_id()) ->
     ok | {error, nhttp_h2_frame:decode_error()}.
@@ -2115,16 +2115,22 @@ validate_recv_flow(_ConnWindow, _StreamWindow, _StreamId) ->
 -spec build_headers_event(
     role(), boolean(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin(), conn()
 ) ->
-    {ok, [event()]} | {error, nhttp_msg:status_error()}.
+    {ok, [event()]} | {error, nhttp_h2_frame:decode_error()}.
 build_headers_event(_, true, StreamId, Headers, _Fin, _Conn) ->
     {ok, [{trailers, StreamId, Headers}]};
 build_headers_event(server, false, StreamId, Headers, Fin, Conn) ->
     Request = build_request(Conn, Headers),
     {ok, [{request, StreamId, Request, Fin}]};
 build_headers_event(client, false, StreamId, Headers, Fin, _Conn) ->
-    maybe
-        {ok, Response} ?= build_response(Headers),
-        {ok, [{response, StreamId, Response, Fin}]}
+    case build_response(Headers) of
+        {ok, Response} ->
+            {ok, [{response, StreamId, Response, Fin}]};
+        {error, _StatusError} ->
+            {error,
+                {stream_error, StreamId, protocol_error, <<
+                    "Malformed response: :status is not three digits in 100-599 "
+                    "(RFC 9113 Section 8.1.1, Section 8.3.2)"
+                >>}}
     end.
 
 -spec build_request(conn(), nhttp_lib:headers()) -> nhttp_lib:request().

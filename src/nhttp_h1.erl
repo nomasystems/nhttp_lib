@@ -2375,44 +2375,26 @@ parse_headers_acc(Bin, Acc, Count, Size, MaxSize, MaxCount) ->
     | {error, parse_error()}.
 parse_headers_acc_generic(Bin, Acc, Count, Size, MaxSize, MaxCount) ->
     case binary:split(Bin, persistent_term:get(?PT_CRLF)) of
-        [Line, Rest] ->
-            case binary:split(Line, persistent_term:get(?PT_COLON)) of
-                [Name, Value] ->
-                    case nhttp_headers:is_token(Name) of
-                        false ->
-                            {error, bad_header};
-                        true ->
-                            TrimmedValue = trim_ows(Value),
-                            case has_invalid_char(TrimmedValue) of
-                                true ->
-                                    {error, bad_header};
-                                false ->
-                                    LineSize = byte_size(Line) + 2,
-                                    NewSize = Size + LineSize,
-                                    NewCount = Count + 1,
-                                    case
-                                        check_header_limits(NewSize, MaxSize, NewCount, MaxCount)
-                                    of
-                                        ok ->
-                                            LowerName = nhttp_headers:to_lower(Name),
-                                            parse_headers_acc(
-                                                Rest,
-                                                [{LowerName, TrimmedValue} | Acc],
-                                                NewCount,
-                                                NewSize,
-                                                MaxSize,
-                                                MaxCount
-                                            );
-                                        {error, _} = Err ->
-                                            Err
-                                    end
-                            end
-                    end;
-                [_] ->
-                    {error, bad_header}
-            end;
         [_] ->
-            {more, 2}
+            {more, 2};
+        [Line, Rest] ->
+            maybe
+                [Name, Value] ?= binary:split(Line, persistent_term:get(?PT_COLON)),
+                TrimmedValue = trim_ows(Value),
+                true ?= nhttp_headers:is_token(Name) andalso not has_invalid_char(TrimmedValue),
+                NewSize = Size + byte_size(Line) + 2,
+                NewCount = Count + 1,
+                ok ?= check_header_limits(NewSize, MaxSize, NewCount, MaxCount),
+                LowerName = nhttp_headers:to_lower(Name),
+                parse_headers_acc(
+                    Rest, [{LowerName, TrimmedValue} | Acc], NewCount, NewSize, MaxSize, MaxCount
+                )
+            else
+                [_] -> {error, bad_header};
+                false -> {error, bad_header};
+                {error, header_too_large} = LimitError -> LimitError;
+                {error, too_many_headers} = LimitError -> LimitError
+            end
     end.
 
 -spec parse_one_chunk(binary(), non_neg_integer()) ->

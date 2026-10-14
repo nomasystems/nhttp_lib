@@ -796,7 +796,7 @@ clip_name(Name) ->
 -spec decode_headers(conn(), nhttp_lib:stream_id(), #h3_stream{}, binary(), boolean()) ->
     {ok, conn(), [event()], [action()]} | {error, h3_error()}.
 decode_headers(
-    #h3_conn{qpack_dec = Dec, local_decoder_stream = DecStreamId} = Conn,
+    #h3_conn{qpack_dec = Dec, local_decoder_stream = DecStreamId, role = Role} = Conn,
     StreamId,
     Stream,
     FieldSection,
@@ -805,43 +805,26 @@ decode_headers(
     case nhttp_qpack:decode_field_section(Dec, StreamId, FieldSection) of
         {ok, NewDec, DecStreamData, Headers} ->
             FinAtom = bool_to_fin(IsFinal),
-            case
-                validate_headers(
-                    Conn#h3_conn.role, Headers, false, Conn#h3_conn.local_settings
-                )
-            of
-                ok ->
-                    NewState = transition_on_recv(Stream#h3_stream.state, FinAtom),
-                    ContentLength = nhttp_msg:extract_content_length(Headers),
-                    NewStream = Stream#h3_stream{
-                        state = NewState,
-                        headers_received = true,
-                        content_length = ContentLength
-                    },
-                    NewConn0 = Conn#h3_conn{qpack_dec = NewDec},
-                    NewConn = update_stream(NewConn0, StreamId, NewStream),
-                    NewConn1 = update_last_peer_stream(NewConn, StreamId),
-                    DecActions =
-                        case iolist_size(DecStreamData) of
-                            0 -> [];
-                            _ -> [{send, DecStreamId, DecStreamData}]
-                        end,
-                    case
-                        build_initial_headers_event(
-                            Conn#h3_conn.role, StreamId, Headers, FinAtom, NewConn1
-                        )
-                    of
-                        {ok, Event} ->
-                            {ok, NewConn1, [Event], DecActions};
-                        {error, _} ->
-                            {error,
-                                {stream_error, StreamId, h3_message_error, <<
-                                    "Malformed response: :status is not three digits in "
-                                    "100-599 (RFC 9114 Section 4.1.2, Section 4.3.2)"
-                                >>}}
-                    end;
-                {error, Reason} ->
-                    {error, {stream_error, StreamId, h3_message_error, Reason}}
+            maybe
+                ok ?= validate_recv_headers(Conn, Headers, false, StreamId),
+                NewState = transition_on_recv(Stream#h3_stream.state, FinAtom),
+                ContentLength = nhttp_msg:extract_content_length(Headers),
+                NewStream = Stream#h3_stream{
+                    state = NewState,
+                    headers_received = true,
+                    content_length = ContentLength
+                },
+                NewConn0 = Conn#h3_conn{qpack_dec = NewDec},
+                NewConn = update_stream(NewConn0, StreamId, NewStream),
+                NewConn1 = update_last_peer_stream(NewConn, StreamId),
+                DecActions =
+                    case iolist_size(DecStreamData) of
+                        0 -> [];
+                        _ -> [{send, DecStreamId, DecStreamData}]
+                    end,
+                {ok, Event} ?=
+                    build_initial_headers_event(Role, StreamId, Headers, FinAtom, NewConn1),
+                {ok, NewConn1, [Event], DecActions}
             end;
         {blocked, NewDec} ->
             NewConn = Conn#h3_conn{qpack_dec = NewDec},
@@ -861,34 +844,38 @@ decode_trailers(
 ) ->
     case nhttp_qpack:decode_field_section(Dec, StreamId, FieldSection) of
         {ok, NewDec, DecStreamData, Trailers} ->
-            case
-                validate_headers(
-                    Conn#h3_conn.role, Trailers, true, Conn#h3_conn.local_settings
-                )
-            of
-                ok ->
-                    FinAtom = bool_to_fin(IsFinal),
-                    NewState = transition_on_recv(Stream#h3_stream.state, FinAtom),
-                    NewStream = Stream#h3_stream{
-                        state = NewState,
-                        trailers_received = true
-                    },
-                    NewConn0 = Conn#h3_conn{qpack_dec = NewDec},
-                    NewConn = update_stream(NewConn0, StreamId, NewStream),
-                    DecActions =
-                        case iolist_size(DecStreamData) of
-                            0 -> [];
-                            _ -> [{send, DecStreamId, DecStreamData}]
-                        end,
-                    {ok, NewConn, [{trailers, StreamId, Trailers}], DecActions};
-                {error, Reason} ->
-                    {error, {stream_error, StreamId, h3_message_error, Reason}}
+            maybe
+                ok ?= validate_recv_headers(Conn, Trailers, true, StreamId),
+                FinAtom = bool_to_fin(IsFinal),
+                NewState = transition_on_recv(Stream#h3_stream.state, FinAtom),
+                NewStream = Stream#h3_stream{
+                    state = NewState,
+                    trailers_received = true
+                },
+                NewConn0 = Conn#h3_conn{qpack_dec = NewDec},
+                NewConn = update_stream(NewConn0, StreamId, NewStream),
+                DecActions =
+                    case iolist_size(DecStreamData) of
+                        0 -> [];
+                        _ -> [{send, DecStreamId, DecStreamData}]
+                    end,
+                {ok, NewConn, [{trailers, StreamId, Trailers}], DecActions}
             end;
         {blocked, NewDec} ->
             NewConn = Conn#h3_conn{qpack_dec = NewDec},
             {ok, NewConn, [], []};
         {error, Reason} ->
             {error, qpack_decode_error(StreamId, Reason, <<"QPACK decode error">>)}
+    end.
+
+-spec validate_recv_headers(conn(), nhttp_lib:headers(), boolean(), nhttp_lib:stream_id()) ->
+    ok | {error, h3_error()}.
+validate_recv_headers(
+    #h3_conn{role = Role, local_settings = Settings}, Headers, IsTrailers, StreamId
+) ->
+    case validate_headers(Role, Headers, IsTrailers, Settings) of
+        ok -> ok;
+        {error, Reason} -> {error, {stream_error, StreamId, h3_message_error, Reason}}
     end.
 
 -spec field_octet_error
@@ -970,14 +957,20 @@ validate_section(client, Headers, false, _Settings) ->
 -define(H3_CONNECTION_HEADERS_SET, ?NHTTP_MSG_CONNECTION_HEADERS_SET).
 -spec build_initial_headers_event(
     role(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin(), conn()
-) -> {ok, event()} | {error, nhttp_msg:status_error()}.
+) -> {ok, event()} | {error, h3_error()}.
 build_initial_headers_event(server, StreamId, Headers, Fin, Conn) ->
     Request = build_request(Conn, Headers),
     {ok, {request, StreamId, Request, Fin}};
 build_initial_headers_event(client, StreamId, Headers, Fin, _Conn) ->
-    maybe
-        {ok, Response} ?= build_response(Headers),
-        {ok, {response, StreamId, Response, Fin}}
+    case build_response(Headers) of
+        {ok, Response} ->
+            {ok, {response, StreamId, Response, Fin}};
+        {error, _StatusError} ->
+            {error,
+                {stream_error, StreamId, h3_message_error, <<
+                    "Malformed response: :status is not three digits in "
+                    "100-599 (RFC 9114 Section 4.1.2, Section 4.3.2)"
+                >>}}
     end.
 
 -spec build_request(conn(), nhttp_lib:headers()) -> nhttp_lib:request().
