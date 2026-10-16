@@ -32,12 +32,14 @@ A DATA frame counts against the receive windows with its padding (RFC 9113
 Section 6.1). The caller credits the data of each `data` event with
 `send_window_update/3`. `recv/2` credits the padding itself.
 
-DATA that no stream takes still counts against the connection window
-(RFC 9113 Section 6.9), and `recv/2` returns that credit at once. DATA on
-a stream that this connection opened and closed is discarded. DATA after
-the peer `END_STREAM`, past the stream window, or against the
-Content-Length is a stream error, and the credit follows the RST_STREAM.
-DATA on an idle stream is a connection error.
+A frame on a stream that this endpoint reset is processed for its side
+effects and discarded (RFC 9113 Section 5.1): HEADERS updates the HPACK
+decoder, DATA counts against the connection window (RFC 9113 Section 6.9)
+and `recv/2` returns that credit at once. The codec remembers the last 1024
+streams it reset. DATA on any other closed stream is a STREAM_CLOSED stream
+error, and the credit follows the RST_STREAM. DATA on an idle stream is a
+PROTOCOL_ERROR connection error. DATA after the peer `END_STREAM`, past the
+stream window, or against the Content-Length is a stream error.
 
 ## Send queue
 
@@ -231,6 +233,8 @@ stream in this call, with `Fin` `fin` when the END_STREAM frame went out.
     | {ok, [event()], conn(), iodata()}
     | {error, nhttp_h2_frame:decode_error()}.
 
+-type absent_stream() :: reset_locally | closed | idle.
+
 -type frame_result() ::
     {ok, conn(), [event()], iodata()}
     | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
@@ -278,6 +282,7 @@ stream with octets in the send queue. Nothing changed in either case.
 -define(H2_HEAP_BINARY_LIMIT, 64).
 -define(H2_REMAINDER_RETENTION_RATIO, 4).
 -define(H2_DEFAULT_MAX_SEND_BUFFER, 131072).
+-define(H2_LOCAL_RESET_MEMORY, 1024).
 
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS (RFC 9113 SECTION 6.5.2)
@@ -339,7 +344,9 @@ stream with octets in the send queue. Nothing changed in either case.
     peer = undefined :: undefined | nhttp_lib:peer(),
     send_q = undefined :: undefined | #send_q{},
     max_send_buffer = ?H2_DEFAULT_MAX_SEND_BUFFER :: pos_integer() | infinity,
-    max_queued_streams = undefined :: undefined | pos_integer() | infinity
+    max_queued_streams = undefined :: undefined | pos_integer() | infinity,
+    local_resets = gb_sets:empty() :: gb_sets:set(nhttp_lib:stream_id()),
+    local_reset_order = queue:new() :: queue:queue(nhttp_lib:stream_id())
 }).
 
 -opaque conn() :: #h2_conn{}.
@@ -510,12 +517,13 @@ Send RST_STREAM to cancel a stream.
 
 The call removes the stream and purges its send queue entry. The purge
 changes no window: octets already emitted stay debited until the peer
-credits stream 0 (RFC 9113 Section 6.9.1).
+credits stream 0 (RFC 9113 Section 6.9.1). Frames that the peer sent before
+it saw the reset are discarded, see "Receive flow control".
 """.
 -spec send_rst_stream(conn(), nhttp_lib:stream_id(), error_code()) -> send_result().
 send_rst_stream(#h2_conn{} = Conn, StreamId, ErrorCode) ->
     {ok, Frame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
-    NewConn = close_stream(Conn, StreamId),
+    NewConn = reset_locally(Conn, StreamId),
     {ok, NewConn, Frame}.
 
 -doc """
@@ -807,6 +815,47 @@ remove_stream(#h2_conn{streams = Streams, active_stream_count = Count} = Conn, S
             }
     end.
 
+-spec reset_locally(conn(), nhttp_lib:stream_id()) -> conn().
+reset_locally(#h2_conn{local_resets = Set, local_reset_order = Order} = Conn, StreamId) ->
+    {Set1, Order1} = evict_oldest_reset(Set, Order),
+    close_stream(
+        Conn#h2_conn{
+            local_resets = gb_sets:add(StreamId, Set1),
+            local_reset_order = queue:in(StreamId, Order1)
+        },
+        StreamId
+    ).
+
+-spec evict_oldest_reset(gb_sets:set(nhttp_lib:stream_id()), queue:queue(nhttp_lib:stream_id())) ->
+    {gb_sets:set(nhttp_lib:stream_id()), queue:queue(nhttp_lib:stream_id())}.
+evict_oldest_reset(Set, Order) ->
+    case gb_sets:size(Set) >= ?H2_LOCAL_RESET_MEMORY of
+        true ->
+            {{value, Oldest}, Order1} = queue:out(Order),
+            {gb_sets:delete(Oldest, Set), Order1};
+        false ->
+            {Set, Order}
+    end.
+
+-spec absent_stream(conn(), nhttp_lib:stream_id()) -> absent_stream().
+absent_stream(#h2_conn{local_resets = Resets} = Conn, StreamId) ->
+    case gb_sets:is_member(StreamId, Resets) of
+        true -> reset_locally;
+        false -> closed_or_idle(Conn, StreamId)
+    end.
+
+-spec closed_or_idle(conn(), nhttp_lib:stream_id()) -> closed | idle.
+closed_or_idle(#h2_conn{role = client, next_stream_id = NextId}, StreamId) when
+    StreamId band 1 =:= 1, StreamId < NextId
+->
+    closed;
+closed_or_idle(#h2_conn{role = server, last_peer_stream_id = LastPeer}, StreamId) when
+    StreamId band 1 =:= 1, StreamId =< LastPeer
+->
+    closed;
+closed_or_idle(_Conn, _StreamId) ->
+    idle.
+
 -spec continuation_flood_error() -> {error, nhttp_h2_frame:decode_error()}.
 continuation_flood_error() ->
     {error,
@@ -819,23 +868,51 @@ continuation_flood_error() ->
 decode_and_emit_headers(
     #h2_conn{hpack_dec = HpackDec, streams = Streams} = Conn, StreamId, EndStream, HeaderBlock
 ) ->
-    case maps:is_key(StreamId, Streams) of
-        true ->
+    case absent_stream(Conn, StreamId) of
+        reset_locally ->
+            decode_and_drop(Conn, StreamId, HeaderBlock);
+        _ when is_map_key(StreamId, Streams) ->
             decode_headers_internal(Conn, StreamId, EndStream, HeaderBlock);
-        false ->
+        _ ->
             maybe
                 ok ?= validate_peer_stream_id(Conn, StreamId),
                 ok ?= check_stream_concurrency(Conn),
                 decode_headers_internal(Conn, StreamId, EndStream, HeaderBlock)
             else
                 {error, at_limit} ->
-                    _ = nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)),
-                    {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, refused_stream),
-                    {ok, Conn, [{stream_refused, StreamId}], RstFrame};
+                    refuse_stream(Conn, StreamId, HeaderBlock);
                 {error, {connection_error, _ErrorCode, _Reason}} = Error ->
                     _ = nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)),
                     Error
             end
+    end.
+
+-spec refuse_stream(conn(), nhttp_lib:stream_id(), binary()) -> frame_result().
+refuse_stream(Conn, StreamId, HeaderBlock) ->
+    maybe
+        {ok, Dropped} ?= drop_header_block(Conn, StreamId, HeaderBlock),
+        {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, refused_stream),
+        Refused = reset_locally(Dropped#h2_conn{last_peer_stream_id = StreamId}, StreamId),
+        {ok, Refused, [{stream_refused, StreamId}], RstFrame}
+    end.
+
+-spec decode_and_drop(conn(), nhttp_lib:stream_id(), binary()) -> frame_result().
+decode_and_drop(Conn, StreamId, HeaderBlock) ->
+    maybe
+        {ok, Dropped} ?= drop_header_block(Conn, StreamId, HeaderBlock),
+        {ok, Dropped, [], []}
+    end.
+
+-spec drop_header_block(conn(), nhttp_lib:stream_id(), binary()) ->
+    {ok, conn()} | {error, nhttp_h2_frame:decode_error()}.
+drop_header_block(#h2_conn{hpack_dec = HpackDec} = Conn, StreamId, HeaderBlock) ->
+    case nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)) of
+        {ok, _Headers, NewHpackDec} ->
+            {ok, remove_stream(Conn#h2_conn{hpack_dec = NewHpackDec}, StreamId)};
+        {invalid_field, _Reason, NewHpackDec} ->
+            {ok, remove_stream(Conn#h2_conn{hpack_dec = NewHpackDec}, StreamId)};
+        {error, HpackError} ->
+            hpack_decode_error(HpackError)
     end.
 
 -spec decode_headers_internal(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
@@ -894,17 +971,21 @@ decode_header_block(#h2_conn{hpack_dec = HpackDec} = Conn, StreamId, HeaderBlock
         {invalid_field, Reason, NewHpackDec} ->
             {stream_error, Conn#h2_conn{hpack_dec = NewHpackDec}, StreamId, protocol_error,
                 invalid_field_reason(Reason)};
-        {error, header_list_too_large} ->
-            {error,
-                {connection_error, enhance_your_calm, <<
-                    "Decoded header list exceeds SETTINGS_MAX_HEADER_LIST_SIZE "
-                    "(RFC 9113 Section 10.5.1)"
-                >>}};
         {error, HpackError} ->
-            {error,
-                {connection_error, compression_error,
-                    iolist_to_binary(io_lib:format("HPACK decode error: ~p", [HpackError]))}}
+            hpack_decode_error(HpackError)
     end.
+
+-spec hpack_decode_error(nhttp_hpack:decode_error()) -> {error, nhttp_h2_frame:decode_error()}.
+hpack_decode_error(header_list_too_large) ->
+    {error,
+        {connection_error, enhance_your_calm, <<
+            "Decoded header list exceeds SETTINGS_MAX_HEADER_LIST_SIZE "
+            "(RFC 9113 Section 10.5.1)"
+        >>}};
+hpack_decode_error(HpackError) ->
+    {error,
+        {connection_error, compression_error,
+            iolist_to_binary(io_lib:format("HPACK decode error: ~p", [HpackError]))}}.
 
 -spec validate_recv_headers(stream_state(), nhttp_lib:stream_id()) ->
     ok | {error, nhttp_h2_frame:decode_error()}.
@@ -1564,10 +1645,12 @@ process_continuation(#h2_conn{continuation_stream = Expected}, StreamId, _EndHea
 process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload, FlowLength) ->
     case maps:get(StreamId, Streams, undefined) of
         undefined ->
-            case was_opened(Conn, StreamId) of
-                true ->
+            case absent_stream(Conn, StreamId) of
+                reset_locally ->
                     discard_data(Conn, FlowLength);
-                false ->
+                closed ->
+                    reject_data(Conn, StreamId, stream_closed, FlowLength);
+                idle ->
                     {error,
                         {connection_error, protocol_error,
                             <<"DATA frame on idle stream (RFC 9113 Section 5.1)">>}}
@@ -1607,12 +1690,6 @@ process_data(#h2_conn{streams = Streams} = Conn, StreamId, EndStream, Payload, F
             end
     end.
 
--spec was_opened(conn(), nhttp_lib:stream_id()) -> boolean().
-was_opened(#h2_conn{role = client, next_stream_id = NextId}, StreamId) ->
-    StreamId band 1 =:= 1 andalso StreamId < NextId;
-was_opened(#h2_conn{role = server, last_peer_stream_id = LastPeer}, StreamId) ->
-    StreamId band 1 =:= 1 andalso StreamId =< LastPeer.
-
 -spec discard_data(conn(), non_neg_integer()) ->
     {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
 discard_data(#h2_conn{recv_window = Window}, FlowLength) when FlowLength > Window ->
@@ -1633,7 +1710,7 @@ reject_data(Conn, StreamId, ErrorCode, FlowLength) ->
     maybe
         {ok, Credited, [], Credit} ?= discard_data(Conn, FlowLength),
         {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
-        {ok, close_stream(Credited, StreamId), [], [RstFrame, Credit]}
+        {ok, reset_locally(Credited, StreamId), [], [RstFrame, Credit]}
     end.
 
 -spec credit_padding(conn(), nhttp_lib:stream_id(), fin(), non_neg_integer()) ->
@@ -1810,7 +1887,7 @@ process_headers(#h2_conn{continuation_stream = Expected}, _StreamId, _ES, _EH, _
     {ok, conn(), [event()], iodata()} | {error, nhttp_h2_frame:decode_error()}.
 process_push_promise(#h2_conn{role = client} = Conn, PromisedId) ->
     {ok, RstFrame} = nhttp_h2_frame:rst_stream(PromisedId, refused_stream),
-    {ok, Conn, [], RstFrame};
+    {ok, reset_locally(Conn, PromisedId), [], RstFrame};
 process_push_promise(#h2_conn{role = server}, _PromisedId) ->
     {error,
         {connection_error, protocol_error,
@@ -1923,11 +2000,11 @@ recv_loop(Conn, Data, EventsAcc, ToSend) ->
                     recv_loop(NewConn, Rest, [NewEvents | EventsAcc], [ToSend, FramesToSend]);
                 {stream_error, StreamConn, StreamId, ErrorCode, _Reason} ->
                     {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
-                    NewConn = close_stream(StreamConn, StreamId),
+                    NewConn = reset_locally(StreamConn, StreamId),
                     recv_loop(NewConn, Rest, EventsAcc, [ToSend, RstFrame]);
                 {error, {stream_error, StreamId, ErrorCode, _Reason}} ->
                     {ok, RstFrame} = nhttp_h2_frame:rst_stream(StreamId, ErrorCode),
-                    NewConn = close_stream(Conn, StreamId),
+                    NewConn = reset_locally(Conn, StreamId),
                     recv_loop(NewConn, Rest, EventsAcc, [ToSend, RstFrame]);
                 {error, _} = Error ->
                     Error

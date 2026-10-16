@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `nhttp_h2:recv/2` discards a frame on a closed stream only when this
+  endpoint sent the RST_STREAM. DATA on a stream that the peer reset or
+  that both sides ended is a STREAM_CLOSED stream error (RFC 9113 Section
+  5.1). 1.3.0 discarded all of them, and h2spec 5.1 failed.
+- `nhttp_h2:recv/2` discards HEADERS and CONTINUATION on a stream that
+  this endpoint reset, after it updates the HPACK decoder. Before, the
+  client answered a late response to a cancelled request with a
+  PROTOCOL_ERROR connection error.
+- `nhttp_h2:recv/2` keeps the HPACK decoder state of a refused HEADERS
+  frame. Before, a refused field section that inserted into the dynamic
+  table desynchronised the decoder.
+- `nhttp_h2:recv/2` records a refused stream as opened. A HEADERS frame
+  with a lower stream id after it is a PROTOCOL_ERROR connection error
+  (RFC 9113 Section 5.1.1).
+
 ## [1.3.0]
 
 ### Added

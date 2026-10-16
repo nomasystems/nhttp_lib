@@ -60,7 +60,22 @@ groups() ->
             client_rejects_odd_server_stream_id,
             max_concurrent_streams_triggers_refused_stream,
             client_rejects_window_update_on_idle_stream,
-            client_refuses_stream_id_above_maximum
+            client_refuses_stream_id_above_maximum,
+            data_after_peer_rst_stream_is_stream_closed,
+            data_on_closed_stream_is_stream_closed,
+            client_data_after_peer_rst_stream_is_stream_closed,
+            second_data_after_reject_is_discarded,
+            late_response_after_cancel_is_discarded,
+            late_response_updates_the_hpack_decoder,
+            server_data_after_local_rst_stream_is_discarded_and_credited,
+            headers_after_local_rst_stream_is_discarded,
+            continuation_after_local_rst_stream_is_discarded,
+            empty_data_after_local_rst_stream_emits_nothing,
+            data_after_refused_stream_is_discarded,
+            refused_headers_keep_the_hpack_decoder,
+            refused_stream_advances_last_peer_stream_id,
+            data_after_codec_rst_stream_is_discarded,
+            local_reset_memory_evicts_the_oldest_reset
         ]},
         {section_6_settings_and_flow_control, [parallel], [
             settings_ack_sent_in_response,
@@ -340,6 +355,280 @@ max_concurrent_streams_triggers_refused_stream(_Config) ->
     {ok, [{stream_refused, 3}], _Conn2, OutData} = Result,
     {ok, {rst_stream, 3, refused_stream}, _} =
         nhttp_h2_frame:decode(iolist_to_binary(OutData)),
+    ok.
+
+%% RFC 9113 Section 5.1: the peer reset the stream, so it knows the stream
+%% is closed. DATA after its own RST_STREAM is a STREAM_CLOSED stream
+%% error, and the octets still count against the connection window.
+%% Mirrors h2spec 5.1/8.
+data_after_peer_rst_stream_is_stream_closed(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Rst} = nhttp_h2_frame:rst_stream(1, cancel),
+    {ok, [{stream_reset, 1, cancel}], Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(Rst)),
+    {ok, D} = nhttp_h2_frame:data(1, nofin, <<"late">>),
+    {ok, [], _Conn3, Out} = nhttp_h2:recv(Conn2, iolist_to_binary(D)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, stream_closed}, {window_update, 4}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    ok.
+
+%% RFC 9113 Section 5.1: both sides sent END_STREAM, so the stream is
+%% closed and the peer knows it. DATA on it is a STREAM_CLOSED stream
+%% error. Mirrors h2spec 5.1/11.
+data_on_closed_stream_is_stream_closed(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, fin, fin, encode_headers(minimal_request_headers())),
+    {ok, [{request, 1, _, fin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, 1, [{<<":status">>, <<"204">>}], fin),
+    {ok, D} = nhttp_h2_frame:data(1, nofin, <<"late">>),
+    {ok, [], _Conn3, Out} = nhttp_h2:recv(Conn2, iolist_to_binary(D)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, stream_closed}, {window_update, 4}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    ok.
+
+%% The client role twin of data_after_peer_rst_stream_is_stream_closed.
+client_data_after_peer_rst_stream_is_stream_closed(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
+    {ok, Rst} = nhttp_h2_frame:rst_stream(StreamId, cancel),
+    {ok, [{stream_reset, StreamId, cancel}], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Rst)),
+    {ok, D} = nhttp_h2_frame:data(StreamId, nofin, <<"late">>),
+    {ok, [], _Conn4, Out} = nhttp_h2:recv(Conn3, iolist_to_binary(D)),
+    ?assertEqual(
+        {ok, [{rst_stream, StreamId, stream_closed}, {window_update, 4}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    ok.
+
+%% A stream that the codec reset with STREAM_CLOSED is a stream this
+%% endpoint reset. The next DATA frame on it is discarded and credited,
+%% so one bad stream costs one RST_STREAM, never one per frame.
+second_data_after_reject_is_discarded(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, fin, fin, encode_headers(minimal_request_headers())),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, D1} = nhttp_h2_frame:data(1, nofin, <<"extra">>),
+    {ok, [], Conn2, Out1} = nhttp_h2:recv(Conn1, iolist_to_binary(D1)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, stream_closed}, {window_update, 5}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out1))
+    ),
+    {ok, D2} = nhttp_h2_frame:data(1, nofin, <<"more">>),
+    {ok, [], _Conn3, Out2} = nhttp_h2:recv(Conn2, iolist_to_binary(D2)),
+    ?assertEqual(
+        {ok, [{window_update, 4}], 13},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out2))
+    ),
+    ok.
+
+%% RFC 9113 Section 5.1: after this endpoint sends RST_STREAM, frames the
+%% peer sent before it saw the reset are processed for their side effects
+%% and discarded. A whole late response to a cancelled request, HEADERS,
+%% padded DATA and trailers, costs the connection nothing but the
+%% WINDOW_UPDATE credit for each DATA frame.
+late_response_after_cancel_is_discarded(_Config) ->
+    Conn0 = client_with_server_preface(),
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
+    {ok, Conn3, _} = nhttp_h2:send_rst_stream(Conn2, StreamId, cancel),
+    {ok, Enc0} = nhttp_hpack:new(),
+    {RespBlock, Enc1} = encode_headers([{<<":status">>, <<"200">>}], Enc0),
+    {ok, Resp} = nhttp_h2_frame:headers(StreamId, nofin, fin, RespBlock),
+    D1 = <<8:24, 16#00:8, 16#08:8, 0:1, StreamId:31, 3:8, "aaaa", 0:24>>,
+    D2 = <<6:24, 16#00:8, 16#08:8, 0:1, StreamId:31, 0:8, "bbbbb">>,
+    D3 = <<14:24, 16#00:8, 16#08:8, 0:1, StreamId:31, 7:8, "cccccc", 0:56>>,
+    {TrailerBlock, _Enc2} = encode_headers([{<<"x-trailer">>, <<"1">>}], Enc1),
+    {ok, Trailers} = nhttp_h2_frame:headers(StreamId, fin, fin, TrailerBlock),
+    {ok, [], _Conn4, Out} = nhttp_h2:recv(Conn3, iolist_to_binary([Resp, D1, D2, D3, Trailers])),
+    ?assertEqual(
+        {ok, [{window_update, 8}, {window_update, 6}, {window_update, 14}], 39},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    ok.
+
+%% A discarded field section still updates the HPACK decoder (RFC 9113
+%% Section 4.3), so a later response that references the entry it inserted
+%% decodes.
+late_response_updates_the_hpack_decoder(_Config) ->
+    Conn0 = client_with_server_preface(),
+    {ok, Cancelled, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, Cancelled, minimal_request_headers(), fin),
+    {ok, Conn3, _} = nhttp_h2:send_rst_stream(Conn2, Cancelled, cancel),
+    {ok, Live, Conn4} = nhttp_h2:open_stream(Conn3),
+    {ok, Conn5, _} = nhttp_h2:send_headers(Conn4, Live, minimal_request_headers(), fin),
+    Response = [{<<":status">>, <<"200">>}, {<<"x-custom">>, <<"v">>}],
+    {ok, Enc0} = nhttp_hpack:new(),
+    {LateBlock, Enc1} = encode_headers(Response, Enc0),
+    {LiveBlock, _Enc2} = encode_headers(Response, Enc1),
+    ?assertEqual(<<16#88, 16#BE>>, LiveBlock),
+    {ok, LateResp} = nhttp_h2_frame:headers(Cancelled, fin, fin, LateBlock),
+    {ok, LiveResp} = nhttp_h2_frame:headers(Live, fin, fin, LiveBlock),
+    {ok, [{response, Live, Resp, fin}], _Conn6} =
+        nhttp_h2:recv(Conn5, iolist_to_binary([LateResp, LiveResp])),
+    ?assertEqual(<<"v">>, nhttp_headers:get(<<"x-custom">>, maps:get(headers, Resp))),
+    ok.
+
+%% The server side of the local reset: DATA after our RST_STREAM is
+%% discarded and the full flow length, padding included, is credited on
+%% the connection.
+server_data_after_local_rst_stream_is_discarded_and_credited(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_rst_stream(Conn1, 1, cancel),
+    Padded = <<6:24, 16#00:8, 16#08:8, 0:1, 1:31, 3:8, "ab", 0:24>>,
+    {ok, [], _Conn3, Out} = nhttp_h2:recv(Conn2, Padded),
+    ?assertEqual({ok, [{window_update, 6}], 13}, nhttp_h2_frame:decode_all(iolist_to_binary(Out))),
+    ok.
+
+%% HEADERS after our RST_STREAM is decoded for the HPACK side effects and
+%% dropped: no event, no frame, no error.
+headers_after_local_rst_stream_is_discarded(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_rst_stream(Conn1, 1, cancel),
+    {ok, Trailers} = nhttp_h2_frame:headers(1, fin, fin, encode_headers([{<<"x-trailer">>, <<"1">>}])),
+    {ok, [], _Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Trailers)),
+    ok.
+
+%% A field section split over HEADERS and CONTINUATION on a stream we reset
+%% is dropped once complete, and the entry that buffered it leaves the
+%% stream map.
+continuation_after_local_rst_stream_is_discarded(_Config) ->
+    Conn0 = server_with_preface(),
+    ReqBlock = encode_headers(minimal_request_headers()),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, ReqBlock),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_rst_stream(Conn1, 1, cancel),
+    TrailerBlock = encode_headers([{<<"x-trailer">>, <<"1">>}, {<<"x-other">>, <<"2">>}]),
+    Split = byte_size(TrailerBlock) div 2,
+    <<Part1:Split/binary, Part2/binary>> = TrailerBlock,
+    {ok, Head} = nhttp_h2_frame:headers(1, fin, nofin, Part1),
+    {ok, Cont} = nhttp_h2_frame:continuation(1, fin, Part2),
+    {ok, [], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary([Head, Cont])),
+    StreamsIndex = maps:get(streams, record_positions(nhttp_h2, h2_conn)),
+    ?assertNot(maps:is_key(1, element(StreamsIndex, Conn3))),
+    {ok, H3} = nhttp_h2_frame:headers(3, fin, fin, ReqBlock),
+    {ok, [{request, 3, _, fin}], _Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(H3)),
+    ok.
+
+%% An empty DATA frame after our RST_STREAM owes no credit, so recv/2
+%% returns nothing to write.
+empty_data_after_local_rst_stream_emits_nothing(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_rst_stream(Conn1, 1, cancel),
+    {ok, Empty} = nhttp_h2_frame:data(1, fin, <<>>),
+    {ok, [], _Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Empty)),
+    ok.
+
+%% A refused stream is a stream this endpoint reset. A client that
+%% pipelines HEADERS and DATA always has DATA in flight for it, and that
+%% DATA is discarded and credited, not answered with an error.
+data_after_refused_stream_is_discarded(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_concurrent_streams => 1}),
+    ReqBlock = encode_headers(minimal_request_headers()),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, ReqBlock),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, H3} = nhttp_h2_frame:headers(3, nofin, fin, ReqBlock),
+    {ok, [{stream_refused, 3}], Conn2, _} = nhttp_h2:recv(Conn1, iolist_to_binary(H3)),
+    {ok, D} = nhttp_h2_frame:data(3, fin, <<"body">>),
+    {ok, [], _Conn3, Out} = nhttp_h2:recv(Conn2, iolist_to_binary(D)),
+    ?assertEqual({ok, [{window_update, 4}], 13}, nhttp_h2_frame:decode_all(iolist_to_binary(Out))),
+    ok.
+
+%% RFC 9113 Section 4.3: a refused field section still updates the HPACK
+%% decoder. The next accepted field section that references the entry it
+%% inserted decodes.
+refused_headers_keep_the_hpack_decoder(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_concurrent_streams => 1}),
+    {ok, Enc0} = nhttp_hpack:new(),
+    {Block1, Enc1} = encode_headers(minimal_request_headers(), Enc0),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, Block1),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    Custom = minimal_request_headers() ++ [{<<"x-custom">>, <<"v">>}],
+    {Block3, Enc2} = encode_headers(Custom, Enc1),
+    {ok, H3} = nhttp_h2_frame:headers(3, fin, fin, Block3),
+    {ok, [{stream_refused, 3}], Conn2, _} = nhttp_h2:recv(Conn1, iolist_to_binary(H3)),
+    {ok, Rst} = nhttp_h2_frame:rst_stream(1, cancel),
+    {ok, [{stream_reset, 1, cancel}], Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(Rst)),
+    {Block5, _Enc3} = encode_headers(Custom, Enc2),
+    ?assertEqual(16#BE, binary:last(Block5)),
+    {ok, H5} = nhttp_h2_frame:headers(5, fin, fin, Block5),
+    {ok, [{request, 5, Request, fin}], _Conn4} = nhttp_h2:recv(Conn3, iolist_to_binary(H5)),
+    ?assertEqual(<<"v">>, nhttp_headers:get(<<"x-custom">>, maps:get(headers, Request))),
+    ok.
+
+%% RFC 9113 Section 5.1.1: a refused stream was opened. The peer cannot
+%% open a lower stream id behind it.
+refused_stream_advances_last_peer_stream_id(_Config) ->
+    Conn0 = server_with_preface_settings(#{max_concurrent_streams => 1}),
+    ReqBlock = encode_headers(minimal_request_headers()),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, ReqBlock),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, H5} = nhttp_h2_frame:headers(5, fin, fin, ReqBlock),
+    {ok, [{stream_refused, 5}], Conn2, _} = nhttp_h2:recv(Conn1, iolist_to_binary(H5)),
+    {ok, H3} = nhttp_h2_frame:headers(3, fin, fin, ReqBlock),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn2, iolist_to_binary(H3)),
+    ok.
+
+%% A stream that the codec reset for a stream window overflow is a stream
+%% this endpoint reset. More DATA on it is discarded and credited.
+data_after_codec_rst_stream_is_discarded(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, encode_headers(minimal_request_headers())),
+    {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Conn2, _} = nhttp_h2:send_window_update(Conn1, connection, 100000),
+    {ok, Full} = nhttp_h2_frame:data(1, nofin, binary:copy(<<"x">>, 16384)),
+    {ok, Events, Conn3, Out1} = nhttp_h2:recv(Conn2, iolist_to_binary([Full, Full, Full, Full])),
+    ?assertEqual(3, length(Events)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, flow_control_error}, {window_update, 16384}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out1))
+    ),
+    {ok, More} = nhttp_h2_frame:data(1, fin, <<"more">>),
+    {ok, [], _Conn4, Out2} = nhttp_h2:recv(Conn3, iolist_to_binary(More)),
+    ?assertEqual({ok, [{window_update, 4}], 13}, nhttp_h2_frame:decode_all(iolist_to_binary(Out2))),
+    ok.
+
+%% The codec remembers the last 1024 streams it reset, in reset order. The
+%% oldest reset leaves first, whatever its id. The DATA on stream 1 goes
+%% first: the STREAM_CLOSED answer on stream 3 records a reset of its own,
+%% and that one evicts stream 1.
+local_reset_memory_evicts_the_oldest_reset(_Config) ->
+    Conn0 = server_with_preface(),
+    ReqBlock = encode_headers(minimal_request_headers()),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, ReqBlock),
+    {ok, H3} = nhttp_h2_frame:headers(3, nofin, fin, ReqBlock),
+    {ok, [{request, 1, _, nofin}, {request, 3, _, nofin}], Conn1} =
+        nhttp_h2:recv(Conn0, iolist_to_binary([H1, H3])),
+    {ok, Conn2, _} = nhttp_h2:send_rst_stream(Conn1, 3, cancel),
+    {ok, Conn3, _} = nhttp_h2:send_rst_stream(Conn2, 1, cancel),
+    Conn4 = lists:foldl(
+        fun(StreamId, Conn) ->
+            {ok, Next, _} = nhttp_h2:send_rst_stream(Conn, StreamId, cancel),
+            Next
+        end,
+        Conn3,
+        lists:seq(5, 5 + 2 * 1022, 2)
+    ),
+    {ok, D1} = nhttp_h2_frame:data(1, nofin, <<"y">>),
+    {ok, [], Conn5, Out1} = nhttp_h2:recv(Conn4, iolist_to_binary(D1)),
+    ?assertEqual({ok, [{window_update, 1}], 13}, nhttp_h2_frame:decode_all(iolist_to_binary(Out1))),
+    {ok, D3} = nhttp_h2_frame:data(3, nofin, <<"x">>),
+    {ok, [], _Conn6, Out3} = nhttp_h2:recv(Conn5, iolist_to_binary(D3)),
+    ?assertEqual(
+        {ok, [{rst_stream, 3, stream_closed}, {window_update, 1}], 26},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out3))
+    ),
     ok.
 
 %%%-----------------------------------------------------------------------------
@@ -1145,8 +1434,12 @@ client_with_server_preface() ->
 
 encode_headers(Headers) ->
     {ok, State} = nhttp_hpack:new(),
-    {ok, HeaderBlock, _} = nhttp_hpack:encode(Headers, State),
-    iolist_to_binary(HeaderBlock).
+    {HeaderBlock, _} = encode_headers(Headers, State),
+    HeaderBlock.
+
+encode_headers(Headers, Enc0) ->
+    {ok, HeaderBlock, Enc1} = nhttp_hpack:encode(Headers, Enc0),
+    {iolist_to_binary(HeaderBlock), Enc1}.
 
 minimal_request_headers() ->
     [{<<":method">>, <<"GET">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}].
