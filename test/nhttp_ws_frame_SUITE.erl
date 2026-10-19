@@ -58,6 +58,10 @@ groups() ->
             validate_control_frame_ok,
             validate_control_frame_too_large,
             validate_control_frame_fragmented,
+            validate_message_ok,
+            validate_message_close_errors,
+            validate_message_control_too_large,
+            validate_close_shared_with_decoder,
             opcode_to_message_fragmented_rejected,
             opcode_to_message_unknown_opcode,
             opcode_to_complete_message_unknown
@@ -330,3 +334,57 @@ partial_payload_stops_at_declared_length(_Config) ->
 partial_payload_length_top_bit(_Config) ->
     Frame = <<16#82, 127, 1:1, 70000:63, "xy">>,
     ?assertEqual(none, nhttp_ws_frame:partial_payload(Frame, client, 0)).
+
+validate_message_ok(_Config) ->
+    Ok = [
+        {text, <<"hi">>},
+        {binary, <<1, 2>>},
+        ping,
+        pong,
+        {ping, binary:copy(<<"p">>, 125)},
+        {pong, <<>>},
+        close,
+        {close, 1000, <<>>},
+        {close, 4999, binary:copy(<<"r">>, 123)},
+        {close, 3000, <<"caf", 16#C3, 16#A9>>}
+    ],
+    [?assertEqual(ok, nhttp_ws_frame:validate_message(M)) || M <- Ok].
+
+validate_message_close_errors(_Config) ->
+    Invalid = [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535],
+    [
+        ?assertEqual(
+            {error, invalid_close_code}, nhttp_ws_frame:validate_message({close, Code, <<>>})
+        )
+     || Code <- Invalid
+    ],
+    ?assertEqual(
+        {error, close_reason_too_large},
+        nhttp_ws_frame:validate_message({close, 1000, binary:copy(<<"r">>, 124)})
+    ),
+    ?assertEqual(
+        {error, invalid_close_reason},
+        nhttp_ws_frame:validate_message({close, 1000, <<16#FF>>})
+    ).
+
+validate_message_control_too_large(_Config) ->
+    Big = binary:copy(<<"x">>, 126),
+    ?assertEqual({error, control_frame_too_large}, nhttp_ws_frame:validate_message({ping, Big})),
+    ?assertEqual({error, control_frame_too_large}, nhttp_ws_frame:validate_message({pong, Big})).
+
+validate_close_shared_with_decoder(_Config) ->
+    ?assertEqual({error, invalid_close_code}, nhttp_ws_frame:validate_close(1005, <<>>)),
+    ?assertEqual(
+        {error, invalid_close_code},
+        nhttp_ws_frame:opcode_to_complete_message(8, <<1005:16>>)
+    ),
+    ?assertEqual({error, invalid_close_reason}, nhttp_ws_frame:validate_close(1000, <<16#FF>>)),
+    ?assertEqual(
+        {error, invalid_close_reason},
+        nhttp_ws_frame:opcode_to_complete_message(8, <<1000:16, 16#FF>>)
+    ),
+    ?assertEqual(ok, nhttp_ws_frame:validate_close(1000, <<"ok">>)),
+    ?assertEqual(
+        {ok, {close, 1000, <<"ok">>}},
+        nhttp_ws_frame:opcode_to_complete_message(8, <<1000:16, "ok">>)
+    ).

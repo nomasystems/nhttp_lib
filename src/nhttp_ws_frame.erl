@@ -59,17 +59,21 @@ code and reason.
     scan_utf8/1,
     scan_utf8/2,
     unmask_from/3,
+    validate_close/2,
     validate_control_frame/3,
-    validate_control_header/3
+    validate_control_header/3,
+    validate_message/1
 ]).
 
 -export_type([
     close_code/0,
+    close_error/0,
     decode_result/0,
     encode_opts/0,
     frame_limits/0,
     frame_too_large/0,
     header_error/0,
+    message_error/0,
     raw_decode_result/0,
     ws_message/0,
     ws_opcode/0
@@ -79,6 +83,10 @@ code and reason.
 %% TYPES
 %%%-----------------------------------------------------------------------------
 -type close_code() :: 0..65535.
+
+-type close_error() :: invalid_close_code | invalid_close_reason | close_reason_too_large.
+
+-type message_error() :: close_error() | control_frame_too_large.
 
 -type ws_message() ::
     {text, binary()}
@@ -130,6 +138,7 @@ code and reason.
 %% MACROS
 %%%-----------------------------------------------------------------------------
 -define(MAX_CONTROL_PAYLOAD, 125).
+-define(MAX_CLOSE_REASON, (?MAX_CONTROL_PAYLOAD - 2)).
 -define(OP_TEXT, 1).
 -define(OP_BINARY, 2).
 -define(OP_CLOSE, 8).
@@ -275,14 +284,9 @@ opcode_to_complete_message(?OP_CLOSE, <<>>) ->
 opcode_to_complete_message(?OP_CLOSE, <<_:8>>) ->
     {error, invalid_close_payload};
 opcode_to_complete_message(?OP_CLOSE, <<Code:16, Reason/binary>>) ->
-    case is_valid_close_code(Code) of
-        false ->
-            {error, invalid_close_code};
-        true ->
-            case is_valid_utf8(Reason) of
-                true -> {ok, {close, Code, Reason}};
-                false -> {error, invalid_close_reason}
-            end
+    case validate_close(Code, Reason) of
+        ok -> {ok, {close, Code, Reason}};
+        {error, _} = Error -> Error
     end;
 opcode_to_complete_message(?OP_PING, <<>>) ->
     {ok, ping};
@@ -375,6 +379,27 @@ scan_utf8(Carry, <<Head:3/binary, Rest/binary>>) ->
     end.
 
 -doc """
+Check a CLOSE code and reason against RFC 6455 §7.4 and §5.5.1. The code
+must be one an endpoint can send: 1000 to 1003, 1007 to 1014, or 3000 to
+4999. The reason must be UTF-8 and fit a control frame beside the code.
+The decoder and the session API share this check.
+""".
+-spec validate_close(close_code(), binary()) -> ok | {error, close_error()}.
+validate_close(Code, _Reason) when
+    not (Code >= 1000 andalso Code =< 1003),
+    not (Code >= 1007 andalso Code =< 1014),
+    not (Code >= 3000 andalso Code =< 4999)
+->
+    {error, invalid_close_code};
+validate_close(_Code, Reason) when byte_size(Reason) > ?MAX_CLOSE_REASON ->
+    {error, close_reason_too_large};
+validate_close(_Code, Reason) ->
+    case is_valid_utf8(Reason) of
+        true -> ok;
+        false -> {error, invalid_close_reason}
+    end.
+
+-doc """
 Validate that a control frame is not fragmented and not too large
 (RFC 6455 §5.5: control frame payloads MUST be <= 125 bytes).
 """.
@@ -396,6 +421,20 @@ validate_control_header(_Fin, _Opcode, Len) when Len > ?MAX_CONTROL_PAYLOAD ->
 validate_control_header(0, _Opcode, _Len) ->
     {error, fragmented_control_frame};
 validate_control_header(1, _Opcode, _Len) ->
+    ok.
+
+-doc """
+Check a message an endpoint is about to send: a CLOSE passes
+`validate_close/2`, a PING or PONG payload fits a control frame (§5.5).
+""".
+-spec validate_message(ws_message()) -> ok | {error, message_error()}.
+validate_message({close, Code, Reason}) ->
+    validate_close(Code, Reason);
+validate_message({ping, Data}) when byte_size(Data) > ?MAX_CONTROL_PAYLOAD ->
+    {error, control_frame_too_large};
+validate_message({pong, Data}) when byte_size(Data) > ?MAX_CONTROL_PAYLOAD ->
+    {error, control_frame_too_large};
+validate_message(_Message) ->
     ok.
 
 %%%-----------------------------------------------------------------------------
@@ -704,12 +743,6 @@ is_utf8_prefix(<<A, B, C>>) when A >= 16#F0, A =< 16#F4, C >= 16#80, C =< 16#BF 
     is_utf8_prefix(<<A, B>>);
 is_utf8_prefix(_) ->
     false.
-
--spec is_valid_close_code(close_code()) -> boolean().
-is_valid_close_code(Code) when Code >= 1000, Code =< 1003 -> true;
-is_valid_close_code(Code) when Code >= 1007, Code =< 1014 -> true;
-is_valid_close_code(Code) when Code >= 3000, Code =< 4999 -> true;
-is_valid_close_code(_) -> false.
 
 -spec is_valid_utf8(binary()) -> boolean().
 is_valid_utf8(<<_/utf8, Rest/binary>>) -> is_valid_utf8(Rest);

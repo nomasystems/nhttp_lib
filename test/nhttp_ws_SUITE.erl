@@ -119,8 +119,9 @@ decoding, and stateful fragmentation for both server and client roles.
     session_broadcast_to_session/1,
     session_broadcast_to_pid/1,
     session_is_alive/1,
-    session_direct_send_from_non_owner/1,
-    session_direct_send_gone_after_close/1,
+    session_send_refuses_close/1,
+    session_send_refuses_oversize_control/1,
+    session_close_refuses_invalid/1,
     session_h1_without_socket_routes_to_conn/1,
     feed_empty_input/1,
     feed_header_split_at_every_boundary_unmasked/1,
@@ -284,8 +285,9 @@ groups() ->
             session_broadcast_to_session,
             session_broadcast_to_pid,
             session_is_alive,
-            session_direct_send_from_non_owner,
-            session_direct_send_gone_after_close,
+            session_send_refuses_close,
+            session_send_refuses_oversize_control,
+            session_close_refuses_invalid,
             session_h1_without_socket_routes_to_conn
         ]},
         {feed, [parallel], [
@@ -902,11 +904,11 @@ session_send_async_envelope(_Config) ->
     Probe = spawn_probe(fun() ->
         receive
             {'$gen_call', From, {ws_send_async, _SessRef, 5, {binary, <<"x">>}}} ->
-                gen_server:reply(From, {error, would_block})
+                gen_server:reply(From, {error, gone})
         end
     end),
     Sess = make_session(h2, Probe, 5),
-    ?assertEqual({error, would_block}, nhttp_ws:send_async(Sess, {binary, <<"x">>})),
+    ?assertEqual({error, gone}, nhttp_ws:send_async(Sess, {binary, <<"x">>})),
     stop_probe(Probe).
 
 session_send_gone_when_pid_dead(_Config) ->
@@ -941,8 +943,8 @@ session_close_envelope(_Config) ->
     ?assertEqual({'$gen_cast', {ws_close, Ref, undefined, 1000, <<>>, #{}}}, await_msg(1000)),
     ?assertEqual(ok, nhttp_ws:close(Sess, 1011, <<"oops">>)),
     ?assertEqual({'$gen_cast', {ws_close, Ref, undefined, 1011, <<"oops">>, #{}}}, await_msg(1000)),
-    ?assertEqual(ok, nhttp_ws:close(Sess, 1001, <<"bye">>, #{force => true})),
-    Expected = {'$gen_cast', {ws_close, Ref, undefined, 1001, <<"bye">>, #{force => true}}},
+    ?assertEqual(ok, nhttp_ws:close(Sess, 1001, <<"bye">>, #{})),
+    Expected = {'$gen_cast', {ws_close, Ref, undefined, 1001, <<"bye">>, #{}}},
     ?assertEqual(Expected, await_msg(1000)).
 
 session_broadcast_to_session(_Config) ->
@@ -964,32 +966,51 @@ session_is_alive(_Config) ->
     SessDead = make_session(h1, Probe, undefined),
     ?assertNot(nhttp_ws:is_alive(SessDead)).
 
-session_direct_send_from_non_owner(_Config) ->
-    {Server, Client} = tcp_pair(),
-    Sess = nhttp_ws:new_session(h1, dead_pid(), undefined, make_ref(), {tcp, Server}),
-    ?assertEqual(h1, nhttp_ws:transport(Sess)),
-    ?assertEqual(undefined, nhttp_ws:stream_id(Sess)),
-    Owner = self(),
-    Sender = spawn_probe(fun() ->
-        Sent = nhttp_ws:send(Sess, {text, <<"hi">>}),
-        SentAsync = nhttp_ws:send_async(Sess, {binary, <<1, 2, 3>>}),
-        Owner ! {sent, Sent, SentAsync}
-    end),
-    ?assertEqual({sent, ok, ok}, await({sent, ok, ok}, 1000)),
-    Expected = <<16#81, 2, "hi", 16#82, 3, 1, 2, 3>>,
-    ?assertEqual({ok, Expected}, gen_tcp:recv(Client, byte_size(Expected), 1000)),
-    stop_probe(Sender),
-    ok = gen_tcp:close(Server),
-    ok = gen_tcp:close(Client).
+session_send_refuses_close(_Config) ->
+    Probe = spawn_probe(fun() -> receive
+        after infinity -> ok
+        end end),
+    Sess = make_session(h1, Probe, undefined),
+    ?assertEqual({error, close_not_allowed}, nhttp_ws:send(Sess, close)),
+    ?assertEqual({error, close_not_allowed}, nhttp_ws:send(Sess, {close, 1000, <<>>})),
+    ?assertEqual({error, close_not_allowed}, nhttp_ws:send(Sess, close, #{timeout => 100})),
+    ?assertEqual({error, close_not_allowed}, nhttp_ws:send_async(Sess, {close, 1000, <<"bye">>})),
+    ?assertEqual({messages, []}, process_info(Probe, messages)),
+    stop_probe(Probe).
 
-session_direct_send_gone_after_close(_Config) ->
-    {Server, Client} = tcp_pair(),
-    Sess = nhttp_ws:new_session(h1, dead_pid(), undefined, make_ref(), {tcp, Server}),
-    ?assertEqual(ok, nhttp_ws:send(Sess, ping)),
-    ok = gen_tcp:close(Server),
-    ?assertEqual({error, gone}, nhttp_ws:send(Sess, {text, <<"late">>})),
-    ?assertEqual({error, gone}, nhttp_ws:send_async(Sess, {text, <<"late">>})),
-    ok = gen_tcp:close(Client).
+session_send_refuses_oversize_control(_Config) ->
+    Probe = spawn_probe(fun() ->
+        receive
+            {'$gen_call', From, {ws_send, _, 3, {ping, _}}} -> gen_server:reply(From, ok)
+        end
+    end),
+    Sess = make_session(h2, Probe, 3),
+    Big = binary:copy(<<"x">>, 126),
+    ?assertEqual({error, control_frame_too_large}, nhttp_ws:send(Sess, {ping, Big})),
+    ?assertEqual({error, control_frame_too_large}, nhttp_ws:send(Sess, {pong, Big})),
+    ?assertEqual({error, control_frame_too_large}, nhttp_ws:send_async(Sess, {pong, Big})),
+    ?assertEqual({error, control_frame_too_large}, nhttp_ws:ping(Sess, Big)),
+    ?assertEqual({messages, []}, process_info(Probe, messages)),
+    ?assertEqual(ok, nhttp_ws:ping(Sess, binary:copy(<<"x">>, 125))),
+    stop_probe(Probe).
+
+session_close_refuses_invalid(_Config) ->
+    Sess = make_session(h3, self(), 4),
+    Invalid = [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535],
+    [
+        ?assertEqual({error, invalid_close_code}, nhttp_ws:close(Sess, Code, <<>>))
+     || Code <- Invalid
+    ],
+    ?assertEqual(
+        {error, close_reason_too_large}, nhttp_ws:close(Sess, 1000, binary:copy(<<"r">>, 124))
+    ),
+    ?assertEqual({error, invalid_close_reason}, nhttp_ws:close(Sess, 1000, <<16#FF>>, #{})),
+    ?assertEqual(ok, nhttp_ws:close(Sess, 4999, binary:copy(<<"r">>, 123))),
+    ?assertMatch({'$gen_cast', {ws_close, _, 4, 4999, _, #{}}}, await_msg(1000)),
+    receive
+        Other -> ct:fail({unexpected_message, Other})
+    after 0 -> ok
+    end.
 
 session_h1_without_socket_routes_to_conn(_Config) ->
     Owner = self(),
@@ -1000,13 +1021,13 @@ session_h1_without_socket_routes_to_conn(_Config) ->
         end,
         receive
             {'$gen_call', From2, {ws_send_async, _, undefined, {text, <<"b">>}}} ->
-                gen_server:reply(From2, {error, would_block})
+                gen_server:reply(From2, {error, gone})
         end,
         Owner ! routed
     end),
     Sess = make_session(h1, Probe, undefined, make_ref()),
     ?assertEqual(ok, nhttp_ws:send(Sess, {text, <<"a">>})),
-    ?assertEqual({error, would_block}, nhttp_ws:send_async(Sess, {text, <<"b">>})),
+    ?assertEqual({error, gone}, nhttp_ws:send_async(Sess, {text, <<"b">>})),
     ?assertEqual(routed, await(routed, 1000)),
     stop_probe(Probe).
 
@@ -1066,22 +1087,6 @@ make_session(Transport, Pid, StreamId) ->
     nhttp_ws:session().
 make_session(Transport, Pid, StreamId, Ref) ->
     nhttp_ws:new_session(Transport, Pid, StreamId, Ref).
-
--spec tcp_pair() -> {gen_tcp:socket(), gen_tcp:socket()}.
-tcp_pair() ->
-    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {ip, loopback}]),
-    {ok, Port} = inet:port(Listen),
-    {ok, Client} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 1000),
-    {ok, Server} = gen_tcp:accept(Listen, 1000),
-    ok = gen_tcp:close(Listen),
-    {Server, Client}.
-
--spec dead_pid() -> pid().
-dead_pid() ->
-    {Pid, MRef} = spawn_monitor(fun() -> ok end),
-    receive
-        {'DOWN', MRef, process, Pid, _} -> Pid
-    end.
 
 -spec await(term(), timeout()) -> term() | no_return().
 await(Expected, Timeout) ->

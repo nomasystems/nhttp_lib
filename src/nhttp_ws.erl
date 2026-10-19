@@ -86,7 +86,6 @@ for backwards compatibility.
     is_alive/1,
     new_session/3,
     new_session/4,
-    new_session/5,
     owner/1,
     session_ref/1,
     stream_id/1,
@@ -116,9 +115,11 @@ for backwards compatibility.
 %%%-----------------------------------------------------------------------------
 -export_type([
     close_code/0,
+    close_error/0,
     decode_error/0,
     decode_result/0,
     feed_result/0,
+    send_error/0,
     session/0,
     stateful_decode_result/0,
     ws_close_opts/0,
@@ -132,6 +133,8 @@ for backwards compatibility.
 ]).
 
 -type close_code() :: nhttp_ws_frame:close_code().
+
+-type close_error() :: nhttp_ws_frame:close_error().
 
 -type decode_result() :: nhttp_ws_frame:decode_result().
 
@@ -167,6 +170,11 @@ for backwards compatibility.
     | {more, MinBytes :: pos_integer(), ws_decoder()}
     | {error, term()}.
 
+-type send_error() :: gone | timeout | close_not_allowed | control_frame_too_large.
+
+-type send_request() ::
+    {ws_send | ws_send_async, reference(), undefined | nhttp_lib:stream_id(), ws_message()}.
+
 -type ws_send_opts() :: #{
     timeout => timeout(),
     priority => low | normal
@@ -186,15 +194,14 @@ for backwards compatibility.
     extensions => [binary()]
 }.
 
--type ws_close_opts() :: #{
-    force => boolean(),
-    timeout => timeout()
-}.
+-type ws_close_opts() :: #{}.
 
 %%%-----------------------------------------------------------------------------
 %% LOCAL MACROS
 %%%-----------------------------------------------------------------------------
 -define(WS_MAGIC, <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>).
+-define(CLOSE_NORMAL, 1000).
+-define(SEND_TIMEOUT_MS, 5000).
 -define(WS_DEFAULT_MAX_MESSAGE_SIZE, 16777216).
 -define(WS_MAX_HEADER_SIZE, 14).
 -define(OP_CONTINUATION, 0).
@@ -212,8 +219,7 @@ for backwards compatibility.
     transport :: h1 | h2 | h3,
     conn_pid :: pid(),
     stream_id :: undefined | nhttp_lib:stream_id(),
-    ref :: reference(),
-    socket :: nhttp_sock:t() | undefined
+    ref :: reference()
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -560,17 +566,6 @@ new_session(Transport, ConnPid, StreamId, Ref) when
         transport = Transport, conn_pid = ConnPid, stream_id = StreamId, ref = Ref
     }.
 
--doc """
-Same as `new_session/4` for HTTP/1.1. Sends write to `Socket` from the caller.
-""".
--spec new_session(h1, pid(), undefined, reference(), nhttp_sock:t()) -> session().
-new_session(h1, ConnPid, undefined, Ref, {Kind, _} = Socket) when
-    is_pid(ConnPid), is_reference(Ref), (Kind =:= tcp orelse Kind =:= ssl)
-->
-    #nhttp_ws_session{
-        transport = h1, conn_pid = ConnPid, stream_id = undefined, ref = Ref, socket = Socket
-    }.
-
 -doc "Return the connection process pid for the session.".
 -spec owner(session()) -> pid().
 owner(#nhttp_ws_session{conn_pid = Pid}) ->
@@ -616,22 +611,27 @@ broadcast(Pid, Msg) when is_pid(Pid) ->
 -doc "Initiate the §5.5.1 close handshake with status 1000 and no reason.".
 -spec close(session()) -> ok.
 close(Session) ->
-    close(Session, 1000, <<>>, #{}).
+    cast_close(Session, ?CLOSE_NORMAL, <<>>, #{}).
 
 -doc "Initiate the §5.5.1 close handshake with explicit code and reason.".
--spec close(session(), close_code(), binary()) -> ok.
+-spec close(session(), close_code(), binary()) -> ok | {error, close_error()}.
 close(Session, Code, Reason) ->
     close(Session, Code, Reason, #{}).
 
 -doc """
-Initiate the §5.5.1 close handshake. Pending sends flush before the
-reciprocal CLOSE is written unless `force => true` is set in `Opts`.
+Initiate the §5.5.1 close handshake. The code and reason pass
+`nhttp_ws_frame:validate_close/2` before the connection process hears of
+them. The connection writes the CLOSE frame after the frames it already
+holds for the session, and no frame follows it. `Opts` takes no keys.
 """.
--spec close(session(), close_code(), binary(), ws_close_opts()) -> ok.
-close(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId, ref = Ref}, Code, Reason, Opts) when
-    is_integer(Code), Code >= 0, Code =< 65535, is_binary(Reason), is_map(Opts)
+-spec close(session(), close_code(), binary(), ws_close_opts()) -> ok | {error, close_error()}.
+close(#nhttp_ws_session{} = Session, Code, Reason, Opts) when
+    is_integer(Code), is_binary(Reason), is_map(Opts)
 ->
-    gen_server:cast(Pid, {ws_close, Ref, StreamId, Code, Reason, Opts}).
+    case nhttp_ws_frame:validate_close(Code, Reason) of
+        ok -> cast_close(Session, Code, Reason, Opts);
+        {error, _} = Error -> Error
+    end.
 
 -doc """
 Deliver an arbitrary Erlang term to a specific session's `handle_ws_info/3`
@@ -643,50 +643,46 @@ info(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId}, Msg) ->
     gen_server:cast(Pid, {ws_info, StreamId, Msg}).
 
 -doc "Send an empty WebSocket PING (§5.5.2) on the session.".
--spec ping(session()) -> ok | {error, term()}.
+-spec ping(session()) -> ok | {error, send_error()}.
 ping(Session) ->
     send(Session, ping).
 
--doc "Send a WebSocket PING with the given payload (≤ 125 bytes per §5.5).".
--spec ping(session(), binary()) -> ok | {error, term()}.
-ping(Session, Payload) when is_binary(Payload), byte_size(Payload) =< 125 ->
+-doc "Send a WebSocket PING with a payload of at most 125 bytes (§5.5).".
+-spec ping(session(), binary()) -> ok | {error, send_error()}.
+ping(Session, Payload) when is_binary(Payload) ->
     send(Session, {ping, Payload}).
 
 -doc """
-Send a message and wait for the write. On a `new_session/5` session the
-caller writes to the socket and `Opts` is ignored. Otherwise the connection
-process writes it within `Opts#timeout` ms. Returns `{error, gone}` once the
-session is closed.
+Send a message and wait for the write. The connection process writes it
+within the `timeout` of `Opts` (default 5000 ms) and replies. A CLOSE is
+refused with `close_not_allowed`: `close/1,3,4` is the close path. A PING
+or PONG payload over 125 bytes is refused with `control_frame_too_large`.
+Returns `{error, gone}` once the session is closed.
 """.
--spec send(session(), ws_message()) -> ok | {error, term()}.
+-spec send(session(), ws_message()) -> ok | {error, send_error()}.
 send(Session, Msg) ->
     send(Session, Msg, #{}).
 
--spec send(session(), ws_message(), ws_send_opts()) -> ok | {error, term()}.
-send(
-    #nhttp_ws_session{socket = undefined, conn_pid = Pid, stream_id = StreamId, ref = Ref},
-    Msg,
-    Opts
-) when
+-spec send(session(), ws_message(), ws_send_opts()) -> ok | {error, send_error()}.
+send(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId, ref = Ref}, Msg, Opts) when
     is_map(Opts)
 ->
-    Timeout = maps:get(timeout, Opts, 5000),
-    call_conn(Pid, {ws_send, Ref, StreamId, Msg}, Timeout);
-send(#nhttp_ws_session{socket = Socket}, Msg, Opts) when is_map(Opts) ->
-    send_direct(Socket, Msg).
+    maybe
+        ok ?= check_send(Msg),
+        Timeout = maps:get(timeout, Opts, ?SEND_TIMEOUT_MS),
+        call_conn(Pid, {ws_send, Ref, StreamId, Msg}, Timeout)
+    end.
 
 -doc """
-Enqueue a message on the connection process, or `{error, would_block}` when
-its outbox is full. On a `new_session/5` session it is a blocking socket
-write from the caller and never returns `would_block`.
+Same as `send/2` with the default timeout: the connection process writes
+the message and replies. There is no outbox.
 """.
--spec send_async(session(), ws_message()) -> ok | {error, would_block | gone | term()}.
-send_async(
-    #nhttp_ws_session{socket = undefined, conn_pid = Pid, stream_id = StreamId, ref = Ref}, Msg
-) ->
-    call_conn(Pid, {ws_send_async, Ref, StreamId, Msg}, 5000);
-send_async(#nhttp_ws_session{socket = Socket}, Msg) ->
-    send_direct(Socket, Msg).
+-spec send_async(session(), ws_message()) -> ok | {error, send_error()}.
+send_async(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId, ref = Ref}, Msg) ->
+    maybe
+        ok ?= check_send(Msg),
+        call_conn(Pid, {ws_send_async, Ref, StreamId, Msg}, ?SEND_TIMEOUT_MS)
+    end.
 
 -doc "Send a binary message.".
 -spec send_binary(session(), iodata()) -> ok | {error, term()}.
@@ -701,26 +697,28 @@ send_text(Session, Data) ->
 %%%-----------------------------------------------------------------------------
 %% INTERNAL FUNCTIONS
 %%%-----------------------------------------------------------------------------
--spec call_conn(pid(), term(), timeout()) -> ok | {error, term()}.
+-spec call_conn(pid(), send_request(), timeout()) -> ok | {error, send_error()}.
 call_conn(Pid, Request, Timeout) ->
     try gen_server:call(Pid, Request, Timeout) of
         Reply -> Reply
     catch
-        exit:{noproc, _} -> {error, gone};
-        exit:{normal, _} -> {error, gone};
-        exit:{shutdown, _} -> {error, gone};
         exit:{timeout, _} -> {error, timeout};
-        exit:{Reason, _} -> {error, Reason}
+        exit:{_Reason, _} -> {error, gone}
     end.
 
--spec send_direct(nhttp_sock:t(), ws_message()) ->
-    ok | {error, gone | nhttp_sock:socket_error()}.
-send_direct(Socket, Msg) ->
-    case nhttp_sock:send(Socket, nhttp_ws_frame:encode(Msg)) of
+-spec cast_close(session(), close_code(), binary(), ws_close_opts()) -> ok.
+cast_close(#nhttp_ws_session{conn_pid = Pid, stream_id = StreamId, ref = Ref}, Code, Reason, Opts) ->
+    gen_server:cast(Pid, {ws_close, Ref, StreamId, Code, Reason, Opts}).
+
+-spec check_send(ws_message()) -> ok | {error, close_not_allowed | control_frame_too_large}.
+check_send(close) ->
+    {error, close_not_allowed};
+check_send({close, _Code, _Reason}) ->
+    {error, close_not_allowed};
+check_send(Msg) ->
+    case nhttp_ws_frame:validate_message(Msg) of
         ok -> ok;
-        {error, closed} -> {error, gone};
-        {error, einval} -> {error, gone};
-        {error, _} = Error -> Error
+        {error, control_frame_too_large} = Error -> Error
     end.
 
 -spec check_message_size(non_neg_integer(), ws_decoder()) ->

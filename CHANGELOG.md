@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0]
+
+### Added
+
+- `nhttp_ws_frame:validate_close/2` and `validate_message/1`: the RFC 6455
+  §7.4 and §5.5 checks for a CLOSE code and reason and for a control
+  frame payload. The decoder and the session API share them.
+- `nhttp_ws:send_error/0` and `nhttp_ws:close_error/0`.
+
+### Changed
+
+- `nhttp_ws:send/2,3` and `send_async/2` refuse CLOSE frames with
+  `{error, close_not_allowed}` and oversize PING or PONG payloads with
+  `{error, control_frame_too_large}`.
+- `nhttp_ws:close/3,4` return `{error, close_error()}` for a code an
+  endpoint must not send, a reason over 123 bytes, or a reason that is
+  not UTF-8.
+- `nhttp_ws:ws_close_opts/0` takes no keys. `force` and `timeout` were
+  never read.
+- `nhttp_ws:send_async/2` documents what it does: the connection process
+  writes and replies. No path returned `would_block`.
+- Every `exit` of the session call other than a timeout maps to
+  `{error, gone}`.
+
+### Removed
+
+- `nhttp_ws:new_session/5` and the direct socket write. A frame written
+  from the caller can follow the CLOSE the connection sent (§5.5.1).
+
 ## [1.3.1]
 
 ### Fixed
