@@ -66,8 +66,6 @@ lowercasing of `lower_field_name/1`.
 -type field_value_error() ::
     invalid_field_value_char | field_value_edge_whitespace.
 
--define(VALUE_WORD_SCAN_MIN, 112).
-
 -define(W_LOW7, 16#7F7F7F7F7F7F7F).
 -define(W_TAB7, 16#09090909090909).
 -define(W_SUB32, 16#60606060606060).
@@ -485,7 +483,7 @@ value_edges(Value) ->
     end.
 
 -spec value_octets(binary()) -> ok | {error, field_value_error()}.
-value_octets(Value) when byte_size(Value) < ?VALUE_WORD_SCAN_MIN ->
+value_octets(Value) when byte_size(Value) < ?NHTTP_VALUE_WORD_SCAN_MIN ->
     case binary:match(Value, persistent_term:get(?PT_FIELD_VALUE_BAD)) of
         nomatch -> ok;
         _ -> {error, invalid_field_value_char}

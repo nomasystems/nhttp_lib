@@ -23,6 +23,8 @@ ok = ssl:send(Socket, Frame).
 ```
 """.
 
+-include("nhttp_h2.hrl").
+
 %%%-----------------------------------------------------------------------------
 %% INLINE DIRECTIVES (PERFORMANCE OPTIMIZATION)
 %%%-----------------------------------------------------------------------------
@@ -151,27 +153,9 @@ ok = ssl:send(Socket, Frame).
 -define(SETTINGS_ENABLE_CONNECT_PROTOCOL, 16#08).
 
 %%%-----------------------------------------------------------------------------
-%% DEFAULT VALUES (RFC 9113 SECTION 6.5.2)
-%%%-----------------------------------------------------------------------------
--define(DEFAULT_MAX_FRAME_SIZE, 16384).
-
-%%%-----------------------------------------------------------------------------
-%% LIMITS (RFC 9113)
-%%%-----------------------------------------------------------------------------
--define(MIN_MAX_FRAME_SIZE, 16#4000).
--define(MAX_FRAME_SIZE_LIMIT, 16#ffffff).
--define(MAX_WINDOW_SIZE, 16#7fffffff).
-
-%%%-----------------------------------------------------------------------------
 %% FRAME STRUCTURE
 %%%-----------------------------------------------------------------------------
 -define(FRAME_HEADER_SIZE, 9).
-
-%%%-----------------------------------------------------------------------------
-%% CONNECTION PREFACE (RFC 9113 SECTION 3.4)
-%%%-----------------------------------------------------------------------------
--define(PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
--define(PREFACE_LEN, 24).
 
 %%%-----------------------------------------------------------------------------
 %% DECODING
@@ -179,14 +163,14 @@ ok = ssl:send(Socket, Frame).
 -doc "Decode a single frame from binary data. Returns {ok, Frame, BytesConsumed} where BytesConsumed is the number of bytes consumed from the input. Use split_at/2 to get the remaining buffer. Uses default max frame size (16384 bytes).".
 -spec decode(Data :: binary()) -> decode_result().
 decode(<<Data/binary>>) ->
-    decode(Data, ?DEFAULT_MAX_FRAME_SIZE).
+    decode(Data, ?H2_INITIAL_MAX_FRAME_SIZE).
 
 -doc "Decode a single frame with custom max frame size. The max frame size should come from peer's SETTINGS_MAX_FRAME_SIZE.".
 -spec decode(Data :: binary(), MaxFrameSize :: pos_integer()) -> decode_result().
-decode(<<"PRI ", _/binary>> = Data, _MaxFrameSize) when byte_size(Data) >= ?PREFACE_LEN ->
+decode(<<"PRI ", _/binary>> = Data, _MaxFrameSize) when byte_size(Data) >= ?H2_PREFACE_LEN ->
     decode_frame(Data, 0);
 decode(<<"PRI ", _/binary>> = Data, _MaxFrameSize) ->
-    {more, ?PREFACE_LEN - byte_size(Data)};
+    {more, ?H2_PREFACE_LEN - byte_size(Data)};
 decode(<<Data/binary>>, _MaxFrameSize) when byte_size(Data) < ?FRAME_HEADER_SIZE ->
     {more, ?FRAME_HEADER_SIZE - byte_size(Data)};
 decode(<<Len:24, _:48, _/binary>>, MaxFrameSize) when Len > MaxFrameSize ->
@@ -201,7 +185,7 @@ decode(<<Data/binary>>, _MaxFrameSize) ->
 -doc "Decode all complete frames from binary data. Returns {ok, Frames, BytesConsumed} with list of decoded frames.".
 -spec decode_all(binary()) -> decode_all_result().
 decode_all(<<Data/binary>>) ->
-    decode_all_loop(Data, ?DEFAULT_MAX_FRAME_SIZE, 0, []).
+    decode_all_loop(Data, ?H2_INITIAL_MAX_FRAME_SIZE, 0, []).
 
 -doc "Decode settings payload (for use in connection layer).".
 -spec decode_settings_payload(binary()) -> {ok, nhttp_h2:settings()} | {error, decode_error()}.
@@ -325,14 +309,14 @@ settings_ack() ->
 
 -doc "Encode a connection-level WINDOW_UPDATE frame.".
 -spec window_update(Increment :: pos_integer()) -> {ok, binary()}.
-window_update(Increment) when Increment > 0, Increment =< ?MAX_WINDOW_SIZE ->
+window_update(Increment) when Increment > 0, Increment =< ?H2_MAX_WINDOW_SIZE ->
     {ok, <<4:24, ?FRAME_WINDOW_UPDATE:8, 0:8, 0:32, 0:1, Increment:31>>}.
 
 -doc "Encode a stream-level WINDOW_UPDATE frame.".
 -spec window_update(StreamId, Increment) -> {ok, binary()} when
     StreamId :: nhttp_lib:stream_id(),
     Increment :: pos_integer().
-window_update(StreamId, Increment) when Increment > 0, Increment =< ?MAX_WINDOW_SIZE ->
+window_update(StreamId, Increment) when Increment > 0, Increment =< ?H2_MAX_WINDOW_SIZE ->
     {ok, <<4:24, ?FRAME_WINDOW_UPDATE:8, 0:8, 0:1, StreamId:31, 0:1, Increment:31>>}.
 
 %%%-----------------------------------------------------------------------------
@@ -359,7 +343,7 @@ headers_with_continuation(StreamId, EndStream, HeaderBlock, MaxFrameSize) ->
 -doc "HTTP/2 connection preface magic string.".
 -spec preface() -> {ok, binary()}.
 preface() ->
-    {ok, ?PREFACE}.
+    {ok, <<?H2_PREFACE>>}.
 
 -doc "Split buffer at position, returning the remainder.".
 -spec split_at(binary(), non_neg_integer()) -> binary().
@@ -412,11 +396,10 @@ decode_all_loop(<<Data/binary>>, MaxFrameSize, TotalConsumed, Acc) ->
     end.
 
 -spec decode_frame(binary(), non_neg_integer()) -> decode_result().
-decode_frame(<<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", _/binary>>, Skip) ->
-    {ok, preface, Skip + ?PREFACE_LEN};
+decode_frame(<<?H2_PREFACE, _/binary>>, Skip) ->
+    {ok, preface, Skip + ?H2_PREFACE_LEN};
 decode_frame(<<"PRI ", _/binary>>, _Skip) ->
-    {error,
-        {connection_error, protocol_error, <<"Invalid connection preface (RFC 9113 Section 3.4)">>}};
+    {error, {connection_error, protocol_error, ?H2_INVALID_PREFACE}};
 decode_frame(<<_Len:24, ?FRAME_DATA:8, _:8, _:1, 0:31, _/binary>>, _Skip) ->
     {error,
         {connection_error, protocol_error,
@@ -749,7 +732,7 @@ decode_settings_payload(<<?SETTINGS_ENABLE_PUSH:16, _:32, _/binary>>, _Settings)
 decode_settings_payload(<<?SETTINGS_MAX_CONCURRENT_STREAMS:16, Value:32, Rest/binary>>, Settings) ->
     decode_settings_payload(Rest, Settings#{max_concurrent_streams => Value});
 decode_settings_payload(<<?SETTINGS_INITIAL_WINDOW_SIZE:16, Value:32, _/binary>>, _Settings) when
-    Value > ?MAX_WINDOW_SIZE
+    Value > ?H2_MAX_WINDOW_SIZE
 ->
     {error,
         {connection_error, flow_control_error,
@@ -757,13 +740,13 @@ decode_settings_payload(<<?SETTINGS_INITIAL_WINDOW_SIZE:16, Value:32, _/binary>>
 decode_settings_payload(<<?SETTINGS_INITIAL_WINDOW_SIZE:16, Value:32, Rest/binary>>, Settings) ->
     decode_settings_payload(Rest, Settings#{initial_window_size => Value});
 decode_settings_payload(<<?SETTINGS_MAX_FRAME_SIZE:16, Value:32, _/binary>>, _Settings) when
-    Value < ?MIN_MAX_FRAME_SIZE
+    Value < ?H2_MIN_MAX_FRAME_SIZE
 ->
     {error,
         {connection_error, protocol_error,
             <<"SETTINGS_MAX_FRAME_SIZE below minimum (RFC 9113 Section 6.5.2)">>}};
 decode_settings_payload(<<?SETTINGS_MAX_FRAME_SIZE:16, Value:32, _/binary>>, _Settings) when
-    Value > ?MAX_FRAME_SIZE_LIMIT
+    Value > ?H2_MAX_MAX_FRAME_SIZE
 ->
     {error,
         {connection_error, protocol_error,

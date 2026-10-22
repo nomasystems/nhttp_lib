@@ -119,7 +119,9 @@ groups() ->
             h2_send_data_conserves_body,
             h2_send_queue_round_robin,
             h2_send_queue_conserves_offers,
-            h2_send_queue_respects_credit
+            h2_send_queue_respects_credit,
+            h2_preface_split_reaches_open,
+            h2_preface_wrong_octet_is_protocol_error
         ]},
         {qpack_props, [parallel], [
             qpack_roundtrip_static,
@@ -441,6 +443,12 @@ h2_send_queue_conserves_offers(Config) ->
 
 h2_send_queue_respects_credit(Config) ->
     run_property(nhttp_h2_props, prop_send_queue_respects_credit, Config).
+
+h2_preface_split_reaches_open(Config) ->
+    run_property(nhttp_h2_props, prop_preface_split_reaches_open, Config).
+
+h2_preface_wrong_octet_is_protocol_error(Config) ->
+    run_property(nhttp_h2_props, prop_preface_wrong_octet_is_protocol_error, Config).
 
 %%%-----------------------------------------------------------------------------
 %%% QPACK PROPERTY TESTS

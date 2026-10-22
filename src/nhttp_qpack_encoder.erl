@@ -45,6 +45,8 @@ DecoderData = ...,
 ```
 """.
 
+-include("nhttp_qpack.hrl").
+
 %%%-----------------------------------------------------------------------------
 %% EXPORTS
 %%%-----------------------------------------------------------------------------
@@ -175,7 +177,7 @@ new(Config) ->
         dynamic_table = Table,
         max_table_capacity = MaxCap,
         configured_max_capacity = ConfiguredCap,
-        max_entries = MaxCap div 32,
+        max_entries = MaxCap div ?QPACK_ENTRY_OVERHEAD,
         max_blocked_streams = MaxBlocked,
         configured_max_blocked = ConfiguredBlocked,
         known_received_count = 0,
@@ -207,7 +209,7 @@ reconcile_peer_limits(PeerMaxCap, PeerMaxBlocked, State) ->
     EffectiveBlocked = min(State#qpack_enc.configured_max_blocked, PeerMaxBlocked),
     State#qpack_enc{
         max_table_capacity = EffectiveCap,
-        max_entries = PeerMaxCap div 32,
+        max_entries = PeerMaxCap div ?QPACK_ENTRY_OVERHEAD,
         max_blocked_streams = EffectiveBlocked,
         pending_capacity = EffectiveCap > 0
     }.

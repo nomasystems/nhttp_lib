@@ -17,6 +17,8 @@ The pure per-frame primitives (`encode/1,2`, `decode/1`, `decode_unmasked/1`,
 for backwards compatibility.
 """.
 
+-include("nhttp_ws.hrl").
+
 -compile({inline, [{next_frame, 2}, {refuse, 2}, {whole_frame, 6}]}).
 
 %%%-----------------------------------------------------------------------------
@@ -204,13 +206,8 @@ for backwards compatibility.
 -define(SEND_TIMEOUT_MS, 5000).
 -define(WS_DEFAULT_MAX_MESSAGE_SIZE, 16777216).
 -define(WS_MAX_HEADER_SIZE, 14).
--define(OP_CONTINUATION, 0).
--define(OP_TEXT, 1).
--define(OP_BINARY, 2).
--define(OP_CLOSE, 8).
--define(OP_PING, 9).
--define(OP_PONG, 10).
--define(IS_CONTROL(Op), (Op =:= ?OP_CLOSE orelse Op =:= ?OP_PING orelse Op =:= ?OP_PONG)).
+-define(WS_OP_CONTINUATION, 0).
+-define(IS_CONTROL(Op), (Op =:= ?WS_OP_CLOSE orelse Op =:= ?WS_OP_PING orelse Op =:= ?WS_OP_PONG)).
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL RECORDS
@@ -738,7 +735,7 @@ the same test to the same sizes.
 -spec check_continuation_size(0..15, non_neg_integer(), ws_decoder()) ->
     ok | {error, message_too_large}.
 check_continuation_size(
-    ?OP_CONTINUATION, Len, #ws_decoder{frag_opcode = FragOp, frag_acc_size = AccSize} = Dec
+    ?WS_OP_CONTINUATION, Len, #ws_decoder{frag_opcode = FragOp, frag_acc_size = AccSize} = Dec
 ) when FragOp =/= undefined ->
     check_message_size(AccSize + Len, Dec);
 check_continuation_size(_Opcode, _Len, _Dec) ->
@@ -854,7 +851,7 @@ partial_carry(#ws_decoder{partial_carry = Carry}) -> Carry.
 
 -spec process_fragment(0 | 1, 0..15, binary(), binary(), ws_decoder()) -> stateful_decode_result().
 process_fragment(1, Opcode, Payload, Rest, #ws_decoder{frag_opcode = undefined} = Dec) when
-    Opcode =:= ?OP_TEXT; Opcode =:= ?OP_BINARY
+    Opcode =:= ?WS_OP_TEXT; Opcode =:= ?WS_OP_BINARY
 ->
     maybe
         ok ?= check_message_size(byte_size(Payload), Dec),
@@ -877,7 +874,7 @@ process_fragment(1, Opcode, Payload, Rest, #ws_decoder{frag_opcode = undefined} 
             Err
     end;
 process_fragment(0, Opcode, Payload, Rest, #ws_decoder{frag_opcode = undefined} = Dec) when
-    Opcode =:= ?OP_TEXT; Opcode =:= ?OP_BINARY
+    Opcode =:= ?WS_OP_TEXT; Opcode =:= ?WS_OP_BINARY
 ->
     Size = byte_size(Payload),
     maybe
@@ -900,7 +897,7 @@ process_fragment(
     end;
 process_fragment(
     0,
-    ?OP_CONTINUATION,
+    ?WS_OP_CONTINUATION,
     Payload,
     Rest,
     #ws_decoder{frag_opcode = FragOp, frag_acc = Acc, frag_acc_size = AccSize} = Dec
@@ -916,7 +913,7 @@ process_fragment(
     end;
 process_fragment(
     1,
-    ?OP_CONTINUATION,
+    ?WS_OP_CONTINUATION,
     Payload,
     Rest,
     #ws_decoder{frag_opcode = FragOp, frag_acc = Acc, frag_acc_size = AccSize} = Dec
@@ -972,17 +969,17 @@ scan_partial_text(New, Needed, #ws_decoder{partial_scanned = Scanned} = Dec) ->
 scan_run(<<>>, Payload) -> nhttp_ws_frame:scan_utf8(Payload);
 scan_run(Carry, Payload) -> nhttp_ws_frame:scan_utf8(Carry, Payload).
 
--spec scan_text(?OP_TEXT | ?OP_BINARY, binary(), ws_decoder()) ->
+-spec scan_text(?WS_OP_TEXT | ?WS_OP_BINARY, binary(), ws_decoder()) ->
     {ok, Carry :: binary()} | {error, invalid_utf8}.
-scan_text(?OP_BINARY, _Payload, _Dec) ->
+scan_text(?WS_OP_BINARY, _Payload, _Dec) ->
     {ok, <<>>};
-scan_text(?OP_TEXT, Payload, #ws_decoder{partial_scanned = Scanned} = Dec) ->
+scan_text(?WS_OP_TEXT, Payload, #ws_decoder{partial_scanned = Scanned} = Dec) ->
     Tail = binary:part(Payload, Scanned, byte_size(Payload) - Scanned),
     scan_run(partial_carry(Dec), Tail).
 
 -spec scans_as_text(0..15, ws_decoder()) -> boolean().
-scans_as_text(?OP_TEXT, #ws_decoder{frag_opcode = undefined}) -> true;
-scans_as_text(?OP_CONTINUATION, #ws_decoder{frag_opcode = ?OP_TEXT}) -> true;
+scans_as_text(?WS_OP_TEXT, #ws_decoder{frag_opcode = undefined}) -> true;
+scans_as_text(?WS_OP_CONTINUATION, #ws_decoder{frag_opcode = ?WS_OP_TEXT}) -> true;
 scans_as_text(_Opcode, _Dec) -> false.
 
 -spec start_frame(#ws_partial{}, binary(), ws_decoder(), [ws_message()]) -> feed_result().
@@ -1010,9 +1007,9 @@ take_piece(Piece, #ws_partial{mask_key = MaskKey, got = Got, chunks = Chunks} = 
         }}
     end.
 
--spec text_or_binary_message(?OP_TEXT | ?OP_BINARY, binary()) -> ws_message().
-text_or_binary_message(?OP_TEXT, Payload) -> {text, Payload};
-text_or_binary_message(?OP_BINARY, Payload) -> {binary, Payload}.
+-spec text_or_binary_message(?WS_OP_TEXT | ?WS_OP_BINARY, binary()) -> ws_message().
+text_or_binary_message(?WS_OP_TEXT, Payload) -> {text, Payload};
+text_or_binary_message(?WS_OP_BINARY, Payload) -> {binary, Payload}.
 
 -spec validate_connection_header(nhttp_lib:headers()) -> ok | {error, invalid_connection}.
 validate_connection_header(Headers) ->

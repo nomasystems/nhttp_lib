@@ -41,7 +41,12 @@ groups() ->
             server_accepts_preface_delivered_in_two_reads,
             server_rejects_a_preface_prefix_that_cannot_complete,
             client_preface_contains_magic_and_settings,
-            server_preface_is_settings_only
+            server_preface_is_settings_only,
+            server_rejects_a_second_preface,
+            client_rejects_a_preface_from_the_server,
+            server_requires_settings_after_the_magic,
+            server_rejects_settings_ack_as_first_frame,
+            client_requires_settings_as_first_server_frame
         ]},
         {section_4_frames, [parallel], [
             interleaved_frame_during_continuation_is_connection_error,
@@ -97,7 +102,9 @@ groups() ->
             data_on_half_closed_remote_credits_the_connection,
             data_over_stream_window_credits_the_connection,
             content_length_mismatch_credits_the_connection,
-            goaway_transitions_to_closing
+            goaway_transitions_to_closing,
+            peer_without_max_concurrent_streams_has_no_limit,
+            peer_settings_report_rfc_initial_values
         ]},
         {section_8_http_semantics, [parallel], [
             request_missing_method_is_stream_error,
@@ -202,6 +209,51 @@ server_preface_is_settings_only(_Config) ->
     {ok, {settings, _}, _} = nhttp_h2_frame:decode(Preface),
     ok.
 
+%% RFC9113-3.4-1: the magic opens the client preface once. A second copy is
+%% an invalid preface, a connection error.
+server_rejects_a_second_preface(_Config) ->
+    Conn0 = nhttp_h2:new(server),
+    {ok, [{settings, #{}}], Conn1, _Ack} =
+        nhttp_h2:recv(Conn0, <<(literal_magic())/binary, (literal_settings())/binary>>),
+    {error, {connection_error, _, _}} = nhttp_h2:recv(Conn1, literal_magic()),
+    ok.
+
+%% RFC9113-3.4-2: the server preface is a SETTINGS frame and carries no
+%% magic. The magic from a server is an invalid preface, at the start of the
+%% connection and after it.
+client_rejects_a_preface_from_the_server(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {error, {connection_error, _, _}} = nhttp_h2:recv(Conn0, literal_magic()),
+    {ok, [{settings, #{}}], Conn1, _Ack} = nhttp_h2:recv(Conn0, literal_settings()),
+    {error, {connection_error, _, _}} = nhttp_h2:recv(Conn1, literal_magic()),
+    ok.
+
+%% RFC9113-3.4-3: the magic MUST be followed by a SETTINGS frame. Any other
+%% frame is an invalid preface, a PROTOCOL_ERROR connection error.
+server_requires_settings_after_the_magic(_Config) ->
+    Conn0 = nhttp_h2:new(server),
+    {error, {connection_error, protocol_error, _}} =
+        nhttp_h2:recv(Conn0, <<(literal_magic())/binary, (literal_ping())/binary>>),
+    {ok, [], Conn1} = nhttp_h2:recv(Conn0, literal_magic()),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn1, literal_ping()),
+    ok.
+
+%% RFC9113-3.4-4: a SETTINGS frame with ACK acknowledges the SETTINGS of this
+%% endpoint and cannot open the peer preface.
+server_rejects_settings_ack_as_first_frame(_Config) ->
+    Conn0 = nhttp_h2:new(server),
+    {error, {connection_error, protocol_error, _}} =
+        nhttp_h2:recv(Conn0, <<(literal_magic())/binary, (literal_settings_ack())/binary>>),
+    ok.
+
+%% RFC9113-3.4-5: the SETTINGS frame MUST be the first frame the server
+%% sends. A PING first is an invalid preface.
+client_requires_settings_as_first_server_frame(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn0, literal_ping()),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn0, literal_settings_ack()),
+    ok.
+
 %%%-----------------------------------------------------------------------------
 %%% Section 4 - HTTP Frames
 %%%-----------------------------------------------------------------------------
@@ -235,7 +287,7 @@ data_on_idle_stream_is_connection_error(_Config) ->
 %% A stream id at or above the next one the client opens, or an even one,
 %% names a stream that never existed.
 client_data_on_idle_stream_is_connection_error(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
     {ok, Even} = nhttp_h2_frame:data(2, fin, <<"x">>),
@@ -249,7 +301,7 @@ client_data_on_idle_stream_is_connection_error(_Config) ->
 %% connection window. The codec returns that credit, answers with no
 %% RST_STREAM, and the connection stays up.
 data_after_rst_stream_is_discarded_and_credited(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
     {ok, Conn3, _} = nhttp_h2:send_rst_stream(Conn2, StreamId, cancel),
@@ -289,7 +341,7 @@ window_update_on_idle_stream_is_connection_error(_Config) ->
     ok.
 
 client_rejects_window_update_on_idle_stream(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, WuEven} = nhttp_h2_frame:window_update(2, 100),
     {error, {connection_error, protocol_error, _}} =
         nhttp_h2:recv(Conn0, iolist_to_binary(WuEven)),
@@ -393,7 +445,7 @@ data_on_closed_stream_is_stream_closed(_Config) ->
 
 %% The client role twin of data_after_peer_rst_stream_is_stream_closed.
 client_data_after_peer_rst_stream_is_stream_closed(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), fin),
     {ok, Rst} = nhttp_h2_frame:rst_stream(StreamId, cancel),
@@ -673,7 +725,7 @@ settings_initial_window_size_reaches_idle_stream(_Config) ->
     ok.
 
 settings_initial_window_size_growth_drains_queued_data(_Config) ->
-    Conn0 = nhttp_h2:new(client, #{send_queue => true}),
+    Conn0 = client_with_server_preface(#{send_queue => true}),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
     {ok, Wu} = nhttp_h2_frame:window_update(100000),
@@ -740,7 +792,7 @@ settings_initial_window_size_emits_no_window_update_event(_Config) ->
     ok.
 
 zero_length_end_stream_data_is_sent_at_zero_window(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
     Conn3 = send_chunks(Conn2, StreamId, [16384, 16384, 16384, 16383]),
@@ -868,7 +920,7 @@ padded_data_credit_matches_every_pad_length(_Config) ->
 %% connection window. DATA on a reset stream that exceeds what is left of
 %% the window is a FLOW_CONTROL_ERROR, not a frame to ignore.
 discarded_data_counts_against_the_window(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, Open, Conn1} = nhttp_h2:open_stream(Conn0),
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, Open, minimal_request_headers(), fin),
     {ok, Reset, Conn3} = nhttp_h2:open_stream(Conn2),
@@ -936,6 +988,43 @@ goaway_transitions_to_closing(_Config) ->
     {ok, [{goaway, 0, no_error, <<"bye">>}], _Conn1} =
         nhttp_h2:recv(Conn0, iolist_to_binary(Goaway)),
     ok.
+
+%% RFC9113-6.5.2-1: SETTINGS_MAX_CONCURRENT_STREAMS has no limit until the
+%% peer sends it. An empty SETTINGS frame leaves it unset.
+peer_without_max_concurrent_streams_has_no_limit(_Config) ->
+    Conn0 = nhttp_h2:new(client),
+    {ok, [{settings, #{}}], Conn1, _Ack} = nhttp_h2:recv(Conn0, literal_settings()),
+    Conn2 = open_request_streams(Conn1, 101),
+    {ok, _StreamId, _Conn3} = nhttp_h2:open_stream(Conn2),
+    ok.
+
+%% RFC9113-6.5.2-2: every parameter the peer did not send holds its initial
+%% value: 4096, 65535 and 16384 octets, and no limit on the concurrent
+%% streams or on the field section.
+peer_settings_report_rfc_initial_values(_Config) ->
+    Initial = #{
+        header_table_size => 4096,
+        initial_window_size => 65535,
+        max_frame_size => 16384,
+        max_concurrent_streams => infinity,
+        max_header_list_size => infinity
+    },
+    Conn0 = nhttp_h2:new(client),
+    ?assertEqual(Initial, nhttp_h2:peer_settings(Conn0)),
+    {ok, [{settings, #{}}], Conn1, _Ack} = nhttp_h2:recv(Conn0, literal_settings()),
+    ?assertEqual(Initial, nhttp_h2:peer_settings(Conn1)),
+    Server0 = nhttp_h2:new(server),
+    {ok, [{settings, #{}}], Server1, _} =
+        nhttp_h2:recv(Server0, <<(literal_magic())/binary, (literal_settings())/binary>>),
+    ?assertEqual(Initial, nhttp_h2:peer_settings(Server1)),
+    ok.
+
+open_request_streams(Conn, 0) ->
+    Conn;
+open_request_streams(Conn0, N) ->
+    {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, minimal_request_headers(), nofin),
+    open_request_streams(Conn2, N - 1).
 
 %%%-----------------------------------------------------------------------------
 %%% Section 8 - HTTP Message Exchanges
@@ -1416,21 +1505,39 @@ decode_data_frames(Bin, MaxFrameSize) ->
 
 server_with_preface() ->
     Conn0 = nhttp_h2:new(server),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
-    Conn1.
+    server_with_preface(Conn0).
 
 server_with_preface_settings(Settings) ->
     Conn0 = nhttp_h2:new(server, maps:merge(#{max_concurrent_streams => 100}, Settings)),
+    server_with_preface(Conn0).
+
+server_with_preface(Conn0) ->
     {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    {ok, Settings} = nhttp_h2_frame:settings(#{}),
+    {ok, [{settings, #{}}], Conn1, _Ack} =
+        nhttp_h2:recv(Conn0, iolist_to_binary([Preface, Settings])),
     Conn1.
 
 client_with_server_preface() ->
-    Conn0 = nhttp_h2:new(client),
+    client_with_server_preface(#{}).
+
+client_with_server_preface(Settings) ->
+    Conn0 = nhttp_h2:new(client, Settings),
     {ok, S} = nhttp_h2_frame:settings(#{}),
     {ok, _, Conn1, _} = nhttp_h2:recv(Conn0, iolist_to_binary(S)),
     Conn1.
+
+literal_magic() ->
+    <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>.
+
+literal_settings() ->
+    <<0:24, 16#04:8, 16#00:8, 0:32>>.
+
+literal_settings_ack() ->
+    <<0:24, 16#04:8, 16#01:8, 0:32>>.
+
+literal_ping() ->
+    <<8:24, 16#06:8, 16#00:8, 0:32, "pingpong">>.
 
 encode_headers(Headers) ->
     {ok, State} = nhttp_hpack:new(),

@@ -954,7 +954,6 @@ validate_section(server, Headers, false, Settings) ->
 validate_section(client, Headers, false, _Settings) ->
     validate_response_headers(Headers).
 
--define(H3_CONNECTION_HEADERS_SET, ?NHTTP_MSG_CONNECTION_HEADERS_SET).
 -spec build_initial_headers_event(
     role(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin(), conn()
 ) -> {ok, event()} | {error, h3_error()}.
@@ -1076,7 +1075,7 @@ validate_response_headers_loop([{<<":status">>, _} | _], #{has_status := true}) 
 validate_response_headers_loop([{<<$:, _/binary>>, _} | _], _) ->
     {error, <<"Invalid pseudo-header in response">>};
 validate_response_headers_loop([{Name, _Value} | Rest], State) ->
-    case maps:is_key(Name, ?H3_CONNECTION_HEADERS_SET) of
+    case maps:is_key(Name, ?NHTTP_MSG_CONNECTION_HEADERS_SET) of
         true ->
             {error, <<"Forbidden connection-specific header">>};
         false ->

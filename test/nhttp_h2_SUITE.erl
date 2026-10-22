@@ -479,7 +479,7 @@ stream_open_to_half_closed_remote(_Config) ->
     ok.
 
 stream_half_closed_to_closed(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, fin),
@@ -634,7 +634,7 @@ stream_window_update(_Config) ->
     ok.
 
 window_overflow_error(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     NearMaxIncrement = 16#7fffffff - 65535 - 1000,
     {ok, Frame1} = nhttp_h2_frame:window_update(NearMaxIncrement),
     {ok, [{window_update, 0, NearMaxIncrement}], Conn1} = nhttp_h2:recv(
@@ -710,7 +710,7 @@ headers_decode_with_hpack(_Config) ->
 %%%-----------------------------------------------------------------------------
 
 goaway_closes_connection(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, GoawayFrame} = nhttp_h2_frame:goaway(0, no_error, <<>>),
     {ok, Events, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(GoawayFrame)),
     ?assertMatch([{goaway, 0, no_error, <<>>}], Events),
@@ -733,7 +733,7 @@ rst_stream_closes_stream(_Config) ->
 %%%-----------------------------------------------------------------------------
 
 full_request_response_cycle(_Config) ->
-    ClientConn0 = nhttp_h2:new(client),
+    ClientConn0 = client_with_server_preface(),
     ServerConn0 = nhttp_h2:new(server),
 
     {ok, StreamId, ClientConn1} = nhttp_h2:open_stream(ClientConn0),
@@ -745,12 +745,11 @@ full_request_response_cycle(_Config) ->
     ],
     {ok, ClientConn2, ReqFrame} = nhttp_h2:send_headers(ClientConn1, StreamId, ReqHeaders, fin),
 
-    {ok, ClientPrefaceData} = nhttp_h2_frame:preface(),
-    ClientPreface = iolist_to_binary(ClientPrefaceData),
-    {ok, ReqEvents, ServerConn1} = nhttp_h2:recv(
+    ClientPreface = iolist_to_binary(nhttp_h2:preface(ClientConn0)),
+    {ok, ReqEvents, ServerConn1, _Ack} = nhttp_h2:recv(
         ServerConn0, <<ClientPreface/binary, (iolist_to_binary(ReqFrame))/binary>>
     ),
-    ?assertMatch([{request, StreamId, _, fin}], ReqEvents),
+    ?assertMatch([{settings, _}, {request, StreamId, _, fin}], ReqEvents),
 
     RespHeaders = [{<<":status">>, <<"200">>}],
     {ok, ServerConn2, RespFrame} = nhttp_h2:send_headers(ServerConn1, StreamId, RespHeaders, fin),
@@ -818,7 +817,7 @@ send_headers_after_goaway(_Config) ->
     ok.
 
 send_headers_on_closed_stream(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, Headers, fin),
@@ -1118,7 +1117,9 @@ queue_stream_bound_refuses_without_side_effects(_Config) ->
 
 -doc "Without the key the stream bound is a quarter of the peer max_concurrent_streams, and infinity lifts it.".
 queue_stream_bound_defaults_to_a_quarter_of_peer_max(_Config) ->
-    {Conn0, [First | Rest]} = open_post_streams(queued_conn(#{}), 26),
+    {Conn0, [First | Rest]} = open_post_streams(
+        client_with_server_preface(#{send_queue => true}, #{max_concurrent_streams => 100}), 26
+    ),
     {queued, Conn1, _, 4465} = nhttp_h2:send_data(Conn0, First, numbered_body(70000), nofin),
     {Accepted, [Last]} = lists:split(24, Rest),
     Conn2 = queue_one_octet_each(Conn1, Accepted),
@@ -1399,10 +1400,10 @@ queue_off_keeps_partial_at_zero_window(_Config) ->
     ok.
 
 queued_conn(Settings) ->
-    nhttp_h2:new(client, Settings#{send_queue => true}).
+    client_with_server_preface(Settings#{send_queue => true}).
 
 open_post_stream() ->
-    open_post_stream(nhttp_h2:new(client)).
+    open_post_stream(client_with_server_preface()).
 
 open_post_stream(Conn0) ->
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
@@ -1496,14 +1497,14 @@ open_stream_after_goaway_sent(_Config) ->
     ok.
 
 open_stream_after_goaway_received(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, GoawayFrame} = nhttp_h2_frame:goaway(0, no_error, <<>>),
     {ok, _, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(GoawayFrame)),
     {error, connection_closing} = nhttp_h2:open_stream(Conn1),
     ok.
 
 ping_ack_received(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     OpaqueData = <<1, 2, 3, 4, 5, 6, 7, 8>>,
     {ok, PingAckFrame} = nhttp_h2_frame:ping_ack(OpaqueData),
     {ok, Events, _Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(PingAckFrame)),
@@ -1522,7 +1523,7 @@ priority_frame_ignored(_Config) ->
     ok.
 
 unknown_frame_ignored(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     UnknownFrame = <<5:24, 99:8, 0:8, 0:32, "hello">>,
     {ok, Events, _Conn1} = nhttp_h2:recv(Conn0, UnknownFrame),
     ?assertEqual([], Events),
@@ -1565,8 +1566,7 @@ continuation_flood_protection_test(_Config) ->
 continuation_exceeds_header_list_size_test(_Config) ->
     Settings = #{max_header_list_size => 200},
     Conn0 = nhttp_h2:new(server, Settings),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     First = binary:copy(<<"a">>, 100),
     {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, First),
     {ok, [], Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(HeadersFrame)),
@@ -1600,8 +1600,7 @@ continuation_count_infinity_allows_flood_test(_Config) ->
 oversized_initial_headers_test(_Config) ->
     Settings = #{max_header_list_size => 100},
     Conn0 = nhttp_h2:new(server, Settings),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     Block = binary:copy(<<"x">>, 200),
     {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, nofin, Block),
     {error, {connection_error, enhance_your_calm, _}} =
@@ -1611,8 +1610,7 @@ oversized_initial_headers_test(_Config) ->
 decoded_header_list_too_large_test(_Config) ->
     Settings = #{max_header_list_size => 200},
     Conn0 = nhttp_h2:new(server, Settings),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     StaticIdx = list_to_binary(
         lists:duplicate(20, 16#82) ++
             lists:duplicate(20, 16#84)
@@ -1657,7 +1655,7 @@ stream_window_overflow(_Config) ->
     ok.
 
 push_promise_rejected(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     HeaderBlock = encode_headers(minimal_request_headers()),
     {ok, PushFrame} = nhttp_h2_frame:push_promise(1, 2, fin, HeaderBlock),
     {ok, [], _Conn1, RstFrame} = nhttp_h2:recv(Conn0, iolist_to_binary(PushFrame)),
@@ -1682,7 +1680,7 @@ ping_received_test(_Config) ->
     ok.
 
 settings_ack_received(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, SettingsAckFrame} = nhttp_h2_frame:settings_ack(),
     {ok, Events, Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(SettingsAckFrame)),
     ?assertEqual([settings_ack], Events),
@@ -1757,8 +1755,7 @@ close_stream_nonexistent(_Config) ->
 -spec server_with_preface() -> nhttp_h2:conn().
 server_with_preface() ->
     Conn0 = nhttp_h2:new(server),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     Conn1.
 
 -doc "Encode headers using HPACK (for test data generation).".
@@ -1997,8 +1994,7 @@ multiple_host_test(_Config) ->
 
 extended_connect_accepted_test(_Config) ->
     Conn0 = nhttp_h2:new(server, #{enable_connect_protocol => true}),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     HeaderBlock = encode_headers([
         {<<":method">>, <<"CONNECT">>},
         {<<":scheme">>, <<"https">>},
@@ -2029,8 +2025,7 @@ extended_connect_not_enabled_test(_Config) ->
 
 protocol_without_connect_test(_Config) ->
     Conn0 = nhttp_h2:new(server, #{enable_connect_protocol => true}),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     HeaderBlock = encode_headers([
         {<<":method">>, <<"GET">>},
         {<<":scheme">>, <<"https">>},
@@ -2045,8 +2040,7 @@ protocol_without_connect_test(_Config) ->
 
 extended_connect_missing_authority_test(_Config) ->
     Conn0 = nhttp_h2:new(server, #{enable_connect_protocol => true}),
-    {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    Conn1 = server_with_preface(Conn0),
     HeaderBlock = encode_headers([
         {<<":method">>, <<"CONNECT">>},
         {<<":scheme">>, <<"https">>},
@@ -2148,7 +2142,7 @@ uppercase_header_name_test(_Config) ->
     ok.
 
 client_receives_even_stream_id_test(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     RespHeaders = encode_headers([{<<":status">>, <<"200">>}]),
     {ok, HeadersFrame} = nhttp_h2_frame:headers(1, fin, fin, RespHeaders),
     {error, {connection_error, protocol_error, _}} =
@@ -2166,7 +2160,7 @@ window_update_on_closed_stream_test(_Config) ->
     ok.
 
 response_missing_status_test(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     ReqHeaders = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, ReqHeaders, fin),
@@ -2185,7 +2179,7 @@ response_missing_status_test(_Config) ->
 
 -spec recv_client_response_status(binary()) -> {ok, [term()], term(), iodata()}.
 recv_client_response_status(StatusValue) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
     ReqHeaders = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, StreamId, ReqHeaders, fin),
@@ -2220,7 +2214,7 @@ response_status_out_of_class_test(_Config) ->
     ).
 
 response_bad_status_connection_survives_test(_Config) ->
-    Conn0 = nhttp_h2:new(client),
+    Conn0 = client_with_server_preface(),
     {ok, Stream1, Conn1} = nhttp_h2:open_stream(Conn0),
     ReqHeaders = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>}],
     {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, Stream1, ReqHeaders, fin),
@@ -2412,10 +2406,27 @@ local_reset_not_counted(_Config) ->
     ),
     ok.
 
+-spec client_with_server_preface() -> nhttp_h2:conn().
+client_with_server_preface() ->
+    client_with_server_preface(#{}).
+
+-spec client_with_server_preface(nhttp_h2:settings()) -> nhttp_h2:conn().
+client_with_server_preface(Settings) ->
+    client_with_server_preface(Settings, #{}).
+
+-spec client_with_server_preface(nhttp_h2:settings(), nhttp_h2:settings()) -> nhttp_h2:conn().
+client_with_server_preface(Settings, PeerSettings) ->
+    {ok, Frame} = nhttp_h2_frame:settings(PeerSettings),
+    {ok, [{settings, PeerSettings}], Conn, _Ack} =
+        nhttp_h2:recv(nhttp_h2:new(client, Settings), iolist_to_binary(Frame)),
+    Conn.
+
 -spec server_with_preface(nhttp_h2:conn()) -> nhttp_h2:conn().
 server_with_preface(Conn0) ->
     {ok, Preface} = nhttp_h2_frame:preface(),
-    {ok, [], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(Preface)),
+    {ok, Settings} = nhttp_h2_frame:settings(#{}),
+    {ok, [{settings, #{}}], Conn1, _Ack} =
+        nhttp_h2:recv(Conn0, iolist_to_binary([Preface, Settings])),
     Conn1.
 
 -spec reset_h2_rounds(nhttp_h2:conn(), nhttp_lib:stream_id(), non_neg_integer()) ->
