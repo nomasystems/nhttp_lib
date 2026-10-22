@@ -52,6 +52,7 @@ queue without restoring credit. A queued `fin` keeps the stream `open` until
 its frame goes out.
 """.
 
+-include("nhttp_h2.hrl").
 -include("nhttp_msg.hrl").
 
 %%%-----------------------------------------------------------------------------
@@ -182,8 +183,8 @@ CONTINUATION frames that carry the larger field section.
     header_table_size => non_neg_integer(),
     enable_push => boolean(),
     max_concurrent_streams => pos_integer() | infinity,
-    initial_window_size => 1..16#7fffffff,
-    max_frame_size => 16#4000..16#ffffff,
+    initial_window_size => 1..?H2_MAX_WINDOW_SIZE,
+    max_frame_size => ?H2_MIN_MAX_FRAME_SIZE..?H2_MAX_MAX_FRAME_SIZE,
     max_header_list_size => pos_integer() | infinity,
     max_continuation_frames => pos_integer() | infinity,
     enable_connect_protocol => boolean(),
@@ -274,21 +275,14 @@ stream with octets in the send queue. Nothing changed in either case.
 %%%-----------------------------------------------------------------------------
 %% INTERNAL CONSTANTS
 %%%-----------------------------------------------------------------------------
--define(H2_DEFAULT_INITIAL_WINDOW_SIZE, 65535).
--define(H2_MAX_WINDOW_SIZE, 16#7fffffff).
 -define(H2_MAX_STREAM_ID, 16#7fffffff).
--define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
--define(H2_PREFACE_LEN, 24).
+-define(H2_INITIAL_HEADER_TABLE_SIZE, 4096).
+-define(H2_INITIAL_WINDOW_SIZE, 65535).
 -define(H2_HEAP_BINARY_LIMIT, 64).
 -define(H2_REMAINDER_RETENTION_RATIO, 4).
 -define(H2_DEFAULT_MAX_SEND_BUFFER, 131072).
 -define(H2_LOCAL_RESET_MEMORY, 1024).
-
-%%%-----------------------------------------------------------------------------
-%% LOCAL MACROS (RFC 9113 SECTION 6.5.2)
-%%%-----------------------------------------------------------------------------
--define(H2_DEFAULT_HEADER_TABLE_SIZE, 4096).
--define(H2_DEFAULT_MAX_FRAME_SIZE, 16384).
+-define(H2_DEFAULT_MAX_CONCURRENT_STREAMS, 100).
 -define(H2_DEFAULT_MAX_HEADER_LIST_SIZE, 16384).
 -define(H2_CONTINUATION_HEADROOM, 8).
 
@@ -321,7 +315,7 @@ stream with octets in the send queue. Nothing changed in either case.
 
 -record(h2_conn, {
     role :: role(),
-    state = preface :: preface | open | closing | closed,
+    state = preface :: magic | preface | open | closing | closed,
     local_settings :: settings(),
     peer_settings :: settings(),
     settings_acked = false :: boolean(),
@@ -331,8 +325,8 @@ stream with octets in the send queue. Nothing changed in either case.
     active_stream_count = 0 :: non_neg_integer(),
     peer_streams_opened = 0 :: non_neg_integer(),
     peer_streams_reset = 0 :: non_neg_integer(),
-    send_window = ?H2_DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
-    recv_window = ?H2_DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
+    send_window = ?H2_INITIAL_WINDOW_SIZE :: integer(),
+    recv_window = ?H2_INITIAL_WINDOW_SIZE :: integer(),
     hpack_enc :: nhttp_hpack:state(),
     hpack_dec :: nhttp_hpack:state(),
     continuation_stream = undefined :: undefined | nhttp_lib:stream_id(),
@@ -363,7 +357,7 @@ new(Role) ->
 -spec new(role(), settings()) -> conn().
 new(Role, LocalSettings) ->
     MergedSettings = maps:merge(default_settings(), LocalSettings),
-    HeaderTableSize = maps:get(header_table_size, MergedSettings, ?H2_DEFAULT_HEADER_TABLE_SIZE),
+    HeaderTableSize = maps:get(header_table_size, MergedSettings, ?H2_INITIAL_HEADER_TABLE_SIZE),
     IndexPolicy = maps:get(hpack_index_policy, MergedSettings, #{}),
     MaxSendBuffer = maps:get(max_send_buffer, MergedSettings, ?H2_DEFAULT_MAX_SEND_BUFFER),
     MaxQueuedStreams = maps:get(max_queued_streams, MergedSettings, undefined),
@@ -371,9 +365,9 @@ new(Role, LocalSettings) ->
     {ok, HpackDec} = nhttp_hpack:new(HeaderTableSize),
     #h2_conn{
         role = Role,
-        state = preface,
+        state = initial_state(Role),
         local_settings = MergedSettings,
-        peer_settings = default_settings(),
+        peer_settings = initial_peer_settings(),
         next_stream_id = initial_stream_id(Role),
         hpack_enc = HpackEnc,
         hpack_dec = HpackDec,
@@ -416,17 +410,10 @@ The four-tuple arm carries frames for the caller to write: SETTINGS ACK,
 PING ACK and RST_STREAM, then the DATA frames the send queue emitted.
 """.
 -spec recv(conn(), binary()) -> recv_result().
-recv(#h2_conn{role = server, state = preface, buffer = <<>>} = Conn, Data) ->
-    maybe
-        ok ?= validate_preface_buffer(Data),
-        recv_loop(Conn, Data, [], [])
-    end;
-recv(#h2_conn{role = server, state = preface, buffer = Buffer} = Conn, Data) ->
-    Buffered = <<Buffer/binary, Data/binary>>,
-    maybe
-        ok ?= validate_preface_buffer(Buffered),
-        recv_loop(Conn#h2_conn{buffer = <<>>}, Buffered, [], [])
-    end;
+recv(#h2_conn{state = magic, buffer = <<>>} = Conn, Data) ->
+    recv_magic(Conn, Data);
+recv(#h2_conn{state = magic, buffer = Buffer} = Conn, Data) ->
+    recv_magic(Conn#h2_conn{buffer = <<>>}, <<Buffer/binary, Data/binary>>);
 recv(#h2_conn{buffer = <<>>} = Conn, Data) ->
     recv_loop(Conn, Data, [], []);
 recv(#h2_conn{buffer = Buffer} = Conn, Data) ->
@@ -607,13 +594,13 @@ open_stream(
     case check_peer_max_streams(ActiveCount, PeerSettings) of
         ok ->
             InitialWindow = maps:get(
-                initial_window_size, PeerSettings, ?H2_DEFAULT_INITIAL_WINDOW_SIZE
+                initial_window_size, PeerSettings, ?H2_INITIAL_WINDOW_SIZE
             ),
             Stream = #h2_stream{
                 id = StreamId,
                 state = idle,
                 send_window = InitialWindow,
-                recv_window = ?H2_DEFAULT_INITIAL_WINDOW_SIZE
+                recv_window = ?H2_INITIAL_WINDOW_SIZE
             },
             NewConn = Conn#h2_conn{
                 next_stream_id = StreamId + 2,
@@ -785,7 +772,7 @@ check_stream_concurrency(#h2_conn{
     active_stream_count = Count,
     local_settings = Settings
 }) ->
-    MaxStreams = maps:get(max_concurrent_streams, Settings, 100),
+    MaxStreams = maps:get(max_concurrent_streams, Settings, ?H2_DEFAULT_MAX_CONCURRENT_STREAMS),
     case MaxStreams of
         infinity -> ok;
         Max when Count >= Max -> {error, at_limit};
@@ -1011,10 +998,10 @@ validate_header_sequence(_IsTrailers, _EndStream, _StreamId) ->
 -spec default_settings() -> settings().
 default_settings() ->
     #{
-        header_table_size => ?H2_DEFAULT_HEADER_TABLE_SIZE,
-        initial_window_size => ?H2_DEFAULT_INITIAL_WINDOW_SIZE,
-        max_frame_size => ?H2_DEFAULT_MAX_FRAME_SIZE,
-        max_concurrent_streams => 100,
+        header_table_size => ?H2_INITIAL_HEADER_TABLE_SIZE,
+        initial_window_size => ?H2_INITIAL_WINDOW_SIZE,
+        max_frame_size => ?H2_INITIAL_MAX_FRAME_SIZE,
+        max_concurrent_streams => ?H2_DEFAULT_MAX_CONCURRENT_STREAMS,
         max_header_list_size => ?H2_DEFAULT_MAX_HEADER_LIST_SIZE
     }.
 
@@ -1024,7 +1011,7 @@ derived_continuation_bound(Settings) ->
         infinity ->
             infinity;
         MaxList ->
-            MaxFrame = maps:get(max_frame_size, Settings, ?H2_DEFAULT_MAX_FRAME_SIZE),
+            MaxFrame = maps:get(max_frame_size, Settings, ?H2_INITIAL_MAX_FRAME_SIZE),
             (MaxList + MaxFrame - 1) div MaxFrame + ?H2_CONTINUATION_HEADROOM
     end.
 
@@ -1057,7 +1044,7 @@ do_send_data(
     Frames
 ) ->
     EffectiveWindow = min(ConnWindow, StreamWindow),
-    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_DEFAULT_MAX_FRAME_SIZE),
+    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_INITIAL_MAX_FRAME_SIZE),
     MaxSend = min(EffectiveWindow, MaxFrameSize),
     case DataSize =< MaxSend of
         true when EffectiveWindow > 0 ->
@@ -1326,7 +1313,7 @@ queued_streams_bound(#h2_conn{max_queued_streams = Bound}) ->
 drain_send_q(#h2_conn{send_window = ConnWindow} = Conn) when ConnWindow =< 0 ->
     {Conn, [], []};
 drain_send_q(#h2_conn{send_q = #send_q{order = Order}, peer_settings = PeerSettings} = Conn) ->
-    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_DEFAULT_MAX_FRAME_SIZE),
+    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_INITIAL_MAX_FRAME_SIZE),
     round_robin(Conn, MaxFrameSize, Order, queue:new(), queue:new(), [], #{}).
 
 -spec round_robin(
@@ -1514,7 +1501,7 @@ do_send_headers(
     EndStream
 ) ->
     {ok, HeaderBlock, NewHpackEnc} = nhttp_hpack:encode(Headers, HpackEnc),
-    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_DEFAULT_MAX_FRAME_SIZE),
+    MaxFrameSize = maps:get(max_frame_size, PeerSettings, ?H2_INITIAL_MAX_FRAME_SIZE),
     {ok, Frame} = nhttp_h2_frame:headers_with_continuation(
         StreamId, EndStream, HeaderBlock, MaxFrameSize
     ),
@@ -1536,13 +1523,13 @@ get_or_create_stream(#h2_conn{streams = Streams, peer_settings = PeerSettings}, 
     case maps:get(StreamId, Streams, undefined) of
         undefined ->
             InitialWindow = maps:get(
-                initial_window_size, PeerSettings, ?H2_DEFAULT_INITIAL_WINDOW_SIZE
+                initial_window_size, PeerSettings, ?H2_INITIAL_WINDOW_SIZE
             ),
             #h2_stream{
                 id = StreamId,
                 state = idle,
                 send_window = InitialWindow,
-                recv_window = ?H2_DEFAULT_INITIAL_WINDOW_SIZE
+                recv_window = ?H2_INITIAL_WINDOW_SIZE
             };
         Stream ->
             Stream
@@ -1561,6 +1548,20 @@ hpack_decode_opts(#h2_conn{local_settings = Settings}) ->
         Max -> #{max_list_size => Max}
     end.
 
+-spec initial_peer_settings() -> settings().
+initial_peer_settings() ->
+    #{
+        header_table_size => ?H2_INITIAL_HEADER_TABLE_SIZE,
+        initial_window_size => ?H2_INITIAL_WINDOW_SIZE,
+        max_frame_size => ?H2_INITIAL_MAX_FRAME_SIZE,
+        max_concurrent_streams => infinity,
+        max_header_list_size => infinity
+    }.
+
+-spec initial_state(role()) -> magic | preface.
+initial_state(server) -> magic;
+initial_state(client) -> preface.
+
 -spec initial_stream_id(role()) -> nhttp_lib:stream_id().
 initial_stream_id(client) -> 1;
 initial_stream_id(server) -> 2.
@@ -1575,8 +1576,7 @@ invalid_field_reason(invalid_header_value) ->
 
 -spec invalid_preface_error() -> {error, nhttp_h2_frame:decode_error()}.
 invalid_preface_error() ->
-    {error,
-        {connection_error, protocol_error, <<"Invalid connection preface (RFC 9113 Section 3.4)">>}}.
+    {error, {connection_error, protocol_error, ?H2_INVALID_PREFACE}}.
 
 -spec is_active_state(stream_state()) -> boolean().
 is_active_state(open) -> true;
@@ -1742,12 +1742,14 @@ process_frame(#h2_conn{continuation_stream = ExpectedId}, Frame) when
     {error,
         {connection_error, protocol_error,
             <<"Received non-CONTINUATION frame while expecting CONTINUATION (RFC 9113 Section 4.3)">>}};
-process_frame(#h2_conn{role = server, state = preface} = Conn, preface) ->
-    {ok, Conn#h2_conn{state = open}, [], []};
-process_frame(#h2_conn{role = server, state = preface}, _Frame) ->
+process_frame(#h2_conn{state = preface} = Conn, {settings, Settings}) ->
+    process_settings(Conn, Settings);
+process_frame(#h2_conn{state = preface}, _Frame) ->
     {error,
         {connection_error, protocol_error,
-            <<"Client must send connection preface first (RFC 9113 Section 3.4)">>}};
+            <<"Peer preface does not start with SETTINGS (RFC 9113 Section 3.4)">>}};
+process_frame(#h2_conn{}, preface) ->
+    invalid_preface_error();
 process_frame(
     #h2_conn{role = server, streams = Streams, last_peer_stream_id = LastPeer} = Conn,
     {rst_stream, StreamId, _ErrorCode}
@@ -1932,7 +1934,7 @@ process_settings(#h2_conn{peer_settings = OldSettings, streams = Streams} = Conn
                 0;
             NewInitialWindow ->
                 NewInitialWindow -
-                    maps:get(initial_window_size, OldSettings, ?H2_DEFAULT_INITIAL_WINDOW_SIZE)
+                    maps:get(initial_window_size, OldSettings, ?H2_INITIAL_WINDOW_SIZE)
         end,
     maybe
         {ok, NewStreams} ?= adjust_stream_windows(Streams, Delta),
@@ -1984,7 +1986,7 @@ rapid_reset_error() ->
 -spec recv_loop(conn(), binary(), [[event()]], iodata()) -> recv_result().
 recv_loop(Conn, Data, EventsAcc, ToSend) ->
     MaxFrameSize = maps:get(
-        max_frame_size, Conn#h2_conn.local_settings, ?H2_DEFAULT_MAX_FRAME_SIZE
+        max_frame_size, Conn#h2_conn.local_settings, ?H2_INITIAL_MAX_FRAME_SIZE
     ),
     case nhttp_h2_frame:decode(Data, MaxFrameSize) of
         {ok, Frame, Consumed} ->
@@ -2025,6 +2027,15 @@ finish_recv(Conn, Events, ToSend) ->
             recv_result(NewConn, Events, ToSend);
         {NewConn, Frames, Sent} ->
             {ok, Events ++ Sent, NewConn, [ToSend, Frames]}
+    end.
+
+-spec recv_magic(conn(), binary()) -> recv_result().
+recv_magic(Conn, <<?H2_PREFACE, Rest/binary>>) ->
+    recv_loop(Conn#h2_conn{state = preface}, Rest, [], []);
+recv_magic(Conn, Data) ->
+    maybe
+        ok ?= validate_preface_buffer(Data),
+        {ok, [], Conn#h2_conn{buffer = Data}}
     end.
 
 -spec recv_result(conn(), [event()], iodata()) -> recv_result().
@@ -2146,7 +2157,7 @@ validate_peer_stream_id(#h2_conn{role = client, last_peer_stream_id = LastPeer},
 -spec validate_preface_buffer(binary()) -> ok | {error, nhttp_h2_frame:decode_error()}.
 validate_preface_buffer(Data) ->
     PrefixLen = min(byte_size(Data), ?H2_PREFACE_LEN),
-    <<Expected:PrefixLen/binary, _/binary>> = ?H2_PREFACE,
+    <<Expected:PrefixLen/binary, _/binary>> = <<?H2_PREFACE>>,
     case Data of
         <<Expected:PrefixLen/binary, _/binary>> -> ok;
         _ -> invalid_preface_error()
@@ -2188,7 +2199,6 @@ validate_recv_flow(_ConnWindow, StreamWindow, StreamId) when StreamWindow < 0 ->
 validate_recv_flow(_ConnWindow, _StreamWindow, _StreamId) ->
     ok.
 
--define(CONNECTION_HEADERS_SET, ?NHTTP_MSG_CONNECTION_HEADERS_SET).
 -spec build_headers_event(
     role(), boolean(), nhttp_lib:stream_id(), nhttp_lib:headers(), fin(), conn()
 ) ->
@@ -2272,7 +2282,7 @@ validate_response_headers([{<<":status">>, _} | _], #{has_status := true}) ->
 validate_response_headers([{<<$:, _/binary>>, _} | _], _) ->
     {error, protocol_error};
 validate_response_headers([{Name, Value} | Rest], State) ->
-    case maps:is_key(Name, ?CONNECTION_HEADERS_SET) of
+    case maps:is_key(Name, ?NHTTP_MSG_CONNECTION_HEADERS_SET) of
         true ->
             {error, protocol_error};
         false ->

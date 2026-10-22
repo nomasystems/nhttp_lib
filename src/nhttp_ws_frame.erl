@@ -28,6 +28,8 @@ length legal for every control frame and §5.5.1 uses it for the close
 code and reason.
 """.
 
+-include("nhttp_ws.hrl").
+
 -compile(
     {inline, [
         {decode_complete, 6},
@@ -139,11 +141,6 @@ code and reason.
 %%%-----------------------------------------------------------------------------
 -define(MAX_CONTROL_PAYLOAD, 125).
 -define(MAX_CLOSE_REASON, (?MAX_CONTROL_PAYLOAD - 2)).
--define(OP_TEXT, 1).
--define(OP_BINARY, 2).
--define(OP_CLOSE, 8).
--define(OP_PING, 9).
--define(OP_PONG, 10).
 
 %%%-----------------------------------------------------------------------------
 %% ENCODE
@@ -272,29 +269,29 @@ Close payloads are validated against the reserved-code ranges of
 RFC 6455 §7.4.1 and the reason is checked as UTF-8.
 """.
 -spec opcode_to_complete_message(0..15, binary()) -> {ok, ws_message()} | {error, term()}.
-opcode_to_complete_message(?OP_TEXT, Data) ->
+opcode_to_complete_message(?WS_OP_TEXT, Data) ->
     case is_valid_utf8(Data) of
         true -> {ok, {text, Data}};
         false -> {error, invalid_utf8}
     end;
-opcode_to_complete_message(?OP_BINARY, Data) ->
+opcode_to_complete_message(?WS_OP_BINARY, Data) ->
     {ok, {binary, Data}};
-opcode_to_complete_message(?OP_CLOSE, <<>>) ->
+opcode_to_complete_message(?WS_OP_CLOSE, <<>>) ->
     {ok, close};
-opcode_to_complete_message(?OP_CLOSE, <<_:8>>) ->
+opcode_to_complete_message(?WS_OP_CLOSE, <<_:8>>) ->
     {error, invalid_close_payload};
-opcode_to_complete_message(?OP_CLOSE, <<Code:16, Reason/binary>>) ->
+opcode_to_complete_message(?WS_OP_CLOSE, <<Code:16, Reason/binary>>) ->
     case validate_close(Code, Reason) of
         ok -> {ok, {close, Code, Reason}};
         {error, _} = Error -> Error
     end;
-opcode_to_complete_message(?OP_PING, <<>>) ->
+opcode_to_complete_message(?WS_OP_PING, <<>>) ->
     {ok, ping};
-opcode_to_complete_message(?OP_PING, Data) ->
+opcode_to_complete_message(?WS_OP_PING, Data) ->
     {ok, {ping, Data}};
-opcode_to_complete_message(?OP_PONG, <<>>) ->
+opcode_to_complete_message(?WS_OP_PONG, <<>>) ->
     {ok, pong};
-opcode_to_complete_message(?OP_PONG, Data) ->
+opcode_to_complete_message(?WS_OP_PONG, Data) ->
     {ok, {pong, Data}};
 opcode_to_complete_message(Opcode, _) ->
     {error, {unknown_opcode, Opcode}}.
@@ -441,14 +438,14 @@ validate_message(_Message) ->
 %% INTERNAL: ENCODE
 %%%-----------------------------------------------------------------------------
 -spec encode_for(ws_message(), fun((0..15, iodata()) -> iodata())) -> iodata().
-encode_for({text, Data}, F) -> F(?OP_TEXT, Data);
-encode_for({binary, Data}, F) -> F(?OP_BINARY, Data);
-encode_for(ping, F) -> F(?OP_PING, <<>>);
-encode_for({ping, Data}, F) -> F(?OP_PING, Data);
-encode_for(pong, F) -> F(?OP_PONG, <<>>);
-encode_for({pong, Data}, F) -> F(?OP_PONG, Data);
-encode_for(close, F) -> F(?OP_CLOSE, <<>>);
-encode_for({close, Code, Reason}, F) -> F(?OP_CLOSE, <<Code:16, Reason/binary>>).
+encode_for({text, Data}, F) -> F(?WS_OP_TEXT, Data);
+encode_for({binary, Data}, F) -> F(?WS_OP_BINARY, Data);
+encode_for(ping, F) -> F(?WS_OP_PING, <<>>);
+encode_for({ping, Data}, F) -> F(?WS_OP_PING, Data);
+encode_for(pong, F) -> F(?WS_OP_PONG, <<>>);
+encode_for({pong, Data}, F) -> F(?WS_OP_PONG, Data);
+encode_for(close, F) -> F(?WS_OP_CLOSE, <<>>);
+encode_for({close, Code, Reason}, F) -> F(?WS_OP_CLOSE, <<Code:16, Reason/binary>>).
 
 -spec encode_frame(0..15, iodata()) -> iodata().
 encode_frame(Opcode, Data) ->

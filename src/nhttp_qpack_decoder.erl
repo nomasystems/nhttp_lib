@@ -26,6 +26,8 @@ failure a connection error. An invalid field never enters the dynamic table,
 so a name or a value that arrives as a table index needs no second read.
 """.
 
+-include("nhttp_qpack.hrl").
+
 -compile({inline, [check_field/2, check_value/2, tag/2]}).
 
 %%%-----------------------------------------------------------------------------
@@ -167,7 +169,7 @@ new(Config) ->
     {ok, #qpack_dec{
         dynamic_table = Table,
         max_table_capacity = MaxCap,
-        max_entries = MaxCap div 32,
+        max_entries = MaxCap div ?QPACK_ENTRY_OVERHEAD,
         max_blocked_streams = MaxBlocked,
         known_sending_count = 0,
         blocked_streams = #{},

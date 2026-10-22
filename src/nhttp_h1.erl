@@ -270,8 +270,6 @@ encoder never repairs the value and never strips a byte from it.
 -define(REQUEST_LINE_ALLOWANCE, 8192).
 -define(MAX_CHUNK_SIZE_LINE, 1024).
 
--define(VALUE_WORD_SCAN_MIN, 112).
-
 %%%-----------------------------------------------------------------------------
 %% COMPILED PATTERNS
 %%%-----------------------------------------------------------------------------
@@ -1529,7 +1527,7 @@ validate_field_name(Name, NamePat) ->
     end.
 
 -spec validate_field_value(binary(), binary:cp()) -> ok | {error, encode_error()}.
-validate_field_value(Value, ValuePat) when byte_size(Value) < ?VALUE_WORD_SCAN_MIN ->
+validate_field_value(Value, ValuePat) when byte_size(Value) < ?NHTTP_VALUE_WORD_SCAN_MIN ->
     case binary:match(Value, ValuePat) of
         nomatch -> ok;
         _ -> {error, {invalid_field_value, Value}}

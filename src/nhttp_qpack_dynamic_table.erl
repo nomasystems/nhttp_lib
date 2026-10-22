@@ -11,6 +11,8 @@ Lookups are constant time in both directions: forward from an absolute
 index to an entry, and reverse from a name and value to an absolute index.
 """.
 
+-include("nhttp_qpack.hrl").
+
 %%%-----------------------------------------------------------------------------
 %% EXPORTS
 %%%-----------------------------------------------------------------------------
@@ -35,11 +37,6 @@ index to an entry, and reverse from a name and value to an absolute index.
 %% TYPES
 %%%-----------------------------------------------------------------------------
 -type entry() :: {binary(), binary()}.
-
-%%%-----------------------------------------------------------------------------
-%% CONSTANTS
-%%%-----------------------------------------------------------------------------
--define(ENTRY_OVERHEAD, 32).
 
 %%%-----------------------------------------------------------------------------
 %% RECORDS
@@ -203,7 +200,7 @@ insert_count(#table{insert_count = IC}) -> IC.
 -doc false.
 -spec entry_size(binary(), binary()) -> pos_integer().
 entry_size(Name, Value) ->
-    byte_size(Name) + byte_size(Value) + ?ENTRY_OVERHEAD.
+    byte_size(Name) + byte_size(Value) + ?QPACK_ENTRY_OVERHEAD.
 
 -doc false.
 -spec evict_to_fit(t()) -> t().

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `nhttp_h2:recv/2` answers a connection preface out of place with a
+  PROTOCOL_ERROR connection error. A second preface on a server and any
+  preface on a client raised `function_clause`.
+- `nhttp_h2:recv/2` requires a SETTINGS frame without ACK as the first
+  frame of the peer preface, after the client magic on a server and from
+  the start on a client (RFC 9113 Section 3.4). Any other frame is a
+  PROTOCOL_ERROR connection error. The connection leaves the preface on
+  that SETTINGS frame only.
+- `nhttp_h2:peer_settings/1` starts at the RFC 9113 Section 6.5.2 initial
+  values. `max_concurrent_streams` and `max_header_list_size` are
+  `infinity` until the peer sends them. Without
+  SETTINGS_MAX_CONCURRENT_STREAMS from the peer, `open_stream/1` refused
+  the 101st stream. The default send queue bound is a quarter of the value that the peer
+  sent, and `infinity` before that value arrives. `max_send_buffer` still
+  bounds the octets.
+
 ## [2.0.0]
 
 ### Added

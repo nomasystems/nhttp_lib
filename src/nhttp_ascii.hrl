@@ -13,3 +13,5 @@
 -define(NHTTP_FIELD_VALUE_BAD_BYTES,
     [<<C>> || C <- lists:seq(16#00, 16#1F), C =/= $\t] ++ [<<16#7F>>]
 ).
+
+-define(NHTTP_VALUE_WORD_SCAN_MIN, 112).

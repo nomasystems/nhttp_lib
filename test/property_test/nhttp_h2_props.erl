@@ -19,9 +19,8 @@ prop_headers_roundtrip() ->
             {ok, StreamId, ClientConn1} = nhttp_h2:open_stream(ClientConn0),
             {ok, _ClientConn2, Frame} = nhttp_h2:send_headers(ClientConn1, StreamId, Headers, fin),
 
-            ServerConn0 = nhttp_h2:new(server),
-            {ok, ClientPreface} = nhttp_h2_frame:preface(),
-            Data = <<ClientPreface/binary, (iolist_to_binary(Frame))/binary>>,
+            ServerConn0 = server_with_preface(),
+            Data = iolist_to_binary(Frame),
             case nhttp_h2:recv(ServerConn0, Data) of
                 {ok, [{request, StreamId, Request, fin}], _ServerConn1} ->
                     nhttp_props_helpers:request_matches(Headers, Request);
@@ -46,9 +45,8 @@ prop_data_roundtrip() ->
                 ClientConn1, StreamId, Headers, nofin
             ),
             {ok, _ClientConn3, DataFrames} = nhttp_h2:send_data(ClientConn2, StreamId, Data, fin),
-            ServerConn0 = nhttp_h2:new(server),
-            {ok, ClientPreface} = nhttp_h2_frame:preface(),
-            HeaderData = <<ClientPreface/binary, (iolist_to_binary(HeaderFrame))/binary>>,
+            ServerConn0 = server_with_preface(),
+            HeaderData = iolist_to_binary(HeaderFrame),
             {ok, _, ServerConn1} = nhttp_h2:recv(ServerConn0, HeaderData),
             case nhttp_h2:recv(ServerConn1, iolist_to_binary(DataFrames)) of
                 {ok, Events, _} ->
@@ -75,15 +73,14 @@ prop_request_response_roundtrip() ->
         {ReqHeaders, RespHeaders},
         {request_headers_gen(), response_headers_gen()},
         begin
-            ClientConn0 = nhttp_h2:new(client),
+            ClientConn0 = client_with_server_preface(),
             {ok, StreamId, ClientConn1} = nhttp_h2:open_stream(ClientConn0),
             {ok, ClientConn2, ReqFrame} = nhttp_h2:send_headers(
                 ClientConn1, StreamId, ReqHeaders, fin
             ),
 
-            ServerConn0 = nhttp_h2:new(server),
-            {ok, ClientPreface} = nhttp_h2_frame:preface(),
-            ReqData = <<ClientPreface/binary, (iolist_to_binary(ReqFrame))/binary>>,
+            ServerConn0 = server_with_preface(),
+            ReqData = iolist_to_binary(ReqFrame),
             case nhttp_h2:recv(ServerConn0, ReqData) of
                 {ok, [{request, StreamId, Request, fin}], ServerConn1} ->
                     {ok, _ServerConn2, RespFrame} = nhttp_h2:send_headers(
@@ -157,7 +154,7 @@ prop_flow_control_window() ->
         Increment,
         int(1, 1000000),
         begin
-            Conn0 = nhttp_h2:new(client),
+            Conn0 = client_with_server_preface(),
             {ok, Frame} = nhttp_h2_frame:window_update(Increment),
             case nhttp_h2:recv(Conn0, iolist_to_binary(Frame)) of
                 {ok, [{window_update, 0, Increment}], Conn1} ->
@@ -268,9 +265,8 @@ prop_continuation_sequence() ->
             HeaderBlock = iolist_to_binary(Encoded),
             StreamId = 1,
             Frames = split_into_headers_continuation(HeaderBlock, StreamId, NumChunks),
-            ServerConn0 = nhttp_h2:new(server),
-            {ok, ClientPreface} = nhttp_h2_frame:preface(),
-            Data = <<ClientPreface/binary, (iolist_to_binary(Frames))/binary>>,
+            ServerConn0 = server_with_preface(),
+            Data = iolist_to_binary(Frames),
             case nhttp_h2:recv(ServerConn0, Data) of
                 {ok, Events, _ServerConn1} ->
                     %% Either a single request event reassembled, or 0 events (more bytes needed).
@@ -462,6 +458,78 @@ data_gen() ->
         binary(Size)
     ).
 
+-spec prop_preface_split_reaches_open() -> triq:property().
+prop_preface_split_reaches_open() ->
+    ?FORALL(
+        Settings,
+        settings_gen(),
+        begin
+            {ok, Frame} = nhttp_h2_frame:settings(Settings),
+            Preface = <<(literal_magic())/binary, (iolist_to_binary(Frame))/binary>>,
+            lists:all(
+                fun(At) -> preface_split_opens(Preface, At) end,
+                lists:seq(0, byte_size(Preface))
+            )
+        end
+    ).
+
+-spec preface_split_opens(binary(), non_neg_integer()) -> boolean().
+preface_split_opens(Preface, At) ->
+    <<Head:At/binary, Tail/binary>> = Preface,
+    SettingsAck = <<0:24, 16#04:8, 16#01:8, 0:32>>,
+    case recv_chunks(nhttp_h2:new(server), [Head, Tail], [], []) of
+        {ok, [{settings, _}], Conn, SettingsAck} -> answers_ping(Conn);
+        _ -> false
+    end.
+
+-spec answers_ping(nhttp_h2:conn()) -> boolean().
+answers_ping(Conn) ->
+    Ping = <<8:24, 16#06:8, 16#00:8, 0:32, "pingpong">>,
+    Pong = <<8:24, 16#06:8, 16#01:8, 0:32, "pingpong">>,
+    case recv_chunks(Conn, [Ping], [], []) of
+        {ok, [{ping, <<"pingpong">>}], _, Pong} -> true;
+        _ -> false
+    end.
+
+-spec prop_preface_wrong_octet_is_protocol_error() -> triq:property().
+prop_preface_wrong_octet_is_protocol_error() ->
+    ?FORALL(
+        {Position, Delta},
+        {int(0, 23), int(1, 255)},
+        begin
+            <<Head:Position/binary, Expected, Tail/binary>> = literal_magic(),
+            Wrong = <<Head/binary, (Expected bxor Delta), Tail/binary>>,
+            Octets = [<<Octet>> || <<Octet>> <= Wrong],
+            {Before, [Bad | _]} = lists:split(Position, Octets),
+            case recv_chunks(nhttp_h2:new(server), Before, [], []) of
+                {ok, [], Conn, <<>>} ->
+                    is_protocol_error(nhttp_h2:recv(Conn, Bad)) andalso
+                        is_protocol_error(nhttp_h2:recv(nhttp_h2:new(server), Wrong));
+                _ ->
+                    false
+            end
+        end
+    ).
+
+-spec is_protocol_error(nhttp_h2:recv_result()) -> boolean().
+is_protocol_error({error, {connection_error, protocol_error, _}}) -> true;
+is_protocol_error(_) -> false.
+
+-spec recv_chunks(nhttp_h2:conn(), [binary()], [nhttp_h2:event()], iodata()) ->
+    {ok, [nhttp_h2:event()], nhttp_h2:conn(), binary()} | {error, nhttp_h2_frame:decode_error()}.
+recv_chunks(Conn, [], Events, Out) ->
+    {ok, Events, Conn, iolist_to_binary(Out)};
+recv_chunks(Conn0, [Chunk | Chunks], Events, Out) ->
+    case nhttp_h2:recv(Conn0, Chunk) of
+        {ok, New, Conn1} -> recv_chunks(Conn1, Chunks, Events ++ New, Out);
+        {ok, New, Conn1, More} -> recv_chunks(Conn1, Chunks, Events ++ New, [Out, More]);
+        {error, _} = Error -> Error
+    end.
+
+-spec literal_magic() -> binary().
+literal_magic() ->
+    <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>.
+
 -spec settings_gen() -> triq_dom:domain().
 settings_gen() ->
     ?LET(
@@ -485,7 +553,7 @@ prop_send_within_credit() ->
         Ops,
         list(flow_op_gen()),
         begin
-            Conn0 = nhttp_h2:new(client),
+            Conn0 = client_with_server_preface(),
             {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
             Headers = [
                 {<<":method">>, <<"POST">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}
@@ -547,7 +615,7 @@ prop_send_data_conserves_body() ->
         {{Parent, Body}, ConnCredit, StreamCredit},
         {body_gen(), int(0, 100000), int(0, 100000)},
         begin
-            Conn0 = nhttp_h2:new(client),
+            Conn0 = client_with_server_preface(),
             {ok, StreamId, Conn1} = nhttp_h2:open_stream(Conn0),
             Headers = [
                 {<<":method">>, <<"POST">>}, {<<":scheme">>, <<"https">>}, {<<":path">>, <<"/">>}
@@ -733,9 +801,27 @@ remainder_retention(Rest, Parent, Body) ->
 own_size(Bin) ->
     binary:referenced_byte_size(binary:copy(Bin)).
 
+-spec server_with_preface() -> nhttp_h2:conn().
+server_with_preface() ->
+    {ok, Settings} = nhttp_h2_frame:settings(#{}),
+    {ok, [{settings, #{}}], Conn, _Ack} =
+        nhttp_h2:recv(nhttp_h2:new(server), <<(literal_magic())/binary, (iolist_to_binary(Settings))/binary>>),
+    Conn.
+
+-spec client_with_server_preface() -> nhttp_h2:conn().
+client_with_server_preface() ->
+    client_with_server_preface(#{}).
+
+-spec client_with_server_preface(nhttp_h2:settings()) -> nhttp_h2:conn().
+client_with_server_preface(LocalSettings) ->
+    {ok, Settings} = nhttp_h2_frame:settings(#{}),
+    {ok, [{settings, #{}}], Conn, _Ack} =
+        nhttp_h2:recv(nhttp_h2:new(client, LocalSettings), iolist_to_binary(Settings)),
+    Conn.
+
 -spec queued_conn() -> nhttp_h2:conn().
 queued_conn() ->
-    nhttp_h2:new(client, #{
+    client_with_server_preface(#{
         send_queue => true, max_send_buffer => infinity, max_queued_streams => infinity
     }).
 
