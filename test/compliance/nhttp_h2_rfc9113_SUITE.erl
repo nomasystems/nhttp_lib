@@ -79,6 +79,10 @@ groups() ->
             data_after_refused_stream_is_discarded,
             refused_headers_keep_the_hpack_decoder,
             refused_stream_advances_last_peer_stream_id,
+            window_update_after_malformed_request_is_ignored,
+            rst_stream_after_malformed_request_is_ignored,
+            malformed_request_advances_last_peer_stream_id,
+            headers_on_half_closed_remote_keep_the_hpack_decoder,
             data_after_codec_rst_stream_is_discarded,
             local_reset_memory_evicts_the_oldest_reset
         ]},
@@ -134,6 +138,9 @@ groups() ->
             invalid_field_value_char_is_stream_error,
             field_value_edge_whitespace_is_stream_error,
             invalid_field_keeps_the_dynamic_table_in_step,
+            malformed_request_keeps_the_hpack_decoder,
+            second_headers_without_end_stream_keep_the_hpack_decoder,
+            malformed_response_keeps_the_hpack_decoder,
             invalid_field_value_in_response_is_stream_error,
             invalid_field_value_in_trailers_is_stream_error,
             trailers_with_pseudo_header_is_stream_error,
@@ -631,6 +638,36 @@ refused_stream_advances_last_peer_stream_id(_Config) ->
     {ok, H3} = nhttp_h2_frame:headers(3, fin, fin, ReqBlock),
     {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn2, iolist_to_binary(H3)),
     ok.
+
+%% RFC 9113 Section 5.1: a frame on a stream this endpoint reset is ignored.
+window_update_after_malformed_request_is_ignored(_Config) ->
+    assert_frame_after_malformed_request_is_ignored(nhttp_h2_frame:window_update(1, 100)).
+
+rst_stream_after_malformed_request_is_ignored(_Config) ->
+    assert_frame_after_malformed_request_is_ignored(nhttp_h2_frame:rst_stream(1, cancel)).
+
+%% RFC 9113 Section 5.1.1: a malformed request opened its stream.
+malformed_request_advances_last_peer_stream_id(_Config) ->
+    Conn0 = server_with_preface(),
+    Bad = request_block(literal_plain(<<"x-test">>, <<"v ">>)),
+    {ok, H5} = nhttp_h2_frame:headers(5, fin, fin, Bad),
+    {ok, [], Conn1, _} = nhttp_h2:recv(Conn0, iolist_to_binary(H5)),
+    {ok, H3} = nhttp_h2_frame:headers(3, fin, fin, request_block(<<>>)),
+    {error, {connection_error, protocol_error, _}} = nhttp_h2:recv(Conn1, iolist_to_binary(H3)),
+    ok.
+
+%% RFC 9113 Section 4.3: a field block in a stream error still updates the
+%% HPACK decoder.
+headers_on_half_closed_remote_keep_the_hpack_decoder(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, fin, fin, request_block(<<>>)),
+    {ok, [{request, 1, _, fin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Late} = nhttp_h2_frame:headers(1, fin, fin, literal_indexed(<<"x-a">>, <<"b">>)),
+    {ok, [], Conn2, Out} = nhttp_h2:recv(Conn1, iolist_to_binary(Late)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, stream_closed}], 13}, nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    assert_request_indexes_entry_62(Conn2, 3).
 
 %% A stream that the codec reset for a stream window overflow is a stream
 %% this endpoint reset. More DATA on it is discarded and credited.
@@ -1285,6 +1322,51 @@ invalid_field_keeps_the_dynamic_table_in_step(_Config) ->
     ?assertEqual(<<"v">>, nhttp_headers:get(<<"x-bad">>, maps:get(headers, Request))),
     ok.
 
+malformed_request_keeps_the_hpack_decoder(_Config) ->
+    Conn0 = server_with_preface(),
+    Bad = <<16#82, 16#86, (literal_indexed(<<"x-a">>, <<"b">>))/binary>>,
+    {ok, H1} = nhttp_h2_frame:headers(1, fin, fin, Bad),
+    {ok, [], Conn1, Out} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, protocol_error}], 13},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    assert_request_indexes_entry_62(Conn1, 3).
+
+second_headers_without_end_stream_keep_the_hpack_decoder(_Config) ->
+    Conn0 = server_with_preface(),
+    {ok, H1} = nhttp_h2_frame:headers(1, nofin, fin, request_block(<<>>)),
+    {ok, [{request, 1, _, nofin}], Conn1} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    {ok, Second} = nhttp_h2_frame:headers(1, nofin, fin, literal_indexed(<<"x-a">>, <<"b">>)),
+    {ok, [], Conn2, Out} = nhttp_h2:recv(Conn1, iolist_to_binary(Second)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, protocol_error}], 13},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    assert_request_indexes_entry_62(Conn2, 3).
+
+malformed_response_keeps_the_hpack_decoder(_Config) ->
+    Conn0 = client_with_server_preface(),
+    {ok, First, Conn1} = nhttp_h2:open_stream(Conn0),
+    {ok, Conn2, _} = nhttp_h2:send_headers(Conn1, First, minimal_request_headers(), fin),
+    {ok, Second, Conn3} = nhttp_h2:open_stream(Conn2),
+    {ok, Conn4, _} = nhttp_h2:send_headers(Conn3, Second, minimal_request_headers(), fin),
+    Bad = <<
+        (literal_plain(<<":status">>, <<"700">>))/binary,
+        (literal_indexed(<<"x-a">>, <<"b">>))/binary
+    >>,
+    {ok, BadResp} = nhttp_h2_frame:headers(First, fin, fin, Bad),
+    {ok, [], Conn5, Out} = nhttp_h2:recv(Conn4, iolist_to_binary(BadResp)),
+    ?assertEqual(
+        {ok, [{rst_stream, First, protocol_error}], 13},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    {ok, GoodResp} = nhttp_h2_frame:headers(Second, fin, fin, <<16#88, 16#BE>>),
+    {ok, [{response, Second, Resp, fin}], _Conn6} = nhttp_h2:recv(
+        Conn5, iolist_to_binary(GoodResp)
+    ),
+    ?assertEqual(<<"b">>, nhttp_headers:get(<<"x-a">>, maps:get(headers, Resp))),
+    ok.
 
 %% RFC 9113 Section 8.2.1 applies to every field section. The decode precedes
 %% the request, response and trailer split, so all three refuse alike.
@@ -1606,3 +1688,25 @@ assert_field_block_rejected(Fields) ->
         {error, {connection_error, _, _}} = Err ->
             ct:fail("Expected stream error but got connection error: ~p", [Err])
     end.
+
+assert_frame_after_malformed_request_is_ignored({ok, Frame}) ->
+    Conn0 = server_with_preface(),
+    Bad = request_block(literal_plain(<<"x-test">>, <<"v ">>)),
+    {ok, H1} = nhttp_h2_frame:headers(1, fin, fin, Bad),
+    {ok, [], Conn1, Out} = nhttp_h2:recv(Conn0, iolist_to_binary(H1)),
+    ?assertEqual(
+        {ok, [{rst_stream, 1, protocol_error}], 13},
+        nhttp_h2_frame:decode_all(iolist_to_binary(Out))
+    ),
+    {ok, [], Conn2} = nhttp_h2:recv(Conn1, iolist_to_binary(Frame)),
+    {ok, H3} = nhttp_h2_frame:headers(3, fin, fin, request_block(<<>>)),
+    {ok, [{request, 3, _, fin}], _Conn3} = nhttp_h2:recv(Conn2, iolist_to_binary(H3)),
+    ok.
+
+assert_request_indexes_entry_62(Conn, StreamId) ->
+    {ok, Frame} = nhttp_h2_frame:headers(StreamId, fin, fin, request_block(<<16#BE>>)),
+    {ok, [{request, StreamId, Request, fin}], _Conn1} = nhttp_h2:recv(
+        Conn, iolist_to_binary(Frame)
+    ),
+    ?assertEqual(<<"b">>, nhttp_headers:get(<<"x-a">>, maps:get(headers, Request))),
+    ok.

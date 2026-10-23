@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the 101st stream. The default send queue bound is a quarter of the value that the peer
   sent, and `infinity` before that value arrives. `max_send_buffer` still
   bounds the octets.
+- `nhttp_h2:recv/2` ignores WINDOW_UPDATE and RST_STREAM on a stream that it
+  reset for a malformed request (RFC 9113 Section 5.1). They were a
+  PROTOCOL_ERROR connection error.
+- `nhttp_h2:recv/2` keeps the HPACK state of a malformed field section (RFC
+  9113 Section 4.3). A later section that indexed it was a COMPRESSION_ERROR
+  connection error.
 
 ## [2.0.0]
 

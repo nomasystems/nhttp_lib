@@ -65,6 +65,7 @@ groups() ->
             uppercase_content_length_is_stream_error,
             uppercase_connection_header_is_stream_error,
             conformant_request_with_pseudo_headers_accepted,
+            malformed_request_leaves_the_connection_open,
             qpack_decompression_failure_is_connection_error
         ]},
         {section_5_connection, [parallel], [
@@ -395,6 +396,25 @@ conformant_request_with_pseudo_headers_accepted(_Config) ->
                 #{method := get, path := <<"/">>, headers := [{<<"x-custom">>, <<"a b">>}]}, fin}
         ],
         Events
+    ).
+
+%% RFC9114-4.1.2-2: a malformed request is a stream error, and the connection
+%% stays open.
+malformed_request_leaves_the_connection_open(_Config) ->
+    Server0 = server_with_table_capacity(),
+    Inserts = encoder_stream_inserts([{<<"x-a">>, <<"b">>}]),
+    {ok, [], Server1, _} = nhttp_h3:recv(Server0, ?PEER_ENC, Inserts, nofin),
+    Malformed = [
+        {literal, <<"x-v">>, <<"v ">>, false},
+        {literal, <<"x-v">>, <<" v">>, false},
+        {literal, <<"x-v">>, <<"\tv">>, false},
+        {literal, <<"x-v">>, <<"v\t">>, false},
+        {literal, <<"x-v">>, <<"a", 0, "b">>, false},
+        {literal, <<"connection">>, <<"close">>, false}
+    ],
+    lists:foreach(
+        fun({Before, Rep}) -> assert_next_request_decodes(Server1, Before, Rep) end,
+        [{Before, Rep} || Before <- [0, 1, 2], Rep <- Malformed]
     ).
 
 %% RFC9204-2.2-1: a reference to a static table entry that does not exist is
@@ -753,3 +773,29 @@ assert_h3_stream_error({error, {stream_error, _, ExpectedCode, _}}, ExpectedCode
     ok;
 assert_h3_stream_error(Other, ExpectedCode) ->
     ct:fail("Expected stream error ~p; got ~p", [ExpectedCode, Other]).
+
+assert_next_request_decodes(Server0, Before, MalformedRep) ->
+    GoodIds = [4 * N || N <- lists:seq(0, Before - 1)],
+    Server1 = lists:foldl(
+        fun(StreamId, Server) ->
+            {ok, [{request, StreamId, _, fin}], Next, _} =
+                nhttp_h3:recv(Server, StreamId, dynamic_request_frame([]), fin),
+            Next
+        end,
+        Server0,
+        GoodIds
+    ),
+    BadId = 4 * Before,
+    Bad = dynamic_request_frame([MalformedRep]),
+    assert_h3_stream_error(nhttp_h3:recv(Server1, BadId, Bad, fin), h3_message_error),
+    NextId = BadId + 4,
+    ?assertMatch(
+        {ok, [{request, NextId, #{headers := [{<<"x-a">>, <<"b">>}]}, fin}], _, _},
+        nhttp_h3:recv(Server1, NextId, dynamic_request_frame([]), fin)
+    ).
+
+dynamic_request_frame(Extra) ->
+    Pseudo = [{literal, Name, Value, false} || {Name, Value} <- minimal_request_headers()],
+    Section = raw_field_section(Pseudo ++ [{indexed, dynamic, 0} | Extra], 1, 1),
+    {ok, Frame} = nhttp_h3_frame:headers(Section),
+    iolist_to_binary(Frame).
