@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `nhttp_headers:get_exact/2,3`, a case-sensitive `get/2,3` for lists
+  with lowercase names.
+
 ### Fixed
 
 - `nhttp_h2:recv/2` answers a connection preface out of place with a

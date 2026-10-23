@@ -70,6 +70,16 @@ prop_lower_field_name_does_not_copy_a_lowercase_name() ->
         erts_debug:same(Name, nhttp_headers:lower_field_name(Name))
     ).
 
+-spec prop_get_exact_agrees_with_get_on_lowercase_names() -> triq:property().
+prop_get_exact_agrees_with_get_on_lowercase_names() ->
+    ?FORALL(
+        {Name, Headers, Default},
+        ?LET(Name, lowercase_name_gen(), {Name, lowercase_headers_gen(Name), default_gen()}),
+        nhttp_headers:get_exact(Name, Headers, Default) =:=
+            nhttp_headers:get(Name, Headers, Default) andalso
+            nhttp_headers:get_exact(Name, Headers) =:= nhttp_headers:get(Name, Headers)
+    ).
+
 %%%-----------------------------------------------------------------------------
 %%% GENERATORS
 %%%-----------------------------------------------------------------------------
@@ -165,6 +175,14 @@ lowercase_name_gen() ->
         field_name_gen(),
         byte_wise_lower(Name)
     ).
+
+-spec lowercase_headers_gen(binary()) -> triq_dom:domain().
+lowercase_headers_gen(Name) ->
+    list({oneof([Name, lowercase_name_gen()]), field_value_gen()}).
+
+-spec default_gen() -> triq_dom:domain().
+default_gen() ->
+    elements([undefined, missing, <<>>, <<"fallback">>]).
 
 %%%-----------------------------------------------------------------------------
 %%% ORACLES

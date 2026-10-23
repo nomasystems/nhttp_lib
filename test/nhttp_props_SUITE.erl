@@ -199,7 +199,8 @@ groups() ->
             headers_field_name_accepts_only_the_rfc_octets,
             headers_field_value_agrees_with_the_octet_set,
             headers_lower_field_name_matches_byte_wise_lowercase,
-            headers_lower_field_name_does_not_copy_a_lowercase_name
+            headers_lower_field_name_does_not_copy_a_lowercase_name,
+            headers_get_exact_agrees_with_get_on_lowercase_names
         ]}
     ].
 
@@ -684,4 +685,9 @@ headers_lower_field_name_matches_byte_wise_lowercase(Config) ->
 headers_lower_field_name_does_not_copy_a_lowercase_name(Config) ->
     run_property(
         nhttp_headers_props, prop_lower_field_name_does_not_copy_a_lowercase_name, Config
+    ).
+
+headers_get_exact_agrees_with_get_on_lowercase_names(Config) ->
+    run_property(
+        nhttp_headers_props, prop_get_exact_agrees_with_get_on_lowercase_names, Config
     ).

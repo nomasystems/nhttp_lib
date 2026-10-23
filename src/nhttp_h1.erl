@@ -1078,10 +1078,7 @@ derive_authority(<<"http://", Rest/binary>>, Headers) ->
 derive_authority(<<"https://", Rest/binary>>, Headers) ->
     extract_authority_from_uri(Rest, Headers);
 derive_authority(_Path, Headers) ->
-    case nhttp_headers:get(<<"host">>, Headers) of
-        undefined -> <<>>;
-        Host -> Host
-    end.
+    nhttp_headers:get_exact(<<"host">>, Headers, <<>>).
 
 -spec detect_body_mode(nhttp_lib:headers()) ->
     body_mode()
@@ -1316,10 +1313,7 @@ extract_authority_from_uri(Rest, Headers) ->
         nomatch ->
             Rest;
         {0, _} ->
-            case nhttp_headers:get(<<"host">>, Headers) of
-                undefined -> <<>>;
-                Host -> Host
-            end;
+            nhttp_headers:get_exact(<<"host">>, Headers, <<>>);
         {Pos, _} ->
             binary:part(Rest, 0, Pos)
     end.
