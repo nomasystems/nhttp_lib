@@ -46,6 +46,7 @@ groups() ->
             parse_populates_default_scheme,
             parse_populates_scheme_from_opts,
             parse_populates_authority_from_host,
+            parse_populates_authority_from_host_in_any_case,
             parse_populates_authority_from_absolute_uri,
             parse_populates_authority_https_absolute_uri,
             parse_populates_authority_absolute_uri_no_path,
@@ -314,6 +315,13 @@ parse_populates_authority_from_host(_Config) ->
     Data = <<"GET /path HTTP/1.1\r\nHost: example.com:8080\r\n\r\n">>,
     {ok, Req, _} = nhttp_h1:parse_request(Data),
     ?assertEqual(<<"example.com:8080">>, maps:get(authority, Req)).
+
+parse_populates_authority_from_host_in_any_case(_Config) ->
+    Data = <<"GET /path HTTP/1.1\r\nHOST: Example.com\r\n\r\n">>,
+    {ok, Req, _} = nhttp_h1:parse_request(Data),
+    ?assertEqual(<<"Example.com">>, maps:get(authority, Req)),
+    {ok, Req2, _, _} = nhttp_h1:parse_request_headers(Data),
+    ?assertEqual(<<"Example.com">>, maps:get(authority, Req2)).
 
 parse_populates_authority_from_absolute_uri(_Config) ->
     Data = <<"GET http://origin.example.com/foo HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n">>,

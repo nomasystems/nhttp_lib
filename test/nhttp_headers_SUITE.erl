@@ -15,6 +15,7 @@
 all() ->
     [
         {group, get},
+        {group, get_exact},
         {group, has},
         {group, mutation},
         {group, filter},
@@ -35,6 +36,12 @@ groups() ->
             get_matches_stored_mixed_case,
             get_returns_first_when_duplicate,
             get_handles_empty_headers
+        ]},
+        {get_exact, [parallel], [
+            get_exact_first_match,
+            get_exact_default_when_absent,
+            get_exact_returns_first_when_duplicate,
+            get_exact_misses_a_name_in_another_case
         ]},
         {has, [parallel], [
             has_present,
@@ -157,6 +164,37 @@ get_returns_first_when_duplicate(_Config) ->
 get_handles_empty_headers(_Config) ->
     ?assertEqual(undefined, nhttp_headers:get(<<"x">>, [])),
     ?assertEqual(default, nhttp_headers:get(<<"x">>, [], default)).
+
+%%%-----------------------------------------------------------------------------
+%%% GET EXACT
+%%%-----------------------------------------------------------------------------
+
+get_exact_first_match(_Config) ->
+    Headers = [
+        {<<"content-type">>, <<"text/html">>},
+        {<<"host">>, <<"localhost">>}
+    ],
+    ?assertEqual(<<"text/html">>, nhttp_headers:get_exact(<<"content-type">>, Headers)),
+    ?assertEqual(<<"localhost">>, nhttp_headers:get_exact(<<"host">>, Headers, default)).
+
+get_exact_default_when_absent(_Config) ->
+    ?assertEqual(undefined, nhttp_headers:get_exact(<<"x">>, [])),
+    ?assertEqual(undefined, nhttp_headers:get_exact(<<"missing">>, [{<<"x">>, <<"1">>}])),
+    ?assertEqual(default, nhttp_headers:get_exact(<<"x">>, [], default)),
+    ?assertEqual(custom, nhttp_headers:get_exact(<<"missing">>, [{<<"x">>, <<"1">>}], custom)).
+
+get_exact_returns_first_when_duplicate(_Config) ->
+    Headers = [
+        {<<"set-cookie">>, <<"a=1">>},
+        {<<"set-cookie">>, <<"b=2">>}
+    ],
+    ?assertEqual(<<"a=1">>, nhttp_headers:get_exact(<<"set-cookie">>, Headers)).
+
+get_exact_misses_a_name_in_another_case(_Config) ->
+    Headers = [{<<"Host">>, <<"a">>}, {<<"content-length">>, <<"5">>}],
+    ?assertEqual(undefined, nhttp_headers:get_exact(<<"host">>, Headers)),
+    ?assertEqual(undefined, nhttp_headers:get_exact(<<"Content-Length">>, Headers)),
+    ?assertEqual(<<"a">>, nhttp_headers:get(<<"host">>, Headers)).
 
 %%%-----------------------------------------------------------------------------
 %%% HAS

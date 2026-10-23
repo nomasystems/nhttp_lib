@@ -13,7 +13,8 @@ Key invariants:
 
 - Header names compare case-insensitively (RFC 9110 §5.1). A lookup
   matches a stored name in any case, so `get/2` with
-  `<<"content-length">>` finds a stored `Content-Length`.
+  `<<"content-length">>` finds a stored `Content-Length`, except through
+  `get_exact/2,3`.
 - Multi-valued headers keep insertion order. `get/2,3` returns the
   first match. `delete/2` removes every occurrence. `append/3`
   appends and keeps existing entries.
@@ -42,6 +43,8 @@ lowercasing of `lower_field_name/1`.
     filter/2,
     get/2,
     get/3,
+    get_exact/2,
+    get_exact/3,
     has/2,
     has_forbidden_value_octet/1,
     is_tchar/1,
@@ -184,6 +187,19 @@ get(Name, Headers) ->
 get(Name, Headers, Default) ->
     Lower = to_lower(Name),
     do_get(Lower, Headers, Default).
+
+-doc "Like `get/2`, but case-sensitive. For lists with lowercase names only.".
+-spec get_exact(binary(), nhttp_lib:headers()) -> binary() | undefined.
+get_exact(Name, Headers) ->
+    get_exact(Name, Headers, undefined).
+
+-doc "Like `get/3`, but case-sensitive. For lists with lowercase names only.".
+-spec get_exact(binary(), nhttp_lib:headers(), Default) -> binary() | Default.
+get_exact(Name, Headers, Default) ->
+    case lists:keyfind(Name, 1, Headers) of
+        {_, Value} -> Value;
+        false -> Default
+    end.
 
 -doc "True iff a header with the given name exists. Case-insensitive.".
 -spec has(binary(), nhttp_lib:headers()) -> boolean().
