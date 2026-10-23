@@ -69,7 +69,6 @@ its frame goes out.
 -compile({inline, [transition_on_send_end_stream/2]}).
 -compile({inline, [validate_recv_data/2]}).
 -compile({inline, [validate_recv_length/4]}).
--compile({inline, [decode_header_block/3]}).
 -compile({inline, [validate_recv_headers/2]}).
 -compile({inline, [validate_header_sequence/3]}).
 -compile({inline, [validate_decoded_headers/5]}).
@@ -903,14 +902,28 @@ drop_header_block(#h2_conn{hpack_dec = HpackDec} = Conn, StreamId, HeaderBlock) 
     end.
 
 -spec decode_headers_internal(conn(), nhttp_lib:stream_id(), fin(), binary()) -> frame_result().
-decode_headers_internal(
+decode_headers_internal(#h2_conn{hpack_dec = HpackDec} = Conn, StreamId, EndStream, HeaderBlock) ->
+    case nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)) of
+        {ok, Headers, NewHpackDec} ->
+            apply_headers(Conn, StreamId, EndStream, Headers, NewHpackDec);
+        {invalid_field, Reason, NewHpackDec} ->
+            {stream_error, field_block_read(Conn, StreamId, NewHpackDec), StreamId, protocol_error,
+                invalid_field_reason(Reason)};
+        {error, HpackError} ->
+            hpack_decode_error(HpackError)
+    end.
+
+-spec apply_headers(
+    conn(), nhttp_lib:stream_id(), fin(), nhttp_lib:headers(), nhttp_hpack:state()
+) -> frame_result().
+apply_headers(
     #h2_conn{role = Role, streams = Streams, local_settings = Settings} = Conn,
     StreamId,
     EndStream,
-    HeaderBlock
+    Headers,
+    NewHpackDec
 ) ->
     maybe
-        {ok, Headers, NewHpackDec} ?= decode_header_block(Conn, StreamId, HeaderBlock),
         #h2_stream{state = OldState, headers_received = IsTrailers} =
             Stream = get_or_create_stream(Conn, StreamId),
         ok ?= validate_recv_headers(OldState, StreamId),
@@ -945,22 +958,18 @@ decode_headers_internal(
         {ok, Events} ?=
             build_headers_event(Role, IsTrailers, StreamId, Headers, EndStream, NewConn),
         {ok, NewConn, Events, []}
+    else
+        {error, {stream_error, StreamId, ErrorCode, Reason}} ->
+            {stream_error, field_block_read(Conn, StreamId, NewHpackDec), StreamId, ErrorCode,
+                Reason};
+        {error, {connection_error, _ErrorCode, _Reason}} = Error ->
+            Error
     end.
 
--spec decode_header_block(conn(), nhttp_lib:stream_id(), binary()) ->
-    {ok, nhttp_lib:headers(), nhttp_hpack:state()}
-    | {stream_error, conn(), nhttp_lib:stream_id(), error_code(), binary()}
-    | {error, nhttp_h2_frame:decode_error()}.
-decode_header_block(#h2_conn{hpack_dec = HpackDec} = Conn, StreamId, HeaderBlock) ->
-    case nhttp_hpack:decode(HeaderBlock, HpackDec, hpack_decode_opts(Conn)) of
-        {ok, _Headers, _NewHpackDec} = Decoded ->
-            Decoded;
-        {invalid_field, Reason, NewHpackDec} ->
-            {stream_error, Conn#h2_conn{hpack_dec = NewHpackDec}, StreamId, protocol_error,
-                invalid_field_reason(Reason)};
-        {error, HpackError} ->
-            hpack_decode_error(HpackError)
-    end.
+-doc "Keep the HPACK state and open the stream (RFC 9113 Section 4.3, Section 5.1).".
+-spec field_block_read(conn(), nhttp_lib:stream_id(), nhttp_hpack:state()) -> conn().
+field_block_read(#h2_conn{last_peer_stream_id = LastPeer} = Conn, StreamId, NewHpackDec) ->
+    Conn#h2_conn{hpack_dec = NewHpackDec, last_peer_stream_id = max(LastPeer, StreamId)}.
 
 -spec hpack_decode_error(nhttp_hpack:decode_error()) -> {error, nhttp_h2_frame:decode_error()}.
 hpack_decode_error(header_list_too_large) ->

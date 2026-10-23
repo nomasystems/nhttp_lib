@@ -511,6 +511,118 @@ prop_preface_wrong_octet_is_protocol_error() ->
         end
     ).
 
+%% RFC 9113 Sections 4.3, 5.1 and 8.1.1.
+-spec prop_malformed_request_resets_only_its_stream() -> triq:property().
+prop_malformed_request_resets_only_its_stream() ->
+    ?FORALL(
+        {Malformed, Before, BadFin, Split, FollowUps},
+        {malformed_section_gen(), int(0, 3), oneof([fin, nofin]), bool(), list(follow_up_gen())},
+        begin
+            BadId = 2 * Before + 1,
+            NextId = BadId + 2,
+            GoodIds = lists:seq(1, BadId - 2, 2),
+            Block = <<Malformed/binary, 16#40, 3, "x-p", 1, "q">>,
+            Chunks =
+                [request_frame(Id, <<>>) || Id <- GoodIds] ++
+                    [malformed_frames(BadId, BadFin, Split, Block)] ++
+                    [follow_up_frame(BadId, FollowUp) || FollowUp <- FollowUps] ++
+                    [request_frame(NextId, <<16#BE>>)],
+            case recv_chunks(server_with_preface(), Chunks, [], []) of
+                {ok, Events, _Conn, Out} ->
+                    {ok, Frames, _} = nhttp_h2_frame:decode_all(Out),
+                    Requests = [{Id, Req} || {request, Id, Req, fin} <- Events],
+                    {_, Next} = lists:last(Requests),
+                    length(Events) =:= length(Requests) andalso
+                        [Id || {Id, _} <- Requests] =:= GoodIds ++ [NextId] andalso
+                        nhttp_headers:get(<<"x-p">>, maps:get(headers, Next)) =:= <<"q">> andalso
+                        [Rst || {rst_stream, _, _} = Rst <- Frames] =:=
+                            [{rst_stream, BadId, protocol_error}];
+                {error, _} ->
+                    false
+            end
+        end
+    ).
+
+-spec malformed_section_gen() -> triq_dom:domain().
+malformed_section_gen() ->
+    oneof([
+        ?LET(Value, malformed_value_gen(), minimal_request(literal_plain(<<"x-v">>, Value))),
+        minimal_request(literal_plain(<<"X-Up">>, <<"v">>)),
+        minimal_request(literal_plain(<<"connection">>, <<"close">>)),
+        minimal_request(literal_plain(<<"te">>, <<"gzip">>)),
+        <<16#82, 16#86>>
+    ]).
+
+-spec malformed_value_gen() -> triq_dom:domain().
+malformed_value_gen() ->
+    oneof([
+        ?LET({Edge, Body}, {oneof([$\s, $\t]), value_body_gen()}, <<Edge, Body/binary>>),
+        ?LET({Edge, Body}, {oneof([$\s, $\t]), value_body_gen()}, <<Body/binary, Edge>>),
+        ?LET(
+            {Octet, Head, Tail},
+            {oneof([16#00, $\r, $\n]), value_body_gen(), value_body_gen()},
+            <<Head/binary, Octet, Tail/binary>>
+        )
+    ]).
+
+-spec value_body_gen() -> triq_dom:domain().
+value_body_gen() ->
+    ?LET(Chars, list(int($a, $z)), list_to_binary(lists:sublist(Chars, 20))).
+
+-spec follow_up_gen() -> triq_dom:domain().
+follow_up_gen() ->
+    oneof([
+        ?LET(Increment, int(1, 65535), {window_update, Increment}),
+        ?LET(Size, int(0, 64), {data, binary:copy(<<"d">>, Size)}),
+        rst_stream,
+        priority,
+        trailers
+    ]).
+
+-spec follow_up_frame(
+    nhttp_lib:stream_id(),
+    {window_update, pos_integer()} | {data, binary()} | rst_stream | priority | trailers
+) -> binary().
+follow_up_frame(StreamId, {window_update, Increment}) ->
+    {ok, Frame} = nhttp_h2_frame:window_update(StreamId, Increment),
+    Frame;
+follow_up_frame(StreamId, {data, Payload}) ->
+    {ok, Frame} = nhttp_h2_frame:data(StreamId, fin, Payload),
+    iolist_to_binary(Frame);
+follow_up_frame(StreamId, rst_stream) ->
+    {ok, Frame} = nhttp_h2_frame:rst_stream(StreamId, cancel),
+    Frame;
+follow_up_frame(StreamId, priority) ->
+    Priority = #{exclusive => false, stream_dependency => 0, weight => 16},
+    {ok, Frame} = nhttp_h2_frame:priority(StreamId, Priority),
+    iolist_to_binary(Frame);
+follow_up_frame(StreamId, trailers) ->
+    {ok, Frame} = nhttp_h2_frame:headers(StreamId, fin, fin, literal_plain(<<"x-t">>, <<"1">>)),
+    iolist_to_binary(Frame).
+
+-spec malformed_frames(nhttp_lib:stream_id(), nhttp_h2:fin(), boolean(), binary()) -> binary().
+malformed_frames(StreamId, EndStream, false, Block) ->
+    {ok, Frame} = nhttp_h2_frame:headers(StreamId, EndStream, fin, Block),
+    iolist_to_binary(Frame);
+malformed_frames(StreamId, EndStream, true, Block) ->
+    {ok, Frames} = nhttp_h2_frame:headers_with_continuation(
+        StreamId, EndStream, Block, byte_size(Block) div 2
+    ),
+    iolist_to_binary(Frames).
+
+-spec request_frame(nhttp_lib:stream_id(), binary()) -> binary().
+request_frame(StreamId, Fields) ->
+    {ok, Frame} = nhttp_h2_frame:headers(StreamId, fin, fin, minimal_request(Fields)),
+    iolist_to_binary(Frame).
+
+-spec minimal_request(binary()) -> binary().
+minimal_request(Fields) ->
+    <<16#82, 16#86, 16#84, Fields/binary>>.
+
+-spec literal_plain(binary(), binary()) -> binary().
+literal_plain(Name, Value) ->
+    <<16#00, (byte_size(Name)), Name/binary, (byte_size(Value)), Value/binary>>.
+
 -spec is_protocol_error(nhttp_h2:recv_result()) -> boolean().
 is_protocol_error({error, {connection_error, protocol_error, _}}) -> true;
 is_protocol_error(_) -> false.
