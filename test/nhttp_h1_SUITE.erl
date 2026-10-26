@@ -252,7 +252,7 @@ parse_post_with_body(_Config) ->
     ?assertEqual(Body, maps:get(body, Req)).
 
 parse_all_methods(_Config) ->
-    Methods = [get, head, post, put, delete, options, trace, patch],
+    Methods = [get, head, post, put, delete, options, trace, patch, query],
     lists:foreach(
         fun(Method) ->
             MethodBin = nhttp_lib:encode_method(Method),
@@ -511,7 +511,7 @@ encode_request_custom_method(_Config) ->
     ?assertMatch(<<"PROPFIND / HTTP/1.1\r\n", _/binary>>, Bin).
 
 encode_request_all_methods(_Config) ->
-    Methods = [get, head, post, put, delete, connect, options, trace, patch],
+    Methods = [get, head, post, put, delete, connect, options, trace, patch, query],
     lists:foreach(
         fun(Method) ->
             Req = #{method => Method, path => <<"/">>, headers => []},
@@ -1065,6 +1065,7 @@ encode_method_coverage(_Config) ->
     ?assertEqual(<<"OPTIONS">>, nhttp_lib:encode_method(options)),
     ?assertEqual(<<"TRACE">>, nhttp_lib:encode_method(trace)),
     ?assertEqual(<<"PATCH">>, nhttp_lib:encode_method(patch)),
+    ?assertEqual(<<"QUERY">>, nhttp_lib:encode_method(query)),
     ?assertEqual(<<"CUSTOM">>, nhttp_lib:encode_method(<<"CUSTOM">>)).
 
 parse_unknown_method_with_crlf_before_space(_Config) ->

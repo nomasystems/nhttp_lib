@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `nhttp_headers:get_exact/2,3`, a case-sensitive `get/2,3` for lists
   with lowercase names.
+- The QUERY method (RFC 10008). `t:nhttp_lib:method/0` holds `query`, and
+  `nhttp_h1:parse_request_line/1` has a fast path for it.
+
+### Changed
+
+- `nhttp_lib:decode_method/1`, `nhttp_h1`, `nhttp_h2` and `nhttp_h3` return
+  `query` for the method `QUERY`. They returned `<<"QUERY">>`. A clause
+  that matches `<<"QUERY">>` no longer matches. A function with one clause
+  per method atom and a `when is_binary(M)` fallback raises
+  `function_clause` on `query`.
 
 ### Fixed
 

@@ -56,6 +56,7 @@ method_atom(<<"CONNECT">>) -> connect;
 method_atom(<<"OPTIONS">>) -> options;
 method_atom(<<"TRACE">>) -> trace;
 method_atom(<<"PATCH">>) -> patch;
+method_atom(<<"QUERY">>) -> query;
 method_atom(B) -> B.
 
 -spec scheme_atom(binary()) -> atom() | binary().

@@ -225,7 +225,8 @@ known_methods_return_atom(_Config) ->
         {<<"PATCH">>, patch},
         {<<"OPTIONS">>, options},
         {<<"CONNECT">>, connect},
-        {<<"TRACE">>, trace}
+        {<<"TRACE">>, trace},
+        {<<"QUERY">>, query}
     ],
     lists:foreach(
         fun({Bin, Atom}) ->

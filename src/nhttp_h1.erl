@@ -2437,6 +2437,8 @@ parse_request_line(<<"CONNECT ", Rest/binary>>) ->
     find_path_version(Rest, connect);
 parse_request_line(<<"TRACE ", Rest/binary>>) ->
     find_path_version(Rest, trace);
+parse_request_line(<<"QUERY ", Rest/binary>>) ->
+    find_path_version(Rest, query);
 parse_request_line(<<C, _/binary>> = Bin) when C >= $A, C =< $Z ->
     parse_request_line_token(Bin);
 parse_request_line(<<C, _/binary>>) when C >= $a, C =< $z ->

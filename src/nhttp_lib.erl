@@ -122,6 +122,7 @@ and are re-exported here as aliases (`ws_message/0`, `ws_frame/0`,
     | options
     | trace
     | patch
+    | query
     | binary().
 
 -type version() :: http1_0 | http1_1 | http2 | http3.
@@ -226,6 +227,7 @@ decode_method(<<"CONNECT">>) -> connect;
 decode_method(<<"OPTIONS">>) -> options;
 decode_method(<<"TRACE">>) -> trace;
 decode_method(<<"PATCH">>) -> patch;
+decode_method(<<"QUERY">>) -> query;
 decode_method(M) when is_binary(M) -> M.
 
 -doc """
@@ -251,6 +253,7 @@ encode_method(connect) -> <<"CONNECT">>;
 encode_method(options) -> <<"OPTIONS">>;
 encode_method(trace) -> <<"TRACE">>;
 encode_method(patch) -> <<"PATCH">>;
+encode_method(query) -> <<"QUERY">>;
 encode_method(M) when is_binary(M) -> M.
 
 -doc "Encode a URI / wire scheme to its binary form.".

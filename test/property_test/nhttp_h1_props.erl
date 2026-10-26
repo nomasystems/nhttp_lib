@@ -195,7 +195,7 @@ body_for_status(_Status, Body) ->
 
 -spec method_gen() -> triq_dom:domain().
 method_gen() ->
-    oneof([get, post, put, delete, head, options, patch]).
+    oneof([get, post, put, delete, head, options, patch, query]).
 
 -spec path_gen() -> triq_dom:domain().
 path_gen() ->
@@ -512,7 +512,7 @@ method_fuzz_gen() ->
 
 -spec method_is_rfc9110_token(nhttp_lib:method()) -> boolean().
 method_is_rfc9110_token(Method) when is_atom(Method) ->
-    lists:member(Method, [get, head, post, put, delete, connect, options, trace, patch]);
+    lists:member(Method, [get, head, post, put, delete, connect, options, trace, patch, query]);
 method_is_rfc9110_token(<<>>) ->
     false;
 method_is_rfc9110_token(Method) when is_binary(Method) ->
