@@ -187,7 +187,9 @@ structured(qpack, S0) ->
 structured(hpack, S0) ->
     hpack_block(S0);
 structured(h1, S0) ->
-    h1_message(S0).
+    h1_message(S0);
+structured(accept_query, S0) ->
+    accept_query_value(S0).
 
 %%%-----------------------------------------------------------------------------
 %%% WEBSOCKET (RFC 6455 SECTION 5.2)
@@ -629,6 +631,108 @@ h1_bodies() ->
         <<"\r\n">>
     ].
 
+
+%%%-----------------------------------------------------------------------------
+%%% ACCEPT-QUERY (RFC 10008 SECTION 3, RFC 9651 SECTION 4.2)
+%%%-----------------------------------------------------------------------------
+-doc """
+A List of one to four members. Each member, parameter key and parameter value
+comes from its valid set three times in four and from its hostile set
+otherwise, so that a share of the inputs reaches the media range check and the
+round trip, and the rest break one rule of the grammar.
+""".
+-spec accept_query_value(state()) -> {binary(), state()}.
+accept_query_value(S0) ->
+    {Lead, S1} = pick([<<>>, <<>>, <<" ">>, <<"  ">>, <<"\t">>], S0),
+    {Count, S2} = uniform(4, S1),
+    {Members, S3} = accept_query_members(Count, S2, []),
+    {Tail, S4} = pick([<<>>, <<>>, <<>>, <<" ">>, <<"\t">>, <<",">>, <<" x">>], S3),
+    {iolist_to_binary([Lead, Members, Tail]), S4}.
+
+-spec accept_query_members(pos_integer(), state(), [iodata()]) -> {iodata(), state()}.
+accept_query_members(1, S0, Acc) ->
+    {Member, S1} = accept_query_member(S0),
+    {lists:reverse([Member | Acc]), S1};
+accept_query_members(N, S0, Acc) ->
+    {Member, S1} = accept_query_member(S0),
+    {Sep, S2} = pick([<<", ">>, <<", ">>, <<",">>, <<" , ">>, <<"\t,\t">>, <<",,">>, <<" ">>], S1),
+    accept_query_members(N - 1, S2, [Sep, Member | Acc]).
+
+-spec accept_query_member(state()) -> {iodata(), state()}.
+accept_query_member(S0) ->
+    {Bare, S1} = accept_query_piece(accept_query_bare_items(), S0),
+    {Count, S2} = uniform0(3, S1),
+    {Params, S3} = accept_query_params(Count, S2, []),
+    {[Bare, Params], S3}.
+
+-spec accept_query_params(non_neg_integer(), state(), [iodata()]) -> {iodata(), state()}.
+accept_query_params(0, S, Acc) ->
+    {Acc, S};
+accept_query_params(N, S0, Acc) ->
+    {Space, S1} = pick([<<>>, <<>>, <<>>, <<>>, <<>>, <<" ">>, <<"\t">>], S0),
+    {Key, S2} = accept_query_piece(accept_query_param_keys(), S1),
+    {Value, S3} = accept_query_piece(accept_query_param_values(), S2),
+    accept_query_params(N - 1, S3, [Acc, $;, Space, Key, Value]).
+
+-spec accept_query_piece({[binary(), ...], [binary(), ...]}, state()) -> {binary(), state()}.
+accept_query_piece({Valid, Hostile}, S0) ->
+    case uniform0(4, S0) of
+        {0, S1} -> pick(Hostile, S1);
+        {_, S1} -> pick(Valid, S1)
+    end.
+
+-spec accept_query_bare_items() -> {[binary(), ...], [binary(), ...]}.
+accept_query_bare_items() ->
+    {
+        [
+            <<"application/sql">>,
+            <<"application/jsonpath">>,
+            <<"text/*">>,
+            <<"*/*">>,
+            <<"Application/XSLT+XML">>,
+            <<"\"3gpp/query\"">>,
+            <<"\"application/x-www-form-urlencoded\"">>
+        ],
+        [
+            <<"\"a\\\"b/c\"">>,
+            <<"*/sql">>,
+            <<"text">>,
+            <<"a:b/c">>,
+            <<"\"text plain\"">>,
+            <<"\"open">>,
+            <<"\"bad\\x\"">>,
+            <<"(a/b)">>,
+            <<"42">>,
+            <<"?1">>,
+            <<":AA==:">>,
+            <<"\"", 16#E9, "\"">>,
+            <<")">>
+        ]
+    }.
+
+-spec accept_query_param_keys() -> {[binary(), ...], [binary(), ...]}.
+accept_query_param_keys() ->
+    {[<<"charset">>, <<"a">>, <<"*x">>, <<"v1.2">>], [<<"A">>, <<"1">>, <<>>]}.
+
+-spec accept_query_param_values() -> {[binary(), ...], [binary(), ...]}.
+accept_query_param_values() ->
+    {
+        [
+            <<"=utf-8">>,
+            <<"=UTF-8">>,
+            <<"=\"utf-8\"">>,
+            <<"=\"a b;c\"">>,
+            <<"=\"\"">>,
+            <<"=x/y">>
+        ],
+        [
+            <<"=1">>,
+            <<"=?0">>,
+            <<"=">>,
+            <<" =x">>,
+            <<>>
+        ]
+    }.
 
 %%%-----------------------------------------------------------------------------
 %%% RANDOM PRIMITIVES

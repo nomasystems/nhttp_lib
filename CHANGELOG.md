@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The QUERY method (RFC 10008) on HTTP/1.1, HTTP/2 and HTTP/3.
   `t:nhttp_lib:method/0` holds `query`, and `nhttp_lib:decode_method/1` and
   `nhttp_lib:encode_method/1` map it to and from `QUERY`.
+  `nhttp_lib:is_safe/1` and `nhttp_lib:is_idempotent/1` give the method
+  properties, `nhttp_media_type` parses `Content-Type`, and
+  `nhttp_accept_query` encodes and parses the `Accept-Query` field.
 
 ### Changed
 

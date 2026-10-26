@@ -46,7 +46,8 @@ artefact readable in a diff.
 
 -export_type([target/0, outcome/0, finding/0]).
 
--type target() :: h1 | h2_frame | h3_frame | hpack | qpack | ws_frame | ws_feed.
+-type target() ::
+    h1 | h2_frame | h3_frame | hpack | qpack | ws_frame | ws_feed | accept_query.
 
 -doc """
 Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
@@ -62,7 +63,8 @@ Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
     | {more_exceeds_bound, pos_integer(), pos_integer()}
     | {rest_not_shorter, non_neg_integer(), non_neg_integer()}
     | {rest_not_a_suffix, non_neg_integer(), non_neg_integer()}
-    | {bad_value_shape, term()}.
+    | {bad_value_shape, term()}
+    | {round_trip, term(), term()}.
 
 -type result() :: {ok, outcome()} | {error, finding()}.
 -type bound() :: pos_integer() | infinity.
@@ -93,7 +95,7 @@ Which declared shape the parser returned. `parsed` is `{ok, _, _}`,
 -doc "Every target the harness drives, in the order the task file lists them.".
 -spec all() -> [target(), ...].
 all() ->
-    [h1, h2_frame, h3_frame, hpack, qpack, ws_frame, ws_feed].
+    [h1, h2_frame, h3_frame, hpack, qpack, ws_frame, ws_feed, accept_query].
 
 -doc """
 Drive one target with `Bin` and check every return against its `-spec`.
@@ -151,7 +153,9 @@ check(ws_feed, Bin) ->
         fun() -> ws_feed(Bin, server, #{}) end,
         fun() -> ws_feed(Bin, client, Capped) end,
         fun() -> ws_feed(Bin, server, Capped) end
-    ]).
+    ]);
+check(accept_query, Bin) ->
+    accept_query(Bin).
 
 -spec h1_opts() -> nhttp_h1:opts().
 h1_opts() ->
@@ -383,6 +387,39 @@ ws_feed_call(Bin, Dec) ->
         Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
     end.
 
+-doc """
+Check `nhttp_accept_query:parse_value/1`, which declares
+`{ok, [media_range()]} | {error, parse_error()}`.
+
+The parser reads one whole field value, so it declares no `{more, _}`. A list
+that it accepts must survive `encode/1` and a second parse unchanged.
+""".
+-spec accept_query(binary()) -> result().
+accept_query(Bin) ->
+    try nhttp_accept_query:parse_value(Bin) of
+        {ok, []} ->
+            {ok, parsed};
+        {ok, [_ | _] = Ranges} ->
+            maybe
+                true ?= lists:all(fun is_media_range/1, Ranges) orelse {bad_value_shape, Ranges},
+                {ok, Wire} ?= nhttp_accept_query:encode(Ranges),
+                {ok, Ranges} ?= nhttp_accept_query:parse_value(Wire),
+                {ok, parsed}
+            else
+                {bad_value_shape, _} = Shape -> {error, Shape};
+                Other -> {error, {round_trip, Ranges, Other}}
+            end;
+        {error, Reason} ->
+            case is_accept_query_error(Reason) of
+                true -> {ok, refused};
+                false -> {error, {bad_value_shape, Reason}}
+            end;
+        Other ->
+            {error, {undeclared_return, Other}}
+    catch
+        Class:Reason:Stack -> {error, {crash, Class, Reason, Stack}}
+    end.
+
 -doc "A `{more, N}` return must ask for at least one byte, and never for more than the bound.".
 -spec check_more(term(), bound()) -> result().
 check_more(N, infinity) when is_integer(N), N >= 1 ->
@@ -486,6 +523,20 @@ is_ws_message(ping) -> true;
 is_ws_message(pong) -> true;
 is_ws_message(close) -> true;
 is_ws_message(_) -> false.
+
+-spec is_media_range(term()) -> boolean().
+is_media_range(#{type := Type, subtype := Subtype, params := Params}) ->
+    is_binary(Type) andalso is_binary(Subtype) andalso is_field_lines(Params);
+is_media_range(_) ->
+    false.
+
+-spec is_accept_query_error(term()) -> boolean().
+is_accept_query_error(not_ascii) -> true;
+is_accept_query_error({sf_syntax, N}) -> is_integer(N) andalso N >= 0;
+is_accept_query_error({unsupported_item, N}) -> is_integer(N) andalso N >= 0;
+is_accept_query_error({unsupported_parameter, N}) -> is_integer(N) andalso N >= 0;
+is_accept_query_error({not_media_range, Member}) -> is_binary(Member);
+is_accept_query_error(_) -> false.
 
 -spec is_h3_frame(term()) -> boolean().
 is_h3_frame({data, Payload}) -> is_binary(Payload);

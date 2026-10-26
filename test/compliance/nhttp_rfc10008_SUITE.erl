@@ -26,7 +26,10 @@ all() ->
         {group, section_2_method},
         {group, section_2_h1},
         {group, section_2_h2},
-        {group, section_2_h3}
+        {group, section_2_h3},
+        {group, section_2_properties},
+        {group, section_2_content_type},
+        {group, section_3_accept_query}
     ].
 
 groups() ->
@@ -52,6 +55,27 @@ groups() ->
         {section_2_h3, [parallel], [
             h3_query_with_data,
             h3_query_with_protocol_is_stream_error
+        ]},
+        {section_2_properties, [parallel], [
+            query_is_safe_and_idempotent,
+            method_property_table
+        ]},
+        {section_2_content_type, [parallel], [
+            query_without_content_type_fails,
+            query_with_invalid_content_type_fails,
+            query_with_content_type_names_the_media_type
+        ]},
+        {section_3_accept_query, [parallel], [
+            accept_query_section_3_example,
+            accept_query_appendix_a3_example,
+            accept_query_appendix_a5_example,
+            accept_query_appendix_a6_example,
+            accept_query_token_and_string_are_one_term,
+            accept_query_leading_digit_goes_out_as_string,
+            accept_query_wildcards,
+            accept_query_rejects_subtype_wildcard_alone,
+            accept_query_rejects_parameter_of_other_type,
+            accept_query_selects_unsupported_media_type
         ]}
     ].
 
@@ -214,8 +238,186 @@ h3_query_with_protocol_is_stream_error(_Config) ->
     ).
 
 %%%-----------------------------------------------------------------------------
+%%% Section 2 - Method properties
+%%%-----------------------------------------------------------------------------
+
+%% RFC10008-2-8: QUERY is safe and idempotent.
+query_is_safe_and_idempotent(_Config) ->
+    ?assert(nhttp_lib:is_safe(query)),
+    ?assert(nhttp_lib:is_idempotent(query)).
+
+%% RFC9110-9.2.1-1, RFC9110-9.2.2-1: the safe and the idempotent methods. A
+%% method that the library does not know is neither, because RFC 9110
+%% Section 9.2.2 forbids an automatic retry without knowledge of idempotency.
+method_property_table(_Config) ->
+    Table = [
+        {get, true, true},
+        {head, true, true},
+        {options, true, true},
+        {trace, true, true},
+        {query, true, true},
+        {put, false, true},
+        {delete, false, true},
+        {post, false, false},
+        {patch, false, false},
+        {connect, false, false},
+        {<<"FROB">>, false, false},
+        {<<"X-PURGE">>, false, false},
+        {<<"A">>, false, false},
+        {<<"query">>, false, false}
+    ],
+    lists:foreach(
+        fun({Method, Safe, Idempotent}) ->
+            ?assertEqual({Method, Safe}, {Method, nhttp_lib:is_safe(Method)}),
+            ?assertEqual({Method, Idempotent}, {Method, nhttp_lib:is_idempotent(Method)})
+        end,
+        Table
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 2 - Content-Type
+%%%-----------------------------------------------------------------------------
+
+%% RFC10008-2-9: a server MUST fail a request without a Content-Type.
+query_without_content_type_fails(_Config) ->
+    Wire = <<"QUERY /contacts HTTP/1.1\r\nHost: example.org\r\nContent-Length: 1\r\n\r\nq">>,
+    {ok, #{method := query, headers := Headers}, _} = nhttp_h1:parse_request(Wire),
+    ?assertEqual({error, missing_content_type}, nhttp_media_type:content_type(Headers)).
+
+%% RFC10008-2.1-1: a Content-Type that is not a media type is no media type
+%% information.
+query_with_invalid_content_type_fails(_Config) ->
+    Wire = <<
+        "QUERY /contacts HTTP/1.1\r\nHost: example.org\r\n"
+        "Content-Type: application\r\nContent-Length: 1\r\n\r\nq"
+    >>,
+    {ok, #{headers := Headers}, _} = nhttp_h1:parse_request(Wire),
+    ?assertEqual({error, invalid_content_type}, nhttp_media_type:content_type(Headers)).
+
+%% RFC10008-2-10: the content of the request and its media type define the
+%% query.
+query_with_content_type_names_the_media_type(_Config) ->
+    {ok, #{headers := Headers}, _} = nhttp_h1:parse_request(
+        iolist_to_binary(element(2, nhttp_h1:encode_request(query_request())))
+    ),
+    ?assertEqual(
+        {ok, #{type => <<"application">>, subtype => <<"x-www-form-urlencoded">>, params => []}},
+        nhttp_media_type:content_type(Headers)
+    ).
+
+%%%-----------------------------------------------------------------------------
+%%% Section 3 - Accept-Query
+%%%-----------------------------------------------------------------------------
+
+%% RFC10008-3-1: the example of Section 3.
+accept_query_section_3_example(_Config) ->
+    ?assertEqual(
+        {ok, [
+            media_type(<<"application">>, <<"jsonpath">>, []),
+            media_type(<<"application">>, <<"sql">>, [{<<"charset">>, <<"UTF-8">>}])
+        ]},
+        nhttp_accept_query:parse([
+            {<<"accept-query">>, <<"\"application/jsonpath\", application/sql;charset=\"UTF-8\"">>}
+        ])
+    ).
+
+%% RFC10008-A.3-1: the example of Appendix A.3.
+accept_query_appendix_a3_example(_Config) ->
+    ?assertEqual(
+        {ok, [
+            media_type(<<"application">>, <<"x-www-form-urlencoded">>, []),
+            media_type(<<"application">>, <<"sql">>, [])
+        ]},
+        nhttp_accept_query:parse_value(<<"application/x-www-form-urlencoded, application/sql">>)
+    ).
+
+%% RFC10008-A.5-1: the example of Appendix A.5.
+accept_query_appendix_a5_example(_Config) ->
+    ?assertEqual(
+        {ok, [
+            media_type(<<"application">>, <<"sql">>, []),
+            media_type(<<"application">>, <<"xslt+xml">>, [])
+        ]},
+        nhttp_accept_query:parse_value(<<"\"application/sql\", \"application/xslt+xml\"">>)
+    ).
+
+%% RFC10008-A.6-1: the example of Appendix A.6.
+accept_query_appendix_a6_example(_Config) ->
+    {ok, Ranges} =
+        nhttp_accept_query:parse_value(<<"\"application/jsonpath\", \"application/xslt+xml\"">>),
+    ?assertEqual(
+        [
+            media_type(<<"application">>, <<"jsonpath">>, []),
+            media_type(<<"application">>, <<"xslt+xml">>, [])
+        ],
+        Ranges
+    ),
+    ?assert(nhttp_accept_query:allows(media_type(<<"application">>, <<"jsonpath">>, []), Ranges)),
+    ?assertNot(nhttp_accept_query:allows(media_type(<<"application">>, <<"sql">>, []), Ranges)).
+
+%% RFC10008-3-2: a recipient MUST NOT process a Token apart from a String.
+accept_query_token_and_string_are_one_term(_Config) ->
+    ?assertEqual(
+        nhttp_accept_query:parse_value(<<"application/sql;charset=utf-8">>),
+        nhttp_accept_query:parse_value(<<"\"application/sql\";charset=\"utf-8\"">>)
+    ).
+
+%% RFC10008-3-3: a media type with a leading digit needs the String form.
+accept_query_leading_digit_goes_out_as_string(_Config) ->
+    Ranges = [media_type(<<"3gpp">>, <<"query">>, [])],
+    ?assertEqual({ok, <<"\"3gpp/query\"">>}, nhttp_accept_query:encode(Ranges)),
+    ?assertEqual({ok, Ranges}, nhttp_accept_query:parse_value(<<"\"3gpp/query\"">>)),
+    ?assertMatch({error, {unsupported_item, 0}}, nhttp_accept_query:parse_value(<<"3gpp/query">>)).
+
+%% RFC10008-3-4: `*/*` matches any type and `type/*` any subtype of `type`.
+accept_query_wildcards(_Config) ->
+    {ok, Any} = nhttp_accept_query:parse_value(<<"*/*">>),
+    {ok, AnyApp} = nhttp_accept_query:parse_value(<<"application/*">>),
+    ?assertEqual([media_type(<<"*">>, <<"*">>, [])], Any),
+    ?assertEqual([media_type(<<"application">>, <<"*">>, [])], AnyApp),
+    ?assert(nhttp_accept_query:allows(media_type(<<"text">>, <<"plain">>, []), Any)),
+    ?assert(nhttp_accept_query:allows(media_type(<<"application">>, <<"sql">>, []), AnyApp)),
+    ?assertNot(nhttp_accept_query:allows(media_type(<<"text">>, <<"sql">>, []), AnyApp)).
+
+%% RFC10008-3-5: `*/*` and `type/*` are the only wildcards.
+accept_query_rejects_subtype_wildcard_alone(_Config) ->
+    ?assertEqual(
+        {error, {not_media_range, <<"*/sql">>}}, nhttp_accept_query:parse_value(<<"*/sql">>)
+    ),
+    ?assertEqual(
+        {error, {not_media_range, <<"*/sql">>}},
+        nhttp_accept_query:encode([media_type(<<"*">>, <<"sql">>, [])])
+    ).
+
+%% RFC10008-3-6: a parameter is a String or a Token.
+accept_query_rejects_parameter_of_other_type(_Config) ->
+    ?assertEqual(
+        {error, {unsupported_parameter, 16}},
+        nhttp_accept_query:parse_value(<<"application/sql;q=1">>)
+    ),
+    ?assertEqual(
+        {error, {unsupported_parameter, 16}},
+        nhttp_accept_query:parse_value(<<"application/sql;strict">>)
+    ).
+
+%% RFC10008-2.1-2: a server answers 415 with Accept-Query when it does not
+%% support the media type of the request.
+accept_query_selects_unsupported_media_type(_Config) ->
+    {ok, Supported} = nhttp_accept_query:parse_value(<<"application/sql;charset=utf-8">>),
+    {ok, Utf8} = nhttp_media_type:parse(<<"application/sql; charset=UTF-8">>),
+    {ok, Latin1} = nhttp_media_type:parse(<<"application/sql; charset=latin1">>),
+    ?assert(nhttp_accept_query:allows(Utf8, Supported)),
+    ?assertNot(nhttp_accept_query:allows(Latin1, Supported)),
+    ?assertEqual(
+        {ok, <<"application/sql;charset=utf-8">>}, nhttp_accept_query:encode(Supported)
+    ).
+
+%%%-----------------------------------------------------------------------------
 %%% HELPERS
 %%%-----------------------------------------------------------------------------
+
+media_type(Type, Subtype, Params) ->
+    #{type => Type, subtype => Subtype, params => Params}.
 
 query_content() ->
     <<"q=foo&limit=10&sort=-published">>.
