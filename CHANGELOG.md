@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `nhttp_headers:get_exact/2,3`, a case-sensitive `get/2,3` for lists
   with lowercase names.
-- The QUERY method (RFC 10008). `t:nhttp_lib:method/0` holds `query`, and
-  `nhttp_h1:parse_request_line/1` has a fast path for it.
+- The QUERY method (RFC 10008) on HTTP/1.1, HTTP/2 and HTTP/3.
+  `t:nhttp_lib:method/0` holds `query`, and `nhttp_lib:decode_method/1` and
+  `nhttp_lib:encode_method/1` map it to and from `QUERY`.
 
 ### Changed
 
