@@ -15,6 +15,9 @@ This suite runs all property tests defined in:
 - nhttp_ws_props
 - nhttp_cookie_props
 - nhttp_headers_props
+- nhttp_lib_props
+- nhttp_media_type_props
+- nhttp_accept_query_props
 """.
 
 -include_lib("common_test/include/ct.hrl").
@@ -39,7 +42,10 @@ all() ->
         {group, cookie_props},
         {group, msg_props},
         {group, compress_props},
-        {group, headers_props}
+        {group, headers_props},
+        {group, lib_props},
+        {group, media_type_props},
+        {group, accept_query_props}
     ].
 
 groups() ->
@@ -202,6 +208,15 @@ groups() ->
             headers_lower_field_name_matches_byte_wise_lowercase,
             headers_lower_field_name_does_not_copy_a_lowercase_name,
             headers_get_exact_agrees_with_get_on_lowercase_names
+        ]},
+        {lib_props, [parallel], [
+            lib_safe_implies_idempotent
+        ]},
+        {media_type_props, [parallel], [
+            media_type_serialized_parses_to_normal_form
+        ]},
+        {accept_query_props, [parallel], [
+            accept_query_encode_parse_roundtrip
         ]}
     ].
 
@@ -695,3 +710,24 @@ headers_get_exact_agrees_with_get_on_lowercase_names(Config) ->
     run_property(
         nhttp_headers_props, prop_get_exact_agrees_with_get_on_lowercase_names, Config
     ).
+
+%%%-----------------------------------------------------------------------------
+%%% METHOD PROPERTY TESTS
+%%%-----------------------------------------------------------------------------
+
+lib_safe_implies_idempotent(Config) ->
+    run_property(nhttp_lib_props, prop_safe_implies_idempotent, Config).
+
+%%%-----------------------------------------------------------------------------
+%%% MEDIA TYPE PROPERTY TESTS
+%%%-----------------------------------------------------------------------------
+
+media_type_serialized_parses_to_normal_form(Config) ->
+    run_property(nhttp_media_type_props, prop_serialized_parses_to_normal_form, Config).
+
+%%%-----------------------------------------------------------------------------
+%%% ACCEPT-QUERY PROPERTY TESTS
+%%%-----------------------------------------------------------------------------
+
+accept_query_encode_parse_roundtrip(Config) ->
+    run_property(nhttp_accept_query_props, prop_encode_parse_roundtrip, Config).

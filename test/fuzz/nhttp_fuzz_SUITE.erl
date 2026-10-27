@@ -55,7 +55,8 @@ groups() ->
             corpus_hpack,
             corpus_qpack,
             corpus_ws_frame,
-            corpus_ws_feed
+            corpus_ws_feed,
+            corpus_accept_query
         ]},
         {mutation, [parallel], [
             mutate_h1,
@@ -64,7 +65,8 @@ groups() ->
             mutate_hpack,
             mutate_qpack,
             mutate_ws_frame,
-            mutate_ws_feed
+            mutate_ws_feed,
+            mutate_accept_query
         ]},
         {structured, [parallel], [
             structured_h1,
@@ -73,7 +75,8 @@ groups() ->
             structured_hpack,
             structured_qpack,
             structured_ws_frame,
-            structured_ws_feed
+            structured_ws_feed,
+            structured_accept_query
         ]},
         {campaign, [], [campaign]}
     ].
@@ -168,6 +171,7 @@ corpus_hpack(_Config) -> replay(hpack).
 corpus_qpack(_Config) -> replay(qpack).
 corpus_ws_frame(_Config) -> replay(ws_frame).
 corpus_ws_feed(_Config) -> replay(ws_feed).
+corpus_accept_query(_Config) -> replay(accept_query).
 
 %%%-----------------------------------------------------------------------------
 %%% SEEDED MUTATION
@@ -179,6 +183,7 @@ mutate_hpack(_Config) -> mutation_run(hpack).
 mutate_qpack(_Config) -> mutation_run(qpack).
 mutate_ws_frame(_Config) -> mutation_run(ws_frame).
 mutate_ws_feed(_Config) -> mutation_run(ws_feed).
+mutate_accept_query(_Config) -> mutation_run(accept_query).
 
 %%%-----------------------------------------------------------------------------
 %%% SEEDED STRUCTURE AWARE GENERATION
@@ -190,6 +195,7 @@ structured_hpack(_Config) -> structured_run(hpack).
 structured_qpack(_Config) -> structured_run(qpack).
 structured_ws_frame(_Config) -> structured_run(ws_frame).
 structured_ws_feed(_Config) -> structured_run(ws_feed).
+structured_accept_query(_Config) -> structured_run(accept_query).
 
 %%%-----------------------------------------------------------------------------
 %%% CAMPAIGN
@@ -262,6 +268,8 @@ silent decay as the parsers change.
 more octets. `nhttp_hpack:decode/3` reads one whole field block, which
 RFC 9113 Section 4.3 calls a discrete unit, so it declares no `{more, _}` and
 answers a truncated block with an error that ends the connection.
+`nhttp_accept_query:parse_value/1` reads one whole field value, so it declares
+no `{more, _}` either.
 """.
 -spec assert_reaches_every_outcome(nhttp_fuzz_target:target(), map()) -> ok.
 assert_reaches_every_outcome(Target, Tally) ->
@@ -279,7 +287,8 @@ declared_outcomes(h2_frame) -> [parsed, incomplete, refused];
 declared_outcomes(h3_frame) -> [parsed, incomplete, refused];
 declared_outcomes(qpack) -> [parsed, incomplete, refused];
 declared_outcomes(ws_frame) -> [parsed, incomplete, refused];
-declared_outcomes(ws_feed) -> [parsed, incomplete, refused].
+declared_outcomes(ws_feed) -> [parsed, incomplete, refused];
+declared_outcomes(accept_query) -> [parsed, refused].
 
 -spec seeds(nhttp_fuzz_target:target()) -> [binary()].
 seeds(Target) ->

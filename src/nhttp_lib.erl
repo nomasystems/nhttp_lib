@@ -9,7 +9,10 @@ thin aliases so consumers only ever import from one upstream module.
 
 ## Core Types
 
-- `method/0` - HTTP request methods (GET, POST, etc.)
+- `method/0` - HTTP request methods: GET, HEAD, POST, PUT, DELETE, CONNECT,
+  OPTIONS, TRACE, PATCH and QUERY (RFC 10008) as atoms, any other token as
+  the binary. `is_safe/1` and `is_idempotent/1` give the method properties
+  of RFC 9110 Section 9.2.
 - `version/0` - HTTP version (`http1_0` | `http1_1` | `http2` | `http3`)
 - `scheme/0` - URI / wire scheme (`http` | `https` | `ws` | `wss`)
 - `authority/0` - Authority component (`host[:port]`)
@@ -69,6 +72,8 @@ and are re-exported here as aliases (`ws_message/0`, `ws_frame/0`,
     decode_scheme/1,
     encode_method/1,
     encode_scheme/1,
+    is_idempotent/1,
+    is_safe/1,
     request_to_pseudo_headers/1
 ]).
 
@@ -122,6 +127,7 @@ and are re-exported here as aliases (`ws_message/0`, `ws_frame/0`,
     | options
     | trace
     | patch
+    | query
     | binary().
 
 -type version() :: http1_0 | http1_1 | http2 | http3.
@@ -226,6 +232,7 @@ decode_method(<<"CONNECT">>) -> connect;
 decode_method(<<"OPTIONS">>) -> options;
 decode_method(<<"TRACE">>) -> trace;
 decode_method(<<"PATCH">>) -> patch;
+decode_method(<<"QUERY">>) -> query;
 decode_method(M) when is_binary(M) -> M.
 
 -doc """
@@ -251,6 +258,7 @@ encode_method(connect) -> <<"CONNECT">>;
 encode_method(options) -> <<"OPTIONS">>;
 encode_method(trace) -> <<"TRACE">>;
 encode_method(patch) -> <<"PATCH">>;
+encode_method(query) -> <<"QUERY">>;
 encode_method(M) when is_binary(M) -> M.
 
 -doc "Encode a URI / wire scheme to its binary form.".
@@ -259,6 +267,43 @@ encode_scheme(http) -> <<"http">>;
 encode_scheme(https) -> <<"https">>;
 encode_scheme(ws) -> <<"ws">>;
 encode_scheme(wss) -> <<"wss">>.
+
+-doc """
+True iff `Method` is idempotent: the safe methods, `put` and `delete` (RFC 9110
+Section 9.2.2). A method that this library does not know is not idempotent,
+because RFC 9110 Section 9.2.2 forbids an automatic retry without that
+knowledge.
+""".
+-spec is_idempotent(method()) -> boolean().
+is_idempotent(get) -> true;
+is_idempotent(head) -> true;
+is_idempotent(post) -> false;
+is_idempotent(put) -> true;
+is_idempotent(delete) -> true;
+is_idempotent(connect) -> false;
+is_idempotent(options) -> true;
+is_idempotent(trace) -> true;
+is_idempotent(patch) -> false;
+is_idempotent(query) -> true;
+is_idempotent(M) when is_binary(M) -> false.
+
+-doc """
+True iff `Method` is safe: `get`, `head`, `options`, `trace` (RFC 9110 Section
+9.2.1) and `query` (RFC 10008 Section 2). A method that this library does not
+know is not safe.
+""".
+-spec is_safe(method()) -> boolean().
+is_safe(get) -> true;
+is_safe(head) -> true;
+is_safe(post) -> false;
+is_safe(put) -> false;
+is_safe(delete) -> false;
+is_safe(connect) -> false;
+is_safe(options) -> true;
+is_safe(trace) -> true;
+is_safe(patch) -> false;
+is_safe(query) -> true;
+is_safe(M) when is_binary(M) -> false.
 
 -doc """
 Build the pseudo-header prefix plus regular headers for an HTTP/2 or
