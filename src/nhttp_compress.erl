@@ -241,8 +241,16 @@ encoding_to_atom(_) -> identity.
 -spec extract_base_mime(binary()) -> binary().
 extract_base_mime(ContentType) ->
     case binary:split(ContentType, <<";">>) of
-        [BaseMime | _] -> string:trim(BaseMime);
+        [BaseMime | _] -> trim_ows(BaseMime);
         [] -> ContentType
+    end.
+
+-spec has_type(binary(), binary()) -> boolean().
+has_type(BaseMime, Type) ->
+    Size = byte_size(Type),
+    case BaseMime of
+        <<Prefix:Size/binary, _/binary>> -> nhttp_headers:name_eq(Prefix, Type);
+        _ -> false
     end.
 
 -spec inflate_exact(binary(), pos_integer() | infinity, pos_integer()) ->
@@ -263,24 +271,14 @@ inflate_failure(Data, Max, WindowBits) ->
 
 -spec is_compressible_type(binary(), [binary()]) -> boolean().
 is_compressible_type(ContentType, MimeTypes) ->
-    Lower = nhttp_headers:to_lower(extract_base_mime(ContentType)),
-    lists:any(fun(Pattern) -> mime_matches(Lower, Pattern) end, MimeTypes).
+    BaseMime = extract_base_mime(ContentType),
+    lists:any(fun(Pattern) -> mime_matches(BaseMime, Pattern) end, MimeTypes).
 
 -spec mime_matches(binary(), binary()) -> boolean().
-mime_matches(ContentType, Pattern) ->
-    case nhttp_headers:to_lower(Pattern) of
-        <<"text/*">> ->
-            case ContentType of
-                <<"text/", _/binary>> -> true;
-                _ -> false
-            end;
-        <<"application/*">> ->
-            case ContentType of
-                <<"application/", _/binary>> -> true;
-                _ -> false
-            end;
-        LowerPattern ->
-            ContentType =:= LowerPattern
+mime_matches(BaseMime, Pattern) ->
+    case wildcard_type(Pattern) of
+        {ok, Type} -> has_type(BaseMime, Type);
+        none -> nhttp_headers:name_eq(Pattern, BaseMime)
     end.
 
 -spec parse_accept_encoding(binary()) -> [{binary(), float()}].
@@ -352,6 +350,33 @@ select_first_supported([{Encoding, _Q} | Rest]) ->
     case encoding_to_atom(Encoding) of
         identity -> select_first_supported(Rest);
         Atom -> Atom
+    end.
+
+-spec trim_ows(binary()) -> binary().
+trim_ows(<<C, Rest/binary>>) when C =:= $\s; C =:= $\t ->
+    trim_ows(Rest);
+trim_ows(Bin) ->
+    trim_ows_end(Bin, byte_size(Bin)).
+
+-spec trim_ows_end(binary(), non_neg_integer()) -> binary().
+trim_ows_end(Bin, 0) ->
+    Bin;
+trim_ows_end(Bin, Size) ->
+    case binary:at(Bin, Size - 1) of
+        C when C =:= $\s; C =:= $\t -> trim_ows_end(Bin, Size - 1);
+        _ -> binary:part(Bin, 0, Size)
+    end.
+
+-spec wildcard_type(binary()) -> {ok, binary()} | none.
+wildcard_type(Pattern) ->
+    case nhttp_headers:name_eq(Pattern, <<"text/*">>) of
+        true ->
+            {ok, <<"text/">>};
+        false ->
+            case nhttp_headers:name_eq(Pattern, <<"application/*">>) of
+                true -> {ok, <<"application/">>};
+                false -> none
+            end
     end.
 
 -spec with_zlib_stream(fun((zlib:zstream()) -> {ok, binary()} | {error, zlib_error()})) ->
