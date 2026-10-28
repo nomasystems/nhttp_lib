@@ -5,12 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.1.1]
 
 ### Changed
 
 - `nhttp_compress:should_compress/3,4` matches the media type without
-  allocation, about 10 times faster per call.
+  allocation, about 10 times faster per call. It removes only SP and HTAB
+  around the media type (RFC 9110 Section 5.6.3), so a `Content-Type` that
+  ends in CR, LF, VT or FF no longer matches.
 
 ## [2.1.0]
 
