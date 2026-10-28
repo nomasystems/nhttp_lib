@@ -73,6 +73,7 @@
     should_compress_application_wildcard/1,
     should_compress_exact_match/1,
     should_compress_content_type_with_params/1,
+    should_compress_pattern_case_and_ows/1,
     default_mime_types/1,
     encoding_header/1
 ]).
@@ -164,7 +165,8 @@ groups() ->
             should_compress_svg,
             should_compress_application_wildcard,
             should_compress_exact_match,
-            should_compress_content_type_with_params
+            should_compress_content_type_with_params,
+            should_compress_pattern_case_and_ows
         ]},
         {helpers, [parallel], [
             default_mime_types,
@@ -511,6 +513,18 @@ should_compress_content_type_with_params(_Config) ->
             <<"application/json; charset=utf-8; boundary=something">>, 2000, MimeTypes
         )
     ).
+
+should_compress_pattern_case_and_ows(_Config) ->
+    MimeTypes = [<<"TEXT/*">>, <<"Custom/Type">>],
+    ?assertEqual(true, nhttp_compress:should_compress(<<"text/html">>, 2000, MimeTypes)),
+    ?assertEqual(true, nhttp_compress:should_compress(<<"custom/type">>, 2000, MimeTypes)),
+    ?assertEqual(true, nhttp_compress:should_compress(<<"CUSTOM/TYPE">>, 2000, MimeTypes)),
+    ?assertEqual(
+        true, nhttp_compress:should_compress(<<"\tcustom/type \t; q=1">>, 2000, MimeTypes)
+    ),
+    ?assertEqual(false, nhttp_compress:should_compress(<<"text">>, 2000, MimeTypes)),
+    ?assertEqual(false, nhttp_compress:should_compress(<<"textual/html">>, 2000, MimeTypes)),
+    ?assertEqual(false, nhttp_compress:should_compress(<<"custom/typed">>, 2000, MimeTypes)).
 
 %%%-----------------------------------------------------------------------------
 %%% CAP BOUNDARY TESTS
